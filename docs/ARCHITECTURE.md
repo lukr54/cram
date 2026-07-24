@@ -195,6 +195,33 @@ it, and convert refuses above **2 GiB** rather than hold that much in RAM. Encry
 , converting an encrypted source produces a plaintext archive unless the caller supplies `--encrypt`
 for the destination.
 
+`dedup` ([`engine/dedup.rs`](../crates/cram-core/src/engine/dedup.rs)) works on loose files rather
+than archives: it finds the same file in several places across folders and drives. Three gates run in
+order so most of the data is never read, a unique file size rules out a byte-identical twin outright,
+same-size files are separated by a partial hash of their first and last 64 KiB, and only the
+survivors are read in full and confirmed with BLAKE3. Candidates are grouped by the volume they live
+on and every volume is worked at once, but the reader count within a volume comes from the same
+[`hw`](../crates/cram-core/src/hw.rs) media detection the extractor uses: one sequential reader on a
+spinning disk, several on an SSD.
+
+`reclaim` ([`engine/reclaim.rs`](../crates/cram-core/src/engine/reclaim.rs)) is the acting half, kept
+in its own module so the read-only scan cannot accidentally reach a destructive path. `plan` filters
+on `GroupKind::Exact`, which is what keeps perceptual "similar" findings structurally unreachable from
+any action, and `apply` re-hashes each pair at the moment of action rather than trusting a plan that
+may be hours old. Replacing a file with a hard link is transactional: the link is built under a
+temporary name first, then swapped by an atomic rename on Unix, while Windows (which will not rename
+onto an existing file) moves the original aside and removes it only once the link is in place,
+rolling back on any failure. A cross-device quarantine copies, verifies the copy, and only then
+removes the original.
+
+`.cram` also applies one reversible **per-entry transform**: a JPEG is stored as a Lepton stream and
+reconstructed byte-for-byte on the way out. The transform runs before chunking, so two copies of one
+photo still dedup to a single stored copy, and the entry's recorded size stays the *original*
+length so listings and extraction report the file the user gets. Because a Lepton stream is a single
+arithmetic-coded unit that cannot be seeked into, `read_range` (the mount primitive) reconstructs the
+whole entry and slices the result. Archives using a transform declare format v2; see
+[`CRAM_FORMAT.md`](CRAM_FORMAT.md).
+
 ---
 
 ## 5. Formats

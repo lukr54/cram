@@ -1,11 +1,13 @@
 # Cram
 
-Cram is a multi-format archive tool for Windows. One `cram` command lists, extracts, creates, tests,
-converts and mounts archives, signs them and builds parity sidecars for them, plus a native format
-(`.cram`) that stores repeated data once.
+Cram is a multi-format archive tool. One `cram` command lists, extracts, creates, tests, converts and
+mounts archives, signs them and builds parity sidecars for them, finds duplicate files across your
+drives, plus a native format (`.cram`) that stores repeated data once and losslessly repacks JPEGs.
 
 This repository is the **engine and the command line**. The `cram` CLI is free and fully featured;
-nothing in it is restricted. It is written in Rust and targets Windows on the GNU (mingw) toolchain.
+nothing in it is restricted. It is written in Rust. Windows (the GNU/mingw toolchain) and Linux are
+both built and tested; macOS is supported in the source but has not been run yet (see
+[Limitations](#limitations)).
 Everything is pure Rust **except the UnRAR C++ decoder**, which is always compiled in because it is
 what reads RAR; the optional `zstd-c` feature links C libzstd, and `libdeflate` is a further opt-in
 C dependency.
@@ -194,9 +196,13 @@ cram --version                                    version + which optional featu
 ### Photos: ~23% smaller, and still byte-for-byte the same files
 
 Creating a `.cram` losslessly recompresses JPEGs. A photo's data is already entropy-coded, which is
-why zip and 7z gain essentially nothing on a photo library, measured on a real folder of 34 camera
-JPEGs, ZIP and 7z both came out *fractionally larger* than the originals, and `tar.xz` managed 2.7%.
-The same folder in a `.cram` is **23.6% smaller**.
+why zip and 7z gain essentially nothing on a photo library. Measured on a folder of 34 phone photos
+(26.1 MB, 8 and 12 megapixel JPEGs): ZIP and 7z both produced output *fractionally larger* than the
+originals, `tar.xz` managed 2.7%, and the same folder as a `.cram` was **23.6% smaller** with every
+file extracting byte-identical.
+
+That is one sample, not a benchmark. Expect roughly this range on ordinary photos, but the exact
+figure depends on the images; `cram a` prints the real ratio for your own files.
 
 Nothing is traded away for it. The JPEG's entropy coding is redone with a stronger coder, and
 extraction reconstructs the **original file byte-for-byte**, same bytes, same EXIF, same checksum.
@@ -347,8 +353,11 @@ contains no benchmark harness, so nothing here is a performance claim.
 - **Nothing is code-signed.** There is no Authenticode certificate, so Windows SmartScreen warns on
   first run of the released binaries. (`cram sign` signs *archives*; that is unrelated to Windows
   executable trust.)
-- **Windows-first.** Mount is Windows-only via ProjFS; the rest is portable in principle but built
-  and tested for Windows/GNU.
+- **Platform status is not uniform.** Windows (`x86_64-pc-windows-gnu`) and Linux
+  (`x86_64-unknown-linux-gnu`) are both built and tested, including the full test suite on each.
+  macOS (`aarch64-apple-darwin`) has been written but **never compiled or run**: it is checked for
+  the first time by CI, so treat it as unproven until a release exists. Mount is Windows-only
+  regardless, because it is built on ProjFS.
 
 ---
 

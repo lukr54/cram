@@ -15,8 +15,9 @@ nothing to list as changed or fixed.
 ### Added
 
 **The `cram` CLI**, one command for the whole lifecycle: `l` (list), `x` (extract), `a` (create),
-`t` (test), `conv` (convert), `mount`, `rec` (recovery sidecar), `sign` / `verify` / `keygen`,
-`make-sfx`, and `dl` (segmented download, behind the opt-in `download` feature). Free and open
+`t` (test), `conv` (convert), `dedup` (find duplicate files), `mount`, `rec` (recovery sidecar),
+`sign` / `verify` / `keygen`, `make-sfx`, and `dl` (segmented download, behind the opt-in `download`
+feature). Free and open
 source under MIT OR Apache-2.0.
 
 **Formats.** Reads ZIP, 7z, tar (+ gzip / xz / zstd / bz2 / lz4 / brotli), ISO 9660, RAR, bare
@@ -24,11 +25,42 @@ single-stream compressed files (`foo.gz`, `foo.xz`, …), and Cram's own `.cram`
 (+ the same codecs), and `.cram`. RAR is **read-only**, creating RAR is forbidden by the UnRAR
 licence and never will be supported.
 
-**The `.cram` format, frozen at v1.** Content-defined chunking (FastCDC) → BLAKE3-keyed **global
-dedup** with no dictionary-window limit → compressed packs → a footer index. Optional Argon2id +
+**The `.cram` format.** Content-defined chunking (FastCDC) → BLAKE3-keyed **global
+dedup** with no dictionary-window limit → compressed packs → a footer index. An archive is v1 unless
+it uses a per-entry transform (see JPEG recompression below), in which case it declares v2 and a
+v1-only reader refuses it rather than misreading it. Optional Argon2id +
 AES-256-GCM encryption, when a password is set the footer index is sealed along with the packs, so
 the file listing is hidden as well as the contents, and byte-for-byte reproducible when unencrypted.
 Specified normatively in [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md).
+
+**`cram dedup`**, find duplicate files across folders and drives, without archiving anything. A file
+whose size is unique cannot have a byte-identical twin, so it is never read; same-size files are
+separated by a partial hash of their first and last 64 KiB; only what survives both is read in full
+and confirmed with BLAKE3. Reads are scheduled per drive, every volume at once, but one sequential
+reader on a spinning disk and several on an SSD, since parallel reads make an HDD slower. Hard links
+are counted as one physical file, so reclaimable space is not overstated.
+
+By default it only reports. `--link` replaces duplicates with hard links (every filename and folder
+stays where it is), `--quarantine <dir>` moves them aside instead, and both preview unless `--apply`
+is given. Nothing is ever deleted. Each pair is re-hashed at the moment of action, so a plan made
+earlier cannot act on a file that has changed since.
+
+`--similar` additionally flags images that look alike without being byte-identical (a resize, a
+re-save). These are reported separately, are never counted as reclaimable, and no action can consume
+them: a perceptual hash cannot tell a redundant re-encode from two different frames of a burst.
+Needs the `phash` feature.
+
+**Lossless JPEG recompression in `.cram`**, on by default. A photo is already entropy-coded, so
+general-purpose compressors gain roughly nothing on one; redoing that coding with a stronger coder
+(Lepton) is worth about 23% while extraction reconstructs the original file byte-for-byte. Measured
+on one folder of 34 phone photos (26.1 MB): ZIP and 7z both produced output fractionally *larger*
+than the originals, `tar.xz` managed 2.7%, and `.cram` was 23.6% smaller with all 34 files
+extracting byte-identical. That is a single sample rather than a benchmark. Every candidate is verified to round-trip before it is stored, and anything that
+fails verification is stored untouched. `cram a --no-recompress` turns it off.
+
+**Linux support** (`x86_64-unknown-linux-gnu`), built and tested alongside Windows, plus an
+`install.sh` for a one-line install. macOS (`aarch64-apple-darwin`) is written but unproven; see
+Known limitations.
 
 **A second, independent `.cram` decoder.** `cram-extract.exe` implements the same spec from the
 document alone, shares no code with the engine, and takes four direct pure-Rust dependencies
@@ -87,7 +119,9 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 
 ### Known limitations
 
-- **Windows-first.** Built and tested for `x86_64-pc-windows-gnu`; the mount is Windows-only.
+- **Platform status is not uniform.** Windows (`x86_64-pc-windows-gnu`) and Linux
+  (`x86_64-unknown-linux-gnu`) are built and tested. macOS (`aarch64-apple-darwin`) is written but
+  has never been compiled or run; CI is the first thing to exercise it. Mount is Windows-only.
 - **`cram test` cannot detect every bit flip.** An unencrypted *stored* `.cram`, `tar` / `.tar.zst`,
   and ISO and RAR, for which Cram computes no checksum of its own; carry no per-chunk or per-file
   content checksum, so a flip inside file content can decode to wrong bytes undetected. What you get
