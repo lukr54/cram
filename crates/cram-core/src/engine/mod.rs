@@ -17,6 +17,7 @@ use crate::{formats, sniff};
 
 pub mod convert;
 pub mod create;
+pub mod estimate;
 pub mod parallel;
 pub mod sequential;
 pub mod skip;

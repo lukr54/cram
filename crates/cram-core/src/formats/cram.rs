@@ -166,9 +166,9 @@ impl Crypter {
 
 // FastCDC v2020 chunk sizing: ~64 KiB average (16 KiB min, 256 KiB max) — a balance of dedup
 // granularity against index size for a general-purpose archiver.
-const CHUNK_MIN: u32 = 16 * 1024;
-const CHUNK_AVG: u32 = 64 * 1024;
-const CHUNK_MAX: u32 = 256 * 1024;
+pub(crate) const CHUNK_MIN: u32 = 16 * 1024;
+pub(crate) const CHUNK_AVG: u32 = 64 * 1024;
+pub(crate) const CHUNK_MAX: u32 = 256 * 1024;
 /// Flush a pack once its raw contents reach this size (it may overshoot by up to one chunk).
 const PACK_TARGET: usize = 8 * 1024 * 1024;
 /// Defensive ceiling on a single pack's raw size when reading an untrusted archive (guards the

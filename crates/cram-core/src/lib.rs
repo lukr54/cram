@@ -54,6 +54,7 @@ pub mod writer;
 #[cfg(feature = "download")]
 pub mod net;
 
+pub use engine::estimate::{estimate_dedup, DedupEstimate};
 pub use engine::{extract, ExtractOptions};
 pub use error::{ArchiveError, Report, Result};
 pub use format::{Codec, Container, Format};
