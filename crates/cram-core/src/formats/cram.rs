@@ -714,7 +714,12 @@ impl ArchiveWriter for CramArchiveWriter {
         // ~23% with the original file still reconstructable byte-for-byte. The whole image has to be
         // in memory for this, so it is bounded — and anything that isn't really a JPEG, is too big,
         // or fails to verify simply streams through unchanged.
-        if self.recompress_images && looks_like_jpeg(&name) {
+        // The planned size is a cheap first gate purely to avoid buffering: without it, a 10 GB file
+        // misnamed `.jpg` would still be read 256 MiB into memory before being rejected. It is only a
+        // hint — the source can have changed since planning, and a source that reports 0 is treated as
+        // unknown — so the read cap below remains the real guard.
+        let plausible_size = entry.size == 0 || entry.size <= MAX_XFORM_INPUT;
+        if self.recompress_images && plausible_size && looks_like_jpeg(&name) {
             let mut head = Vec::new();
             body.take(MAX_XFORM_INPUT + 1).read_to_end(&mut head)?;
             if head.len() as u64 <= MAX_XFORM_INPUT {
