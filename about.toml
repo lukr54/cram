@@ -1,0 +1,22 @@
+# cargo-about configuration — generates THIRD-PARTY-LICENSES.md, the full-text licence appendix that
+# ships beside cram.exe / cram-extract.exe. Every licence the resolved graph uses must appear in
+# `accepted`. Regenerate with the command recorded in THIRD-PARTY-NOTICES.md after any dependency change.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "bzip2-1.0.6",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+]
+
+# The one platform the binaries are shipped for. Filtering to it keeps the appendix to what actually
+# links (e.g. on windows-gnu reqwest uses SChannel, so rustls/ring are not pulled in).
+targets = ["x86_64-pc-windows-gnu"]

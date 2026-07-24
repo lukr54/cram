@@ -5,8 +5,10 @@ links, bundles or redistributes the third-party components listed below, each un
 Several of those licences require their text to be reproduced in binary distributions — this file is
 how Cram does that, and it is installed alongside the binaries.
 
-Sections 1–3 cover components whose licence obliges us to reproduce a notice. Section 4 covers the
-Rust dependency graph.
+Sections 1–4 cover components whose licence obliges us to reproduce a specific notice (UnRAR, the
+Intel Slicing-by-8 acknowledgment, the winpthreads runtime DLL, and the bundled C Zstandard library).
+Section 5 covers the Rust dependency graph, whose per-crate copyright and licence texts are reproduced
+in full in the companion `THIRD-PARTY-LICENSES.md`.
 
 ---
 
@@ -195,29 +197,67 @@ OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISE
 OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## 4. Rust dependencies
+## 4. Zstandard — the bundled C library
 
-Cram links **233** third-party Rust crates. Every one of them declares a licence. There is **no GPL,
-AGPL or MPL anywhere in the graph** — every dependency is permissive. By declared SPDX expression:
+The release build enables the `zstd-c` feature, which compiles Meta's C Zstandard library into
+`cram.exe` / `cram-extract.exe` (through the `zstd` / `zstd-sys` crates) as a fast `.cram` pack codec.
+Its BSD-3-Clause licence requires the copyright notice, the conditions and the disclaimer to be
+reproduced in binary distributions:
 
-| Licence | Crates |
-|---|---|
-| MIT and/or Apache-2.0 (in some combination) | 156 |
-| MIT only | 45 |
-| Unicode-3.0 (the ICU crates) | 18 |
-| BSD-3-Clause | `alloc-no-stdlib`, `alloc-stdlib`, `curve25519-dalek`, `ed25519-dalek`, `instant`, `subtle`, and (in combination) `brotli`, `brotli-decompressor`, `encoding_rs` |
-| ISC | `rustls-webpki`, `untrusted`, and (in combination) `ring` |
-| Apache-2.0 only | `lzma-rust2`, `sevenz-rust2`, `sync_wrapper` |
-| BSD-2-Clause | `arrayref` |
-| bzip2-1.0.6 | `libbz2-rs-sys` |
-| Public-domain-equivalent (0BSD / CC0 / Unlicense, each dual-licensed) | `adler2`, `blake3`, `ppmd-rust`, `aho-corasick`, `memchr` |
+```
+BSD License
 
-**Regenerating this section.** The counts above come from the resolved graph for
-`x86_64-pc-windows-gnu`:
+For Zstandard software
 
-```bash
-cargo metadata --format-version 1 --filter-platform x86_64-pc-windows-gnu
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-Each package's `license` field in that output is the authority. Re-run it after any dependency
-change and update the table.
+The pure-Rust default build does not link this library; it is compiled in only under the shipped
+`zstd-c` feature. (The `zstd` / `zstd-safe` / `zstd-sys` Rust crates are themselves MIT-licensed and
+appear, with their own notices, in `THIRD-PARTY-LICENSES.md`.)
+
+## 5. Rust dependencies
+
+Cram statically links a large graph of third-party Rust crates. **There is no GPL, AGPL, LGPL or MPL
+anywhere in the graph** — every dependency is permissive (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause,
+ISC, Unicode-3.0, bzip2-1.0.6, and 0BSD / CC0 / Unlicense, in various combinations).
+
+The **full copyright notice and licence text for every one of these crates** is reproduced in the
+companion [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md) — generated from each crate's own
+`LICENSE` file and distributed alongside the binaries. That appendix, not a summary, is what discharges
+the reproduction requirement the MIT, BSD-2/3-Clause, ISC, Unicode-3.0 and bzip2 licences place on
+binary distributions.
+
+**Regenerating the appendix** after any dependency change, for the shipped `x86_64-pc-windows-gnu`
+build (`about.toml` and `about.hbs` in this repo drive it):
+
+```bash
+cargo install cargo-about --locked --features cli
+cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
+  -m crates/cram-cli/Cargo.toml --features "download zstd-c"
+```
