@@ -36,7 +36,7 @@ document alone, shares no code with the engine, and takes four direct pure-Rust 
 needs no DLL beside it beyond the OS's own. Your data stays recoverable even if the main build is not
 available. It doubles as the `make-sfx` self-extractor stub.
 
-**Parallel extraction** for the formats with a random-access seam (ZIP, ISO, `.cram`). The worker
+**Parallel extraction** for the formats with a random-access interface (ZIP, ISO, `.cram`). The worker
 count is derived from the *destination* drive, hardware auto-detect plus a one-shot calibration
 cached in `%APPDATA%\cram\profile.toml`. `--skip` leaves a destination file alone only when a
 per-entry CRC proves it identical, so it helps on ZIP and 7z entries that store a CRC, and does

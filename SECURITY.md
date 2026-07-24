@@ -64,7 +64,7 @@ Anything below, reachable by feeding Cram a file you control:
 
 ## Out of scope
 
-- **Resource exhaustion from a deliberately huge archive.** A legitimate 500 GB archive and a
+- **Resource exhaustion from a huge archive.** A legitimate 500 GB archive and a
   malicious one look identical, and extracting either will use your CPU, RAM and disk. "I made a
   100 GB bomb and it filled my disk" is expected behaviour. A crafted archive that **bypasses a
   bound**, unbounded allocation, a decode that never terminates, RAM use unrelated to what it

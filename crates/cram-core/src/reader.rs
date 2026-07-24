@@ -1,4 +1,4 @@
-//! The read side of the engine, the spine every backend implements.
+//! The read side of the engine, the core every backend implements.
 //!
 //! Backends stay *dumb*: they only yield entry metadata and entry *bodies*. All the write-loop
 //! machinery, output paths, overwrite/skip policy, progress, cancellation, and the parallel
@@ -74,7 +74,7 @@ pub trait RandomAccessReader: Send + Sync {
     fn entries(&self) -> &[Entry];
 
     /// Decompress entry `index` and stream its uncompressed bytes into `out`, **safe to call
-    /// concurrently** (opens its own file handle). This is the parallel seam the rayon per-entry
+    /// concurrently** (opens its own file handle). This is the parallel hand-off point the rayon per-entry
     /// path fans out over; the engine passes a writer that owns the destination file plus the
     /// progress/cancel wrapper, so those concerns stay in one place. Returns bytes written.
     fn copy_entry(&self, index: usize, out: &mut dyn Write) -> Result<u64>;

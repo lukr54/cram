@@ -1,5 +1,5 @@
 //! `cram test` (integrity verification without extraction). Proves the happy path across
-//! formats AND that a real single-byte corruption of stored data is actually caught, the whole point
+//! formats AND that a real single-byte corruption of stored data is actually caught, the point
 //! of the feature (a verify that always says "ok" would be worse than none).
 
 use std::path::PathBuf;

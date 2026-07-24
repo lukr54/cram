@@ -36,7 +36,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// nested dirs, a file duplicated across two paths (exercises cross-file dedup), and (when `extra` is
 /// set) a few small distinct files so the index carries a mix of new and deduped chunks.
 ///
-/// This fixture is deliberately small, well under one ~8 MiB pack, so it does NOT exercise the
+/// This fixture is small, well under one ~8 MiB pack, so it does NOT exercise the
 /// multi-pack parallel-compression path (that is covered separately by
 /// [`unencrypted_multipack_build_is_byte_identical`]). It pins down the size-independent parts of
 /// determinism (sorted walk, chunking, dedup, single-pack compression, index, trailer, path
@@ -120,7 +120,7 @@ fn unencrypted_cram_is_byte_identical_across_paths_and_runs() {
     let _ = fs::remove_dir_all(&dir_b);
 }
 
-/// Genuinely exercises the MULTI-PACK parallel-compression path: > 16 MiB of INCOMPRESSIBLE data so
+/// exercises the MULTI-PACK parallel-compression path: > 16 MiB of INCOMPRESSIBLE data so
 /// the writer crosses the ~8 MiB raw pack boundary twice (≥ 2 packs) and `flush_batch` runs on
 /// multi-element batches, and so the archive is large (STORE codec); proving the size is real
 /// multi-pack, not a compression artifact. Two builds must be byte-identical; this is what would catch
@@ -155,11 +155,8 @@ fn unencrypted_multipack_build_is_byte_identical() {
     create_cram(&proj, &a, CreateOptions::default());
     create_cram(&proj, &b, CreateOptions::default());
     let (ba, bb) = (fs::read(&a).unwrap(), fs::read(&b).unwrap());
-    // Incompressible input ⇒ the archive is far bigger than one 8 MiB pack ⇒ genuinely multi-pack.
-    assert!(
-        ba.len() > 12 * 1024 * 1024,
-        "archive genuinely spans multiple packs"
-    );
+    // Incompressible input ⇒ the archive is far bigger than one 8 MiB pack ⇒ multi-pack.
+    assert!(ba.len() > 12 * 1024 * 1024, "archive spans multiple packs");
     assert_eq!(
         ba, bb,
         "multi-pack builds must be byte-identical (order-preserving parallel compression)"

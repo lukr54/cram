@@ -1,7 +1,7 @@
 //! Convert one archive into another format: read the source front-to-back and stream each entry into
 //! a destination `ArchiveWriter`. This is the **interop escape hatch**, a `.cram` (or any format we
 //! can read) can be re-exported to a portable classic container, so adopting `.cram` is never a
-//! one-way door. It reuses the exact reader/writer spine every backend already implements, so every
+//! one-way door. It reuses the exact reader/writer core every backend already implements, so every
 //! readable source × every writable destination composes for free.
 
 use std::io::{self, Cursor, Read};
@@ -95,7 +95,7 @@ impl Read for ConvBody<'_> {
 }
 
 /// Reading half: walk the source and stream every entry into the channel. Runs on the CALLING thread
-/// because [`ArchiveReader`] is deliberately not `Send` (RAR's archive handle can't move threads).
+/// because [`ArchiveReader`] is not `Send` (RAR's archive handle can't move threads).
 fn read_side(
     reader: &mut Box<dyn ArchiveReader>,
     tx: &SyncSender<ConvMsg>,
@@ -163,7 +163,7 @@ fn read_side(
                 break;
             }
             if sink.is_cancelled() {
-                // Cancelled MID-BODY. Returning here deliberately skips the `FileEnd` below: sending
+                // Cancelled MID-BODY. Returning here skips the `FileEnd` below: sending
                 // it would tell the writer this entry ended normally, and the backends believe it;
                 // tar zero-pads to the declared header size, zip records the short length, so a
                 // half-streamed entry would be sealed as complete and the job reported Ok. Bailing

@@ -4,7 +4,7 @@
 //! fixed-shape *directory records* describing the layout. There is no compression and no per-file
 //! container framing, so the reader is small and the format is naturally **random-access** (a file is
 //! `seek(extent × block_size); read(size)`), which also makes it mountable through the same
-//! `RandomAccessReader` seam as ZIP and `.cram`.
+//! `RandomAccessReader` boundary as ZIP and `.cram`.
 //!
 //! Supported: base ISO 9660, the **Joliet** extension (UCS-2 long/Unicode names, preferred when
 //! present), and **multi-extent files** (the `0x80` "not-final" flag): consecutive same-name records

@@ -22,7 +22,7 @@ use crate::secret::{PasswordProvider, PasswordRequest};
 /// The CRC-32 a ZIP entry actually commits to, or `None` when the container stores none.
 ///
 /// WinZip AES comes in two flavours. **AE-1** stores the real CRC-32 of the plaintext; **AE-2**
-/// stores `0` and deliberately omits it, because the AES authentication code already proves the
+/// stores `0` and omits it, because the AES authentication code already proves the
 /// data is intact and a plaintext CRC leaks information about short entries. Writers pick between
 /// them per entry, the `zip` crate emits AE-2 for anything under 20 bytes, so a zero here is not a
 /// checksum, it is the absence of one.

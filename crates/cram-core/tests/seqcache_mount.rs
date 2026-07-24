@@ -1,6 +1,6 @@
 //! Sequential-format archives (tar, 7z) made mountable via the decode-to-cache adapter.
 //!
-//! These drive the *exact* seam the ProjFS mount uses, [`formats::open_random_access`]; on formats
+//! These drive the *exact* boundary the ProjFS mount uses, [`formats::open_random_access`]; on formats
 //! that have no native random-access ability, then check the resulting [`RandomAccessReader`] serves
 //! every entry's bytes correctly (whole-entry `copy_entry`, and arbitrary `read_range` slices,
 //! including out-of-range requests that must clamp/empty rather than panic).
@@ -43,7 +43,7 @@ fn make_sources(root: &Path) -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-/// Create an archive of `fmt`, open it through the mount seam, and verify random access matches source.
+/// Create an archive of `fmt`, open it through the mount interface, and verify random access matches source.
 fn check_random_access(tag: &str, fmt: Format, file_name: &str) {
     let dir = scratch(tag);
     let sources = make_sources(&dir);

@@ -384,7 +384,7 @@ fn hash_pass(
     let hashed = std::sync::atomic::AtomicU64::new(0);
     let stop = AtomicBool::new(false);
 
-    // One OS thread per volume so separate drives genuinely read at the same time; inside a volume, a
+    // One OS thread per volume so separate drives read at the same time; inside a volume, a
     // rayon pool sized to that drive's media (1 for a spinning disk).
     std::thread::scope(|scope| {
         for members in by_volume.values() {
@@ -673,7 +673,7 @@ fn hash_file(
 /// a resized copy, a re-save at different quality, a screenshot of the same shot.
 ///
 /// **These findings are never actionable.** A perceptual hash cannot tell a redundant re-encode from
-/// two genuinely different frames of a burst, and this runs over irreplaceable data, so
+/// two different frames of a burst, and this runs over irreplaceable data, so
 /// [`GroupKind::Similar`] groups always carry `reclaimable == 0` and exist purely for human review.
 pub mod similar {
     use super::{DupeGroup, GroupKind, ScannedFile};
@@ -685,8 +685,8 @@ pub mod similar {
     /// Two *unrelated* 64-bit dHashes differ in ~32 bits (half of them, σ ≈ 4), so 8 sits about six
     /// standard deviations below chance, a coincidental match is vanishingly unlikely. It was chosen
     /// by measurement, not taste: at the stricter value of 3 a photo does **not** match its own
-    /// resized/re-compressed copy, which is precisely the case this feature exists to catch, while at
-    /// 8 it does and genuinely different photos still never group (verified up to [`MAX_DISTANCE`]).
+    /// resized/re-compressed copy, which is exactly the case this feature exists to catch, while at
+    /// 8 it does and different photos still never group (verified up to [`MAX_DISTANCE`]).
     /// Raising it trades review noise for recall, safely, since similar findings are never actionable.
     pub const DEFAULT_DISTANCE: u32 = 8;
     /// Largest distance the banded index can serve without missing matches (see [`find`]).
@@ -837,7 +837,7 @@ pub mod similar {
     /// **dHash**: downscale to 9×8 greyscale and emit one bit per horizontal neighbour pair,
     /// "is this pixel brighter than the one to its right". Encoding *gradients* rather than absolute
     /// values is what makes it survive re-encoding, resizing and brightness shifts while still
-    /// separating genuinely different pictures.
+    /// separating different pictures.
     #[cfg(feature = "phash")]
     fn dhash(path: &std::path::Path) -> Option<u64> {
         let img = image::open(path).ok()?;
@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     /// The two claims the perceptual feature lives or dies by: a photo matches its own resized copy
-    /// (recall), and two genuinely different photos never match (no false positives; the dangerous
+    /// (recall), and two different photos never match (no false positives; the dangerous
     /// direction, since a false pair invites a human to delete a photo that isn't a duplicate).
     #[cfg(feature = "phash")]
     #[test]

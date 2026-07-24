@@ -71,7 +71,7 @@ type FnWriteFileData = unsafe extern "system" fn(
 type FnFreeAlignedBuffer = unsafe extern "system" fn(*const c_void);
 
 /// The resolved entry points. Only function pointers are kept (they are `Send + Sync`); the module
-/// handle is deliberately not stored, the DLL stays loaded for the life of the process, which is
+/// handle is not stored, the DLL stays loaded for the life of the process, which is
 /// what we want, and `HMODULE` is not `Sync`.
 struct Api {
     mark_directory_as_placeholder: FnMarkDirectoryAsPlaceholder,

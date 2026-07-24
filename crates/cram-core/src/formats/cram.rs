@@ -1089,7 +1089,7 @@ impl CramReader {
                 }
             } else {
                 // A transformed entry stores a *smaller* stream than the file it reconstructs, so the
-                // sizes deliberately differ and the equality above cannot apply. The declared size is
+                // sizes differ and the equality above cannot apply. The declared size is
                 // still bounded here, otherwise a hostile index could claim an enormous one purely to
                 // inflate the anti-bomb budget below, and it is checked exactly against the
                 // reconstructed length at extraction time, which is the real guarantee.

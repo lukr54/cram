@@ -114,7 +114,7 @@ fn main() {
         "  DEFLATE  decode {:>6.0} MiB/s   encode {:>5.0} MiB/s",
         rates.deflate_dec, rates.deflate_enc
     );
-    println!("  LZMA/xz  decode {:>6.0} MiB/s", rates.lzma_dec);
+    println!("  LZMA/xz decode {:>6.0} MiB/s", rates.lzma_dec);
 
     // ---- optional heavy write-wall probe ----
     let mut measured_wall = wall > 0.0 && source == "cached profile";

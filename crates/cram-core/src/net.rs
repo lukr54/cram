@@ -1,4 +1,4 @@
-//! Network sources, the `download` feature's bridge from rdm-core to the [`ByteSource`] seam.
+//! Network sources, the `download` feature's bridge from rdm-core to the [`ByteSource`] interface.
 //!
 //! [`RdmSource`] runs a segmented rdm download on its own thread (with a tokio runtime) and exposes
 //! it as a growing [`ByteSource`]: `available()` is the rdm engine's **contiguous watermark**,

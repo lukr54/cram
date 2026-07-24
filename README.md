@@ -34,7 +34,7 @@ RAR compressor. Cram reads RAR only.
 
 † **`cram t` does not mean the same thing for every format.** *CRC-32*: the checksum stored in the
 container is recomputed over the decoded bytes and compared, real content integrity. ZIP stores one
-for every entry except a WinZip AES entry written in the **AE-2** form, which deliberately stores no
+for every entry except a WinZip AES entry written in the **AE-2** form, which stores no
 CRC because the AES authentication code already covers the data; those entries are checked against
 that authentication code instead, which fails if any byte of the entry changed. In 7z the CRC field
 is optional, so an entry carrying none falls back to the *decode* check. *decode*: Cram recomputes no
@@ -55,7 +55,7 @@ Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS   # a restart m
 
 The ProjFS DLL is bound lazily, so every other command works without the feature. *on-demand*:
 content is read out of the archive as a file is opened, with no up-front extraction. *≤ 2 GiB RAM*:
-7z, tar, RAR and bare compressed streams have no random-access seam, so mounting one **decodes the
+7z, tar, RAR and bare compressed streams have no random-access hand-off point, so mounting one **decodes the
 whole archive into memory up front** and refuses anything whose total uncompressed size exceeds
 2 GiB, extract those instead.
 
@@ -149,10 +149,10 @@ and `cargo clippy --workspace --all-targets -- -D warnings` are clean. See
 ## Using it
 
 ```sh
-cram a  backup.cram ./project        # create (adaptive compression; --store / --fast / --best)
-cram l  backup.cram                  # list
-cram t  backup.cram                  # test integrity (no extract; exits non-zero if bad)
-cram x  backup.cram -o ./out         # extract (--skip: see the note below)
+cram a backup.cram ./project        # create (adaptive compression; --store / --fast / --best)
+cram l backup.cram                  # list
+cram t backup.cram                  # test integrity (no extract; exits non-zero if bad)
+cram x backup.cram -o ./out         # extract (--skip: see the note below)
 cram conv backup.cram backup.zip     # convert to another format
 cram mount backup.cram .\view        # mount as a virtual folder; press Enter to unmount
 ```
@@ -234,7 +234,7 @@ on an SSD, because parallel reads make an HDD slower rather than faster.
 `--similar` additionally finds images that *look* the same without being byte-identical, a resized
 copy, a re-save at lower quality, the version a messaging app recompressed. These are reported
 **separately and are never counted as reclaimable space**, because a perceptual hash cannot tell a
-redundant re-encode from two genuinely different frames of a burst. Treat them as a shortlist to look
+redundant re-encode from two different frames of a burst. Treat them as a shortlist to look
 through by hand, not as a delete list. `--similar-distance` tunes how alike is alike (0 = identical
 hash, default 8); it needs a build with the `phash` feature. HEIC/HEIF and camera RAW are not decoded
 for similarity (that needs a C library), though they are still covered by exact-duplicate detection,
@@ -299,14 +299,14 @@ abnormally, the command reports it as an error and the shell it was launched fro
 These describe how Cram works, not a measured comparison against anything else. This repository
 contains no benchmark harness, so nothing here is a performance claim.
 
-- **Parallel extraction** on the formats with a random-access seam, ZIP, ISO and `.cram`, where
+- **Parallel extraction** on the formats with a random-access boundary, ZIP, ISO and `.cram`, where
   entries can be decoded independently. Sequential formats (7z, tar, RAR, bare streams) stream
   front-to-back through the same write machinery.
 - **`.cram`** applies content-defined chunking, then global BLAKE3-keyed dedup across every input in
   one archive, then compressed packs and a footer index. Dedup is global: identical data anywhere in
   the inputs is stored once, with no dictionary-window limit. Optional encryption is Argon2id +
   AES-256-GCM. Unencrypted `.cram` output is byte-for-byte reproducible; encrypted output is
-  deliberately not (a fresh random salt per archive).
+  not (a fresh random salt per archive).
 - The format is **frozen at v1** and specified normatively in
   [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md), that document, not the code, is the contract. The
   decoder in [`crates/cram-extract`](crates/cram-extract) is an independent implementation of the

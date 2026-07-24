@@ -8,7 +8,7 @@ user's seat is [`README.md`](../README.md); how to build and test is
 
 ---
 
-## 1. The spine
+## 1. The core
 
 Cram reads and writes many formats, but almost none of the interesting code is format-specific. A
 backend only knows how to yield entry **metadata** and entry **bytes**. Everything else, safe output
@@ -20,7 +20,7 @@ The traits are in [`cram-core/src/reader.rs`](../crates/cram-core/src/reader.rs)
 [`writer.rs`](../crates/cram-core/src/writer.rs):
 
 ```
-ArchiveReader          the read spine (every readable container)
+ArchiveReader          the read core (every readable container)
   ├ format()           the detected Container × Codec
   ├ entries()          the full member list (a cheap header/central-directory scan)
   ├ next_entry()       pull the next member as a streamed (metadata, body)   ← sequential path
@@ -29,10 +29,10 @@ ArchiveReader          the read spine (every readable container)
 RandomAccessReader     the per-entry capability (Send + Sync)
   ├ entries()
   ├ copy_entry(i, w)   decode entry i straight into a writer, from its own handle (safe to call
-  │                    concurrently), the seam the parallel extractor fans out over
+  │                    concurrently), the boundary the parallel extractor fans out over
   └ read_range(i,o,l)  a byte-range of an entry's uncompressed stream; the mount / on-access primitive
 
-ArchiveWriter          the write spine (every creatable container, never RAR)
+ArchiveWriter          the write core (every creatable container, never RAR)
   ├ add_file(entry, body, hint)
   ├ add_dir(entry)
   └ finish() -> CreateReport
@@ -55,7 +55,7 @@ in the engine.
 | **`cram-mount`** | ProjFS mount, present an archive as a browsable virtual folder. Its own crate so the Windows/ProjFS specifics stay contained. |
 | **`cram-recovery`** | Reed-Solomon parity **sidecar** (`.cramrec`): store parity, later repair bit-rot or truncation. Works on any file. |
 | **`cram-sign`** | detached **ed25519** signature sidecar (`.cramsig`), authorship plus integrity. Works on any file. |
-| **`cram-extract`** | a standalone, dependency-minimal `.cram` decoder, which also serves as the self-extractor (SFX) stub. Shares no code with `cram-core` on purpose (§6). |
+| **`cram-extract`** | a standalone, dependency-minimal `.cram` decoder, which also serves as the self-extractor (SFX) stub. Shares no code with `cram-core` by design (§6). |
 | **`rdm-core`** | the segmented, resumable, multi-source **download engine** (library, no GUI) behind `cram dl` and extract-while-download. Vendored in-tree. |
 
 `cram-extract`'s whole manifest is four decode-only, pure-Rust crates: `lzma-rust2` (XZ), `ruzstd`
@@ -96,7 +96,7 @@ per-entry workers possible.
 
 **Everything else, tar, 7z, RAR, a bare compressed stream; takes the sequential path**
 ([`engine/sequential.rs`](../crates/cram-core/src/engine/sequential.rs)), one entry at a time. These
-are front-to-back streams with no seek seam: entry *n* can only be decoded by decoding what precedes
+are front-to-back streams with no seek interface: entry *n* can only be decoded by decoding what precedes
 it, so there is nothing to fan out over.
 
 The two paths share the write machinery in
@@ -233,7 +233,7 @@ byte-level spec is [`CRAM_FORMAT.md`](CRAM_FORMAT.md); the code is
   qualifier is load-bearing, the pack codec depends on build features and level, so a `zstd-c` build
   writes zstd packs where a default build writes XZ ones. Pinned within one build by
   [`tests/reproducible.rs`](../crates/cram-core/tests/reproducible.rs). **Encrypted** archives are
-  deliberately *not* reproducible (fresh salt, fresh nonces), and that test asserts the difference so
+  *not* reproducible (fresh salt, fresh nonces), and that test asserts the difference so
   "reproducible" is never misread as "encryption is deterministic".
 
 The format is **frozen at v1**: any layout change bumps the version byte, and a conforming reader must
@@ -275,7 +275,7 @@ from `read_range` on demand. ProjFS invokes callbacks on its own threads, so the
   only the packs the range touches, and ZIP re-opens the entry and decodes forward from its start,
   discarding the leading bytes through a 64 KiB scratch buffer, bounded memory, but work proportional
   to the offset.
-- **Sequential, staged to RAM**; tar, 7z, RAR and bare compressed streams have no seek seam, so
+- **Sequential, staged to RAM**; tar, 7z, RAR and bare compressed streams have no seek hand-off point, so
   [`formats/seqcache.rs`](../crates/cram-core/src/formats/seqcache.rs) decodes the whole archive into
   memory when the mount opens and serves ranges from those buffers. The cache is capped at **2 GiB
   uncompressed** (entry metadata counts against the same cap, so millions of tiny entries cannot slip

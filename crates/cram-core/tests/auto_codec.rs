@@ -1,5 +1,5 @@
 //! The adaptive `Level::Auto` probe. Proves that already-compressed files are stored
-//! verbatim (not run through the codec) while genuinely compressible files are compressed, on both
+//! verbatim (not run through the codec) while compressible files are compressed, on both
 //! random-access backends (ZIP and 7z), and that either archive still round-trips byte-for-byte.
 //!
 //! ZIP verification is exact: cram's reader reports each entry's `compressed_size`, so a STORED
@@ -26,7 +26,7 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Deterministic high-entropy bytes (xorshift), genuinely incompressible, no RNG dep.
+/// Deterministic high-entropy bytes (xorshift), incompressible, no RNG dep.
 fn noise(len: usize) -> Vec<u8> {
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
     let mut out = Vec::with_capacity(len);

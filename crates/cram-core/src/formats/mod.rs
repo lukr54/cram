@@ -1,5 +1,5 @@
 //! Format dispatch: turn a sniffed [`Format`] into a concrete reader/writer. Only ZIP read is wired
-//! for the spine; the tar/rar/7z/raw backends slot in here as they land.
+//! for the core; the tar/rar/7z/raw backends slot in here as they land.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ pub fn open(
 /// - **Natively seekable**, ZIP (central directory + per-entry local headers), `.cram` (a footer
 ///   index over content-addressed packs), and ISO 9660 (each file is a contiguous extent). These serve
 ///   ranges straight from disk with no whole-archive buffering.
-/// - **Sequential, staged to RAM**; tar / 7z / rar / raw are front-to-back streams with no seek seam,
+/// - **Sequential, staged to RAM**; tar / 7z / rar / raw are front-to-back streams with no seek boundary,
 ///   so [`seqcache::SeqCacheReader`] decodes them once into a bounded in-memory cache and serves ranges
 ///   from there. Capped, so a too-large archive is refused (extract it instead of mounting).
 ///
@@ -59,7 +59,7 @@ pub fn open_random_access(
         Container::Zip => Ok(Box::new(zip::ZipReader::open(path, pw)?)),
         Container::Cram => Ok(Box::new(cram::CramReader::open(path, pw)?)),
         Container::Iso => Ok(Box::new(iso::IsoReader::open(path, pw)?)),
-        // No native random-access seam → decode the whole stream into a bounded in-memory cache.
+        // No native random-access interface → decode the whole stream into a bounded in-memory cache.
         Container::Tar | Container::SevenZ | Container::Rar | Container::Raw => {
             Ok(Box::new(seqcache::SeqCacheReader::decode(path, fmt, pw)?))
         }

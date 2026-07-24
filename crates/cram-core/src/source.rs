@@ -1,11 +1,11 @@
-//! Growing byte sources, the seam for **extract-while-download**.
+//! Growing byte sources, the boundary for **extract-while-download**.
 //!
 //! A [`ByteSource`] is a byte stream whose *contiguous prefix* grows over time: a segmented download
 //! in progress publishes a **watermark** (how many bytes are available from offset 0), and the
 //! streaming extractor reads that prefix, blocking at the frontier until more arrives. A completed
 //! local file is just the degenerate case (watermark = length, already finished).
 //!
-//! This module is deliberately network-free: it only defines the abstraction + a blocking
+//! This module is network-free: it only defines the abstraction + a blocking
 //! [`SourceReader`] adapter, so the streaming engine ([`crate::engine::stream`]) is source-agnostic
 //! and fully testable without a download. The rdm-backed implementation lives behind the `download`
 //! Cargo feature and plugs in here by implementing [`ByteSource`].

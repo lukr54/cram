@@ -77,7 +77,7 @@ pub struct PlannedAction {
     pub dest: Option<PathBuf>,
 }
 
-/// The full set of decisions, plus everything deliberately left alone and why.
+/// The full set of decisions, plus everything left alone and why.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub actions: Vec<PlannedAction>,
@@ -312,7 +312,7 @@ pub fn apply(plan: &Plan, sink: &dyn ProgressSink) -> Result<ReclaimReport> {
 /// `None` when they are not (so the caller skips), and an error only when they could not be read.
 ///
 /// Sizes are compared first because that rules out most drift for free, and a full hash of both files
-/// follows, the scan's verdict is deliberately not trusted here, however recent it is.
+/// follows, the scan's verdict is not trusted here, however recent it is.
 fn verify_pair(keeper: &Path, victim: &Path) -> io::Result<Option<[u8; 32]>> {
     let (mk, mv) = (fs::metadata(keeper)?, fs::metadata(victim)?);
     if !mk.is_file() || !mv.is_file() || mk.len() != mv.len() {
@@ -535,7 +535,7 @@ mod tests {
         #[cfg(unix)]
         {
             let again = scan_dir(&dir);
-            assert_eq!(again.reclaimable(), 0, "space is genuinely reclaimed");
+            assert_eq!(again.reclaimable(), 0, "space is reclaimed");
         }
         let _ = fs::remove_dir_all(&dir);
     }

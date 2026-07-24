@@ -1,6 +1,6 @@
 # Contributing to Cram
 
-Thanks for looking. Cram is a small, opinionated codebase: a thin spine, dumb format backends, one
+Thanks for looking. Cram is a small, opinionated codebase: a thin core, dumb format backends, one
 smart engine. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first, it is the map, and the
 module-level `//!` comments in each file are the streets.
 
@@ -104,7 +104,7 @@ If you change a performance claim in the docs, the number must come from a run a
 
 - `cargo fmt --all`, default rustfmt, no custom config. Run it before you push.
 - `cargo clippy --workspace --all-targets -- -D warnings`, this is what CI runs, and it must come
-  back clean. If a lint is genuinely wrong, `#[allow]` it *with a comment saying why*.
+  back clean. If a lint is wrong, `#[allow]` it *with a comment saying why*.
 - **Every file gets a module doc comment** (`//! …`) explaining what that piece is and why it exists.
   This codebase leans hard on them; a new file without one will be asked for one.
 - Comments explain **why**, not what. If a line looks strange, the reason it is that way is the

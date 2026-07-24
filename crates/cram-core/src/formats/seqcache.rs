@@ -1,12 +1,12 @@
 //! `SeqCacheReader`, mount a sequential-only archive (tar / 7z / rar / raw single-stream) by decoding
 //! it **once** into a bounded in-memory cache, then serving random-access reads from RAM.
 //!
-//! tar, 7z, rar and raw single-stream codecs are front-to-back streams with no random-access seam, so
+//! tar, 7z, rar and raw single-stream codecs are front-to-back streams with no random-access hand-off point, so
 //! unlike ZIP / `.cram` / ISO they can't directly back a ProjFS mount. This adapter bridges the gap:
 //! at open time it drains every entry body into memory (up to `MOUNT_CACHE_CAP`), then implements
-//! [`RandomAccessReader`] over those buffers. It is deliberately the simple option, the whole
+//! [`RandomAccessReader`] over those buffers. It is the simple option, the whole
 //! *uncompressed* archive must fit under the cap, but it makes every readable format mountable through
-//! the exact same seam as the natively-seekable ones.
+//! the exact same boundary as the natively-seekable ones.
 //!
 //! Because all decoding finishes *before* the adapter is returned (the underlying backend is opened,
 //! fully drained, and dropped inside [`SeqCacheReader::decode`]), the resulting reader owns only

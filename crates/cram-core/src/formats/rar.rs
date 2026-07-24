@@ -30,7 +30,7 @@ use crate::secret::{PasswordProvider, PasswordRequest, Secret};
 /// Generous so real files pass; a future extract-to-temp path could stream and lift this.
 const MAX_INMEM_ENTRY: u64 = 2 * 1024 * 1024 * 1024;
 
-/// A body that fails on first read, surfaces an entry we deliberately refuse to extract (an
+/// A body that fails on first read, surfaces an entry we refuse to extract (an
 /// oversized RAR entry UnRAR would buffer whole in RAM) as a per-entry failure via the engine's
 /// normal write loop, rather than aborting the whole job or silently dropping the entry.
 struct ErrBody(Option<String>);
@@ -329,7 +329,7 @@ impl ArchiveReader for RarReader {
                 Ok(v) => v,
                 // A damaged entry, most often "File CRC error" from a partly corrupt archive.
                 // One bad file must not end the whole extraction: WinRAR reports the file and
-                // continues, and a damaged archive is precisely when the remaining files matter
+                // continues, and a damaged archive is exactly when the remaining files matter
                 // most. So report this entry as a per-entry failure (an `ErrBody` the engine turns
                 // into one `report.failed` line) and wind the cursor back to the next entry. A
                 // password problem is different in kind, it is not damage and it will affect every

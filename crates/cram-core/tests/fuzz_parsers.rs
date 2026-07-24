@@ -6,7 +6,7 @@
 //!
 //! Iterations scale with `CRAM_FUZZ_ITERS` (default 150 per parser); a nightly run can set it high.
 //!
-//! The pure-Rust parsers (ZIP, 7z, tar, ISO, `.cram`) are covered here. RAR is deliberately excluded:
+//! The pure-Rust parsers (ZIP, 7z, tar, ISO, `.cram`) are covered here. RAR is excluded:
 //! it decodes through the UnRAR C++ library, where a bad input could fault the *process* rather than
 //! raise a catchable Rust panic, not something a unit test can contain.
 //!

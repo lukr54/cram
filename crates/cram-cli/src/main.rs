@@ -752,7 +752,7 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
                 if done.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                eprint!("\r  scanning… {} read", bytes_human(prog.done_bytes()));
+                eprint!("\r scanning… {} read", bytes_human(prog.done_bytes()));
             }
         })
     };
@@ -996,7 +996,7 @@ fn reclaim_phase(
     Ok(())
 }
 
-/// Machine-readable report. Hand-rolled because cram-cli deliberately has no serde dependency.
+/// Machine-readable report. Hand-rolled because cram-cli has no serde dependency.
 fn print_dedup_json(rep: &cram_core::engine::dedup::DedupReport) {
     fn esc(s: &str) -> String {
         let mut o = String::with_capacity(s.len() + 8);
@@ -1316,7 +1316,7 @@ fn default_dest(archive: &Path) -> PathBuf {
 
 /// `cram make-sfx <archive.cram> <out.exe>`, build a self-extracting executable. Delegates to the
 /// co-located `cram-extract` stub, which appends itself onto the payload. Kept a separate small binary
-/// on purpose: the SFX stub must stay tiny and carry none of the engine, so the unified `cram` locates
+/// by design: the SFX stub must stay tiny and carry none of the engine, so the unified `cram` locates
 /// and invokes it rather than embedding it.
 fn make_sfx(args: &[String]) -> ExitCode {
     use std::process::Command;

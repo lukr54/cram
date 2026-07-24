@@ -2,7 +2,7 @@
 //! the extracted files with "now". Covered for the formats that actually carry a per-entry mtime,
 //! ZIP (parallel/random-access path) and tar (sequential path), so both engine paths are exercised.
 //!
-//! `.cram` v1 deliberately stores no per-entry mtime (the format is frozen), so its reader reports
+//! `.cram` v1 stores no per-entry mtime (the format is frozen), so its reader reports
 //! `modified: None` and there is nothing to restore, that's correct, not a regression, and is why
 //! `.cram` is not asserted here.
 

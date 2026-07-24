@@ -74,7 +74,7 @@ impl Mount {
 #[cfg(windows)]
 pub fn mount(archive: &Path, root: &Path, pw: Arc<dyn PasswordProvider>) -> Result<Mount> {
     // Sniff → dispatch to whichever backend offers random access (ZIP or `.cram`). The mount only
-    // ever touches the `RandomAccessReader` seam, so it is agnostic to which concrete reader backs it.
+    // ever touches the `RandomAccessReader` boundary, so it is agnostic to which concrete reader backs it.
     let fmt = cram_core::sniff::sniff_path(archive)?;
     let reader = cram_core::formats::open_random_access(archive, fmt, pw)?;
     let inner = projfs::MountInner::start(reader, root)?;

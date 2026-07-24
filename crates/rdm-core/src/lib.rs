@@ -728,7 +728,7 @@ async fn run(
         }
     }
 
-    // create + write but deliberately NOT truncate: on resume we reuse the existing partial file and
+    // create + write but NOT truncate: on resume we reuse the existing partial file and
     // only overwrite the still-missing chunks (truncate(true) here would wipe a resumed download).
     let file = Arc::new(
         OpenOptions::new()
@@ -1332,7 +1332,7 @@ mod net_tests {
         }
     }
 
-    /// Full multi-connection download; size is deliberately NOT a chunk multiple so the short final
+    /// Full multi-connection download; size is NOT a chunk multiple so the short final
     /// chunk is exercised. Verifies byte-exact output, the counter ending exactly at total, and the
     /// watermark reaching the end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

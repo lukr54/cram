@@ -1,9 +1,9 @@
 //! Cram core engine, the format-agnostic read/write/verify machinery every Cram tool builds on.
 //!
-//! The design is a thin **spine** of two traits ([`reader`], [`writer`]) that each container backend
+//! The design is a thin core traits of two traits ([`reader`], [`writer`]) that each container backend
 //! implements, with all the shared machinery; output-path safety, overwrite/skip policy, progress,
 //! cancellation, and the adaptive parallel scheduler; living once in [`engine`] so every format
-//! inherits it. Adding a format is implementing the spine, not re-plumbing the engine.
+//! inherits it. Adding a format is implementing the core, not re-plumbing the engine.
 //!
 //! ## The layers
 //!
@@ -13,7 +13,7 @@
 //!   guard ([`EntryPath`]): the one place archive names are normalized so no backend can escape the
 //!   output directory.
 //! - [`reader`], [`ArchiveReader`] (sequential `next_entry` stream) plus the [`RandomAccessReader`]
-//!   capability (`copy_entry` = the parallel per-entry seam; `read_range` = the mount primitive).
+//!   capability (`copy_entry` = the parallel per-entry boundary; `read_range` = the mount primitive).
 //! - [`writer`], the incremental [`ArchiveWriter`] (`add_file` / `add_dir` / `finish`) and its
 //!   [`CreateOptions`] / [`CreateReport`].
 //! - [`formats`], the concrete backends: ZIP, 7z, tar-family, ISO 9660, RAR (read-only), raw

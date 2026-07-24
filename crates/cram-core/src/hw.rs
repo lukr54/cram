@@ -289,7 +289,7 @@ mod unix_platform {
     // ---- macOS media detection -------------------------------------------------------------------
     //
     // Whether a drive is spinning decides between one sequential reader and several parallel ones, and
-    // getting it wrong on an external USB hard disk means seek thrash, precisely the case a big photo
+    // getting it wrong on an external USB hard disk means seek thrash, exactly the case a big photo
     // collection lives on. macOS answers it through IOKit, which `diskutil` already wraps, so this
     // shells out **once per volume** and caches the result rather than binding IOKit. Any failure
     // leaves the entry unknown and the caller falls back to today's defaults.
@@ -1212,7 +1212,7 @@ pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
     let mut win_start = Instant::now();
     // Run the write loop through an inner closure so EVERY exit, including the error path; falls
     // through to the temp-file cleanup below. ENOSPC is this probe's *expected* failure mode (it
-    // deliberately writes toward the cap), and erroring straight out would leave a multi-GiB
+    // writes toward the cap), and erroring straight out would leave a multi-GiB
     // `.cram_writeprobe.tmp` permanently occupying the space of an already-full drive: the worst
     // possible outcome for a calibration.
     let run = (|| -> io::Result<()> {
@@ -1316,7 +1316,7 @@ pub fn profile_path() -> Option<std::path::PathBuf> {
 }
 
 /// macOS keeps per-application state under `~/Library/Application Support`, not in an XDG directory.
-/// `XDG_CONFIG_HOME` is still honoured first for anyone who deliberately sets it.
+/// `XDG_CONFIG_HOME` is still honoured first for anyone who sets it.
 #[cfg(target_os = "macos")]
 pub fn profile_path() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")

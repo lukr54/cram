@@ -12,7 +12,7 @@
 //!   - **Metalink/HTTP** (RFC 6249), one GET whose `Link: <url>; rel=duplicate` headers enumerate
 //!     mirrors (what Fedora's redirector and some CDNs serve).
 //!
-//! Riskier tiers are deliberately deferred: distro mirror-list adapters (Ubuntu/Debian/Arch),
+//! Riskier tiers are deferred: distro mirror-list adapters (Ubuntu/Debian/Arch),
 //! repack **page-scrape** (opt-in, with SSRF / inert-probe guards), and BitTorrent. Each will be a new
 //! function alongside these, feeding the same [`Discovered`] shape into the pool.
 

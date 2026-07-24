@@ -177,7 +177,7 @@ fn small_entries_in_an_encrypted_zip_do_not_fail_verification() {
         report.failures
     );
     assert_eq!(report.checked, 3, "every entry should have been checked");
-    // Two of the three are genuinely CRC-checked: `long.txt` keeps a real AE-1 CRC, and `empty.txt`
+    // Two of the three are CRC-checked: `long.txt` keeps a real AE-1 CRC, and `empty.txt`
     // has a stored CRC of 0 that is *correct*, the CRC of no bytes is 0; which is exactly why
     // `stored_crc` discounts a zero CRC only on a non-empty entry. Only `tiny.txt` is AE-2 with no
     // checksum to compare, and it is proven by its AES authentication instead. Pinning the count

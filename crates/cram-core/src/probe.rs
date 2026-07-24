@@ -65,7 +65,7 @@ const STORE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "png", "gif", "webp", "heic", "heif", "avif", "jxl",
     // audio
     "mp3", "aac", "m4a", "m4b", "ogg", "oga", "opus", "flac", "wma", "ape",
-    // video (NB: `.ts` is deliberately NOT here, it is overwhelmingly TypeScript source, which is
+    // video (NB: `.ts` is NOT here, it is overwhelmingly TypeScript source, which is
     // highly compressible; a genuine MPEG transport stream is high-entropy and the content sample
     // stores it anyway. `.m2ts` is unambiguously video.)
     "mp4", "m4v", "mkv", "webm", "avi", "mov", "wmv", "flv", "m2ts", "vob", "mpg", "mpeg",
@@ -245,7 +245,7 @@ impl ProbeSummary {
 mod tests {
     use super::*;
 
-    /// Deterministic pseudo-random bytes (xorshift), genuinely incompressible, no `rand` dep.
+    /// Deterministic pseudo-random bytes (xorshift), incompressible, no `rand` dep.
     fn noise(len: usize) -> Vec<u8> {
         let mut x = 0x2545_f491_4f6c_dd1du64;
         let mut out = Vec::with_capacity(len);

@@ -9,7 +9,7 @@
 //!   and zip64 (large game files). Two zip shapes can't be streamed and are reported as
 //!   [`ArchiveError::StreamUnsupported`] so the caller extracts them normally once fully downloaded:
 //!   entries whose sizes live in a trailing **data descriptor** (general-purpose bit 3), and
-//!   **encrypted** entries (the streaming reader has no password seam). Real repack zips written to a
+//!   **encrypted** entries (the streaming reader has no password hand-off point). Real repack zips written to a
 //!   file by 7-Zip/WinRAR carry their sizes in the local header, so they stream.
 //!
 //! 7z/rar still need the whole file (header structures / solid blocks), download to completion first.
@@ -255,7 +255,7 @@ fn extract_zip_stream(
         }
 
         // skip-already-correct: still read the entry's bytes off the wire (a stream can't seek past
-        // it), but skip the write. (zip carries a CRC, so this can genuinely fire.)
+        // it), but skip the write. (zip carries a CRC, so this can fire.)
         if opts.skip_existing && skip::dest_already_correct(&outpath, &entry) {
             let _ = io::copy(&mut zf, &mut io::sink());
             sink.on_bytes(entry.size);
