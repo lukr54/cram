@@ -1,4 +1,4 @@
-# The `.cram` archive format — version 1
+# The `.cram` archive format, version 1
 
 **Status: frozen.** This document is the normative specification of the on-disk `.cram`
 container as produced and consumed by Cram. A file that conforms to this document is a valid
@@ -8,7 +8,7 @@ not understand rather than guess (see §9).
 
 The reference implementation lives in
 [`crates/cram-core/src/formats/cram.rs`](../crates/cram-core/src/formats/cram.rs); where this
-document and the code disagree, that is a bug in one of them — please file it.
+document and the code disagree, that is a bug in one of them; please file it.
 
 - **Endianness:** every multi-byte integer is **little-endian**, unsigned, unless stated otherwise.
 - **Notation:** `u8`/`u32`/`u64` are 1/4/8-byte little-endian unsigned integers. `bytes(n)` is a
@@ -38,7 +38,7 @@ document and the code disagree, that is a bug in one of them — please file it.
 
 `packs_start` is `8` for an unencrypted archive and `8 + 28 = 36` for an encrypted one. The index
 sits at the end of the packs region (immediately before the trailer) so the writer can stream packs
-out in a single forward pass and only needs to seek once — never at all, in practice, since it
+out in a single forward pass and only needs to seek once, never at all, in practice, since it
 appends. The trailer records where the index begins, so a reader finds everything by reading the
 fixed-size trailer first.
 
@@ -69,7 +69,7 @@ A reader **must**:
 
 ---
 
-## 3. Crypto block (28 bytes — encrypted archives only)
+## 3. Crypto block (28 bytes, encrypted archives only)
 
 Present **iff** the ENCRYPTED flag is set. Immediately follows the header.
 
@@ -83,14 +83,14 @@ Present **iff** the ENCRYPTED flag is set. Immediately follows the header.
 The cost parameters are stored so they stay tunable without a format change. Because they come from
 an untrusted file, a reader **must** clamp them before use (§8): reject `m_cost > 1048576` (1 GiB),
 `t_cost > 64`, or `p_cost > 16`. The reference writer emits `m_cost = 19456` (19 MiB), `t_cost = 2`,
-`p_cost = 1` — the OWASP-recommended Argon2id floor.
+`p_cost = 1`, the OWASP-recommended Argon2id floor.
 
 ---
 
 ## 4. Packs region
 
 The packs region is the concatenation of every pack blob, back to back, with no padding or
-separators. A pack is a group of unique file chunks (§10) compressed — and, if encrypted, sealed —
+separators. A pack is a group of unique file chunks (§10) compressed, and, if encrypted, sealed; 
 as one unit. Nothing in the region is self-describing: a pack's location, on-disk length, codec, and
 decompressed length all come from the pack table in the index (§6). A reader therefore never scans
 the region; it seeks to a pack by its index entry.
@@ -105,7 +105,7 @@ archive whose index declares a larger `raw_len` (§8).
 The index is a single byte string (§6). If the archive is unencrypted, it is stored verbatim at
 `index_offset`. If the archive is encrypted, the bytes at `index_offset` are the **sealed** index
 (§8): `nonce(12) | ciphertext | tag(16)`, and `index_len` counts those sealed bytes. The index's own
-GCM authentication tag doubles as the password verifier — a wrong password fails the tag check on
+GCM authentication tag doubles as the password verifier, a wrong password fails the tag check on
 open, cleanly, before any index byte is trusted.
 
 ---
@@ -132,13 +132,13 @@ EntryMeta   := is_dir:u8 | name_len:u32 | name:bytes(name_len)
              | transform:u8                                   (v2 archives only)
 ```
 
-**transform** (v2 only) — a reversible, *lossless* transform applied to the entry's bytes before
+**transform** (v2 only), a reversible, *lossless* transform applied to the entry's bytes before
 chunking. A reader that cannot reverse a transform it encounters **must** reject the archive.
 
 | value | meaning |
 |-------|---------|
-| `0x00` | `NONE` — stored exactly as read. |
-| `0x01` | `LEPTON` — a JPEG stored as a Lepton stream; extraction reconstructs the original file byte-for-byte. |
+| `0x00` | `NONE`, stored exactly as read. |
+| `0x01` | `LEPTON`, a JPEG stored as a Lepton stream; extraction reconstructs the original file byte-for-byte. |
 
 For a transformed entry, `size` is the **reconstructed** (original) length, so listings and extraction
 report the file the user actually gets. Consequently `size == Σ chunk length` does **not** hold for
@@ -146,33 +146,33 @@ such entries (§9); the stored stream is smaller. A reader **must** instead veri
 reconstruction is exactly `size` bytes long, and **must** bound `size` against the stored length
 before trusting it in any budget calculation.
 
-**PackLoc** — one pack:
-- `file_offset` — absolute offset of the pack blob in the packs region.
-- `comp_len` — the pack blob's **on-disk** length. For an encrypted archive this **includes** the
+**PackLoc**, one pack:
+- `file_offset`, absolute offset of the pack blob in the packs region.
+- `comp_len`, the pack blob's **on-disk** length. For an encrypted archive this **includes** the
   12-byte nonce and 16-byte GCM tag (i.e. it is the length of the sealed blob, not of the
   compressed plaintext).
-- `raw_len` — the pack's length **after** decompression (and after decryption, when encrypted).
-- `codec` — how the pack plaintext is compressed: `0` = STORE (raw, uncompressed), `1` = XZ
+- `raw_len`, the pack's length **after** decompression (and after decryption, when encrypted).
+- `codec`, how the pack plaintext is compressed: `0` = STORE (raw, uncompressed), `1` = XZ
   (an `.xz`/LZMA2 stream), `2` = ZSTD (a single zstd frame). See §11.
 
-**ChunkLoc** — one unique chunk, addressed **within its pack's decompressed bytes**:
-- `pack_id` — index into the pack table.
-- `offset` — byte offset of the chunk inside pack `pack_id`'s decompressed bytes.
-- `length` — chunk length in bytes. `offset + length` must be `≤` that pack's `raw_len`.
+**ChunkLoc**, one unique chunk, addressed **within its pack's decompressed bytes**:
+- `pack_id`, index into the pack table.
+- `offset`, byte offset of the chunk inside pack `pack_id`'s decompressed bytes.
+- `length`, chunk length in bytes. `offset + length` must be `≤` that pack's `raw_len`.
 
-**EntryMeta** — one archive member:
-- `is_dir` — `0` for a file, non-zero for a directory.
-- `name` — the member path, UTF-8, forward-slash separated, no leading slash. Two distinct rules:
-  - a name that is **not valid UTF-8** is corruption — the reference reader rejects the whole
+**EntryMeta**, one archive member:
+- `is_dir`, `0` for a file, non-zero for a directory.
+- `name`, the member path, UTF-8, forward-slash separated, no leading slash. Two distinct rules:
+  - a name that is **not valid UTF-8** is corruption, the reference reader rejects the whole
     archive (§9 item 13);
   - a name that is valid UTF-8 but **unsafe as a path** (`..` traversal, drive letter / absolute
     path, NUL, a reserved device name) must be sanitized before use as a filesystem path. The
     reference reader **silently drops** such an entry from the listing (it is neither listed nor
     extracted) rather than rejecting the archive.
-- `size` — the reconstructed file length in bytes. Invariant: `size == Σ length` over the entry's
+- `size`, the reconstructed file length in bytes. Invariant: `size == Σ length` over the entry's
   `chunk_ids` (§8). Directories have `size == 0` and no chunks.
-- `mode` — Unix permission bits, or `0` if unknown/not applicable.
-- `chunk_ids` — the ordered list of chunk-table indices whose bytes, concatenated in this order,
+- `mode`, Unix permission bits, or `0` if unknown/not applicable.
+- `chunk_ids`, the ordered list of chunk-table indices whose bytes, concatenated in this order,
   reconstruct the file body. Ids may repeat (in-file dedup); the same id may appear in many entries
   (cross-file dedup).
 
@@ -203,7 +203,7 @@ seeking to `index_offset`.
 - **Associated data (AAD)** binds each blob to its role, so blobs cannot be swapped or replayed:
   - a **pack** with pack id *N* uses the 4-byte little-endian encoding of *N* as AAD;
   - the **index** uses the ASCII bytes `cram-index` (`63 72 61 6D 2D 69 6E 64 65 78`) as AAD.
-- **Password verification:** opening the index's GCM tag is the password check — no separate
+- **Password verification:** opening the index's GCM tag is the password check, no separate
   verifier is stored. A wrong password (or any tampering) surfaces as an authentication failure.
 
 In v1, encryption is all-or-nothing: when the ENCRYPTED flag is set, **every** pack and the index
@@ -217,13 +217,13 @@ names" mode in v1.
 A `.cram` file may be hostile. A conforming reader **must** enforce all of the following and treat
 any violation as corruption (never a panic, never an unbounded allocation):
 
-1. `file_len ≥ 8 + 22`; and `≥ 8 + 28 + 22` when the ENCRYPTED flag is set.
+1. `file_len ≥ 8 + 22`, and `≥ 8 + 28 + 22` when the ENCRYPTED flag is set.
 2. Header magic (§2), version, and reserved-flag checks.
 3. Trailer magic (§7).
 4. The index lies wholly within `[packs_start, file_len − 22)`. Check with subtraction, never with
    `index_offset + index_len` (that sum is attacker-controlled and can wrap `u64`).
 5. Every pack lies wholly within `[packs_start, index_offset)`, checked by subtraction for the same
-   reason; and `raw_len ≤ 64 MiB`.
+   reason, and `raw_len ≤ 64 MiB`.
 6. Every `ChunkLoc`: `pack_id < pack_count` and `offset + length ≤ pack.raw_len`.
 7. Every entry `chunk_id < chunk_count`, and `size == Σ length` over the entry's chunks.
 8. On decompression, a pack must expand to **exactly** its declared `raw_len` (a codec that yields a
@@ -235,23 +235,23 @@ any violation as corruption (never a panic, never an unbounded allocation):
     `size == Σ length` invariant (7) bounds output; this bounds work.
 11. Counts (`pack_count`, `chunk_count`, `entry_count`, `chunk_id_count`, `name_len`) are never used
     to pre-size an allocation; parse incrementally so a bogus count fails on exhausted input.
-12. Reject an unknown pack `codec` — only STORE (0), XZ (1), and ZSTD (2) are defined (§11).
+12. Reject an unknown pack `codec`, only STORE (0), XZ (1), and ZSTD (2) are defined (§11).
 13. Every entry `name` must be valid UTF-8; a non-UTF-8 name is corruption and rejects the archive.
-    (A name that is valid UTF-8 but unsafe as a path is *not* corruption — see §6.)
+    (A name that is valid UTF-8 but unsafe as a path is *not* corruption, see §6.)
 
 ---
 
 ## 10. Chunking and deduplication (informative)
 
-This section describes how the reference **writer** fills packs. A reader does not need it — the
-index fully determines reconstruction — but it explains why the format deduplicates.
+This section describes how the reference **writer** fills packs. A reader does not need it, the
+index fully determines reconstruction, but it explains why the format deduplicates.
 
 - Each file body is split into content-defined chunks with **FastCDC v2020**, parameters
   `min = 16 KiB`, `avg = 64 KiB`, `max = 256 KiB`. Content-defined boundaries mean an insertion near
   the start of a file only re-chunks the region around it, so shared regions across files (and
   across versions of a file) produce identical chunks.
 - A chunk's identity is its **BLAKE3** hash (256-bit). The writer keeps a hash→chunk-id table; a
-  chunk whose hash is already present is not stored again — its id is simply referenced.
+  chunk whose hash is already present is not stored again, its id is simply referenced.
 - Unique chunks accumulate into a pack buffer; when the buffer reaches ~8 MiB (`PACK_TARGET`) it is
   flushed as a pack (§4). A pack that compression does not shrink is stored with codec STORE so a
   pack never grows.
@@ -281,7 +281,7 @@ ZSTD), and does not affect readability.
 An **unencrypted** `.cram` is **deterministic**: building it twice from the same logical inputs
 (the same top-level inputs, **given in the same order**, with the same file bytes and same relative
 paths) with the same options and the same build of Cram yields a **byte-for-byte identical** file.
-This is a guaranteed property, not an accident — it makes a `.cram` safe to content-address, cache by
+This is a guaranteed property, not an accident; it makes a `.cram` safe to content-address, cache by
 hash, and verify against a published checksum.
 
 It holds because nothing in the format or the writer depends on wall-clock time, absolute paths, or
@@ -290,7 +290,7 @@ run-to-run randomness:
 - The format stores **no timestamps** and **no absolute paths** (entry names are relative, rooted at
   the input's base name).
 - The create walk **sorts** each directory's children, so on-disk enumeration order does not leak in.
-  (The **order of the top-level inputs** is preserved as given, so it is part of "same inputs" — the
+  (The **order of the top-level inputs** is preserved as given, so it is part of "same inputs"; the
   same files listed in a different order produce a different, though internally valid, archive.)
 - Chunking (FastCDC), dedup identity (BLAKE3), pack assembly, and index serialization are pure
   functions of the input bytes.
@@ -309,11 +309,11 @@ Two caveats:
 
 ## 13. Version history
 
-- **v1** — initial frozen format: content-defined chunking + BLAKE3 dedup, solid packs
+- **v1**, initial frozen format: content-defined chunking + BLAKE3 dedup, solid packs
   (STORE/XZ/ZSTD), footer index, trailer, optional whole-archive AES-256-GCM with Argon2id.
-- **v2** — adds the per-entry `transform` byte (§6) and, with it, `LEPTON`: lossless JPEG
+- **v2**, adds the per-entry `transform` byte (§6) and, with it, `LEPTON`: lossless JPEG
   recompression. Photos are already entropy-coded, so a general-purpose compressor gains ~0% on them;
   redoing that coding is worth ~23% while still reconstructing the original file byte-for-byte. The
   writer emits v2 only when a transform was actually used, and verifies every candidate round-trips
-  before storing it — a file that fails to verify is stored untransformed. Everything else is
+  before storing it, a file that fails to verify is stored untransformed. Everything else is
   unchanged from v1.

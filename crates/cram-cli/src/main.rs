@@ -1,4 +1,4 @@
-//! `cram` — the single Cram command line. One binary, subcommand-dispatched (like `git` / `7z`):
+//! `cram`, the single Cram command line. One binary, subcommand-dispatched (like `git` / `7z`):
 //!
 //! ```text
 //! cram l  <archive>                            list entries
@@ -39,7 +39,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     // RAR is decoded by the UnRAR C++ library, which can fault the *whole process* on a crafted
     // archive (why the fuzz harness excludes it). When a verb would read a RAR and we are not already
-    // the sacrificial worker, run the command in a child process so a fault kills only the child — the
+    // the sacrificial worker, run the command in a child process so a fault kills only the child; the
     // user's shell/session reports a clean error instead of vanishing.
     if let Some(code) = maybe_isolate_rar(&args) {
         return code;
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
 const RAR_WORKER_ENV: &str = "CRAM_RAR_WORKER";
 
 /// If this invocation would drive the UnRAR C++ decoder over an untrusted archive, re-run the whole
-/// command in a child process and return its outcome — a fault in the child (a Windows structured
+/// command in a child process and return its outcome, a fault in the child (a Windows structured
 /// exception, or a Unix signal) is reported as a clean error rather than taking down this process.
 /// Returns `None` (→ proceed in-process) when isolation doesn't apply: we're already the worker, the
 /// verb never reads a RAR, or no argument names an existing RAR file.
@@ -119,18 +119,18 @@ fn maybe_isolate_rar(args: &[String]) -> Option<ExitCode> {
         .status();
     Some(child_exit_code(
         status,
-        "cram: the RAR decoder crashed on this archive — isolated, so your session is unaffected. \
+        "cram: the RAR decoder crashed on this archive, isolated, so your session is unaffected. \
          The file is likely corrupt or malicious.",
         "could not launch the isolated RAR worker",
     ))
 }
 
-/// Map a child process's exit status to our own [`ExitCode`]. A **normal** exit (0..=255 — including
+/// Map a child process's exit status to our own [`ExitCode`]. A **normal** exit (0..=255, including
 /// the child's own clean error codes) is passed through unchanged. Anything else means the child
 /// **crashed**: a Unix signal yields no code, and a Windows structured exception (e.g. an access
-/// violation 0xC0000005) yields a code cast to a *negative* / out-of-range `i32` — either way we print
+/// violation 0xC0000005) yields a code cast to a *negative* / out-of-range `i32`, either way we print
 /// `crash_msg` and return `EX_SOFTWARE` (70). Clamping the raw code into 0..=255 is not an option: it
-/// folds a crash into an ordinary exit status, and a negative code lands on 0 — a silent false
+/// folds a crash into an ordinary exit status, and a negative code lands on 0; a silent false
 /// success. `launch_ctx` labels a spawn failure.
 fn child_exit_code(
     status: std::io::Result<std::process::ExitStatus>,
@@ -175,7 +175,7 @@ fn isolated_rar_extract(archive: &Path, dir: &Path, args: &[String]) -> Result<(
                 format!("isolated RAR extraction failed (exit {c})"),
             )),
             _ => Err(cram_core::error::ArchiveError::Backend(
-                "the RAR decoder crashed on this download — isolated, so your session is \
+                "the RAR decoder crashed on this download, isolated, so your session is \
                  unaffected. The file is likely corrupt or malicious."
                     .into(),
             )),
@@ -187,7 +187,7 @@ fn isolated_rar_extract(archive: &Path, dir: &Path, args: &[String]) -> Result<(
 }
 
 /// Does `arg` name an existing file whose magic says RAR? Flags and non-files are ignored, and a sniff
-/// failure (unreadable / not an archive) is treated as "not RAR" — the check only *adds* isolation, it
+/// failure (unreadable / not an archive) is treated as "not RAR", the check only *adds* isolation, it
 /// never blocks a normal path.
 fn names_rar_file(arg: &str) -> bool {
     if arg.starts_with('-') {
@@ -243,7 +243,7 @@ fn usage() {
         "  mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)"
     );
     eprintln!("  dedup <folder|file…> [--similar] [--min-size <bytes>] [--json]");
-    eprintln!("       find duplicate files across folders/drives — reports only by default");
+    eprintln!("       find duplicate files across folders/drives, reports only by default");
     eprintln!("       [--link] [--quarantine <dir>] [--keep shortest|oldest|first] [--apply]");
     eprintln!(
         "       reclaim space: --link hard-links copies (every path stays put), --quarantine"
@@ -266,7 +266,7 @@ fn has(args: &[String], flag: &str) -> bool {
 #[cfg(not(feature = "download"))]
 fn download_cmd(_args: &[String]) -> Result<()> {
     Err(cram_core::error::ArchiveError::Backend(
-        "download support not compiled in — rebuild with `--features download`".into(),
+        "download support not compiled in, rebuild with `--features download`".into(),
     ))
 }
 
@@ -292,7 +292,7 @@ fn streamable_fmt_from_name(name: &str) -> Option<Format> {
 
 /// Last path segment of a URL (before any `?`/`#`), used as the default output filename.
 ///
-/// The URL is UNTRUSTED — Metalink discovery replaces the source list with `<url>` elements from
+/// The URL is UNTRUSTED, Metalink discovery replaces the source list with `<url>` elements from
 /// the metalink file, so this name controls where the download is written. It must come out as one
 /// plain, safe component: a segment like `a\..\..\evil.bat` (backslashes are legal URL characters)
 /// would otherwise become a traversal on Windows. `EntryPath::from_raw` applies the same rules as
@@ -347,9 +347,9 @@ fn dl_err(msg: impl Into<String>) -> cram_core::error::ArchiveError {
 }
 
 /// If a whole-file SHA-256 is known (discovered from a Metalink, or passed via `--sha256`), hash the
-/// finished file and compare. A mismatch is fatal (returns `Err` — so we never extract a bad file),
+/// finished file and compare. A mismatch is fatal (returns `Err`, so we never extract a bad file),
 /// and so is an I/O error during hashing: a checksum we could NOT compute is not a checksum that
-/// passed — failing open here would let a transiently-unreadable (e.g. AV-locked) malicious file skip
+/// passed, failing open here would let a transiently-unreadable (e.g. AV-locked) malicious file skip
 /// verification entirely and proceed to extraction.
 #[cfg(feature = "download")]
 fn verify_download(out: &Path, expected_sha: Option<&str>) -> Result<()> {
@@ -366,13 +366,13 @@ fn verify_download(out: &Path, expected_sha: Option<&str>) -> Result<()> {
         Ok(false) => {
             println!("MISMATCH ✗");
             Err(dl_err(
-                "downloaded file does not match the expected SHA-256 — delete it and retry",
+                "downloaded file does not match the expected SHA-256, delete it and retry",
             ))
         }
         Err(e) => {
             println!("UNVERIFIED ✗");
             Err(dl_err(format!(
-                "could not verify SHA-256 ({e}) — refusing to treat the file as good; retry when it is readable"
+                "could not verify SHA-256 ({e}), refusing to treat the file as good; retry when it is readable"
             )))
         }
     }
@@ -402,7 +402,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
     let mut expected_sha = opt(args, "--sha256").map(str::to_string);
 
     // Mirror discovery: a `.meta4`/`.metalink` input, or `--discover` on a single URL, expands to a
-    // verified mirror list (+ maybe a whole-file SHA-256). Only for a single input — several given
+    // verified mirror list (+ maybe a whole-file SHA-256). Only for a single input, several given
     // URLs are already an explicit mirror set. Discovery only proposes; the engine's verify gate
     // still byte-checks every discovered mirror, so a bad discovered link can't corrupt the download.
     if sources.len() == 1 && (discover || net::is_metalink_ref(&sources[0])) {
@@ -442,7 +442,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
     if let Some(dir) = &extract {
         if expected_sha.is_some() && streamable_fmt_from_name(name).is_some() {
             println!(
-                "a SHA-256 is expected — downloading fully and verifying BEFORE extracting \
+                "a SHA-256 is expected, downloading fully and verifying BEFORE extracting \
                  (stream-extract is skipped so unverified bytes never land in {})",
                 dir.display()
             );
@@ -451,7 +451,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
             if let Some(fmt) = streamable_fmt_from_name(name) {
                 if auto {
                     eprintln!(
-                    "note: --auto is ignored while stream-extracting — leading-edge scheduling is \
+                    "note: --auto is ignored while stream-extracting, leading-edge scheduling is \
                      used so the extract frontier keeps advancing"
                 );
                 }
@@ -504,7 +504,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
     let source = RdmSource::start(sources, out.clone(), ceiling, chunk, vec![], mode)?;
     let ok = source.wait();
     if !ok {
-        return Err(dl_err("download incomplete — re-run to resume"));
+        return Err(dl_err("download incomplete, re-run to resume"));
     }
     let total = source.progress().total();
     let ramped = if auto {
@@ -525,7 +525,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
         // A downloaded RAR is attacker-controlled and decodes through the UnRAR C++ library, which can
         // fault the whole process. The startup isolation (maybe_isolate_rar) cannot cover this: the
         // file does not exist yet when it runs, and `dl` isn't in its verb list. So isolate the
-        // extract here — run it in a sacrificial `cram x` child (unless we're already that worker).
+        // extract here, run it in a sacrificial `cram x` child (unless we're already that worker).
         if std::env::var_os(RAR_WORKER_ENV).is_none()
             && names_rar_file(out.to_str().unwrap_or_default())
         {
@@ -553,7 +553,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
 /// Print per-entry extraction failures / cancellation to stderr, and return an error when the
 /// extraction was **not fully clean** so the process exits non-zero. Extraction is best-effort
 /// (failures are collected, not fatal), so a partial/failed/cancelled extract would otherwise look
-/// like a success — a chained script (`cram x deps.zip -o build/ && run-build`) must be able to tell
+/// like a success, a chained script (`cram x deps.zip -o build/ && run-build`) must be able to tell
 /// via the exit code, not just stderr text. Every command that extracts routes through here.
 fn report_issues(report: &cram_core::error::Report) -> Result<()> {
     if !report.failed.is_empty() {
@@ -648,7 +648,7 @@ fn extract(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `test` — decode every entry and verify stored checksums without extracting. Exit non-zero if any
+/// `test`, decode every entry and verify stored checksums without extracting. Exit non-zero if any
 /// entry fails, so it's usable in scripts / CI ("is this archive still good?").
 fn test_cmd(args: &[String]) -> Result<()> {
     let archive = args.get(2).map(PathBuf::from).ok_or_else(|| {
@@ -682,7 +682,7 @@ fn test_cmd(args: &[String]) -> Result<()> {
 
 // ---- dedup -----------------------------------------------------------------------------------
 
-/// `cram dedup <paths…>` — find duplicate files across folders and drives.
+/// `cram dedup <paths…>`, find duplicate files across folders and drives.
 ///
 /// **Read-only.** It reports; it never deletes, moves, or links anything. That is deliberate for a
 /// first release over irreplaceable data: the scan has to earn trust before it is allowed to act.
@@ -737,7 +737,7 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
         );
     }
 
-    // A scan can run for hours over a large pile, so report progress to stderr — which also keeps
+    // A scan can run for hours over a large pile, so report progress to stderr; which also keeps
     // `--json` on stdout clean and pipeable.
     let prog = Arc::new(cram_core::progress::Progress::new(0, 0));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -773,7 +773,7 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
     }
 
     println!(
-        "Scanned {} files ({}) in {:.1}s — read {} to be certain.",
+        "Scanned {} files ({}) in {:.1}s, read {} to be certain.",
         thousands(rep.files_scanned),
         bytes_human(rep.bytes_scanned),
         secs,
@@ -818,7 +818,7 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
     let similar: Vec<_> = rep.similar_groups().collect();
     if !similar.is_empty() {
         println!(
-            "\n{} set(s) of visually similar images — REVIEW BY HAND.",
+            "\n{} set(s) of visually similar images, REVIEW BY HAND.",
             thousands(similar.len() as u64)
         );
         println!(
@@ -840,7 +840,7 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
     }
 
     if rep.cancelled {
-        println!("\nScan was cancelled — the results above cover only what was scanned.");
+        println!("\nScan was cancelled, the results above cover only what was scanned.");
     }
     let _ = GroupKind::Exact; // keeps the import honest if the loops above are ever refactored
 
@@ -864,7 +864,7 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
     reclaim_phase(&rep, args, want_link, quarantine)
 }
 
-/// Plan — and, only with `--apply`, carry out — the space reclamation for a finished scan.
+/// Plan, and, only with `--apply`, carry out; the space reclamation for a finished scan.
 fn reclaim_phase(
     rep: &cram_core::engine::dedup::DedupReport,
     args: &[String],
@@ -906,7 +906,7 @@ fn reclaim_phase(
 
     let apply = args.iter().any(|a| a == "--apply");
     println!(
-        "\n{} — {} hard link(s), {} quarantine move(s), {} to reclaim.",
+        "\n{}, {} hard link(s), {} quarantine move(s), {} to reclaim.",
         if apply {
             "APPLYING"
         } else {
@@ -989,7 +989,7 @@ fn reclaim_phase(
     }
     if done.quarantined > 0 {
         println!(
-            "\nQuarantined files were MOVED, not deleted — the space is freed only once you delete\n\
+            "\nQuarantined files were MOVED, not deleted; the space is freed only once you delete\n\
              the quarantine folder yourself, after checking you are happy with it."
         );
     }
@@ -1101,12 +1101,12 @@ fn create_inputs(args: &[String]) -> Vec<PathBuf> {
             i += 1; // skip the flag's value too
         } else if s.starts_with('-') {
             if CREATE_FLAGS.contains(&s) {
-                // known boolean flag — nothing to collect
+                // known boolean flag, nothing to collect
             } else if Path::new(s).exists() {
                 out.push(PathBuf::from(s)); // a real file that happens to start with '-'
             } else {
                 eprintln!(
-                    "warning: ignoring unknown option {s:?} — put `--` before file names that start with '-'"
+                    "warning: ignoring unknown option {s:?}, put `--` before file names that start with '-'"
                 );
             }
         } else {
@@ -1230,7 +1230,7 @@ fn create(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `cram conv <in> <out> [-p <src-pw>] [--encrypt <dst-pw>] [--best|--fast|--store]` — re-export any
+/// `cram conv <in> <out> [-p <src-pw>] [--encrypt <dst-pw>] [--best|--fast|--store]`, re-export any
 /// readable archive into `<out>`'s format. `-p` opens an encrypted SOURCE; `--encrypt` encrypts the
 /// DESTINATION (independent passwords). The interop escape hatch: a `.cram` is never a dead end.
 fn convert_cmd(args: &[String]) -> Result<()> {
@@ -1314,7 +1314,7 @@ fn default_dest(archive: &Path) -> PathBuf {
     archive.parent().unwrap_or(Path::new(".")).join(stem)
 }
 
-/// `cram make-sfx <archive.cram> <out.exe>` — build a self-extracting executable. Delegates to the
+/// `cram make-sfx <archive.cram> <out.exe>`, build a self-extracting executable. Delegates to the
 /// co-located `cram-extract` stub, which appends itself onto the payload. Kept a separate small binary
 /// on purpose: the SFX stub must stay tiny and carry none of the engine, so the unified `cram` locates
 /// and invokes it rather than embedding it.
@@ -1328,7 +1328,7 @@ fn make_sfx(args: &[String]) -> ExitCode {
         Some(p) => p,
         None => {
             eprintln!(
-                "cram: cram-extract stub not found next to this binary — it builds the SFX; \
+                "cram: cram-extract stub not found next to this binary, it builds the SFX; \
                  ship cram-extract alongside cram"
             );
             return ExitCode::FAILURE;
@@ -1344,7 +1344,7 @@ fn make_sfx(args: &[String]) -> ExitCode {
     // SUCCESS, which lets `cram make-sfx … && upload out.exe` ship a half-written executable.
     child_exit_code(
         status,
-        "cram: the cram-extract stub crashed while building the SFX — the output is incomplete.",
+        "cram: the cram-extract stub crashed while building the SFX, the output is incomplete.",
         "failed to run cram-extract stub",
     )
 }

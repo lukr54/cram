@@ -1,4 +1,4 @@
-//! `cram convert` — re-exporting a source archive into another container preserves every file's bytes
+//! `cram convert`, re-exporting a source archive into another container preserves every file's bytes
 //! (the interop escape hatch: a `.cram` is never a dead end). Builds one `.cram`, converts it to ZIP /
 //! tar / 7z through the public engine, extracts each, and checks the bytes round-trip exactly.
 

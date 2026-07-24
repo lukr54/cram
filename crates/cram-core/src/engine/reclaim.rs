@@ -1,4 +1,4 @@
-//! Act on what [`super::dedup`] found — reclaim the space, without ever risking the data.
+//! Act on what [`super::dedup`] found, reclaim the space, without ever risking the data.
 //!
 //! This is the destructive half of dedup, run against irreplaceable collections, so every design
 //! choice here is made in favour of "impossible to lose a file" over "reclaims the most bytes".
@@ -8,7 +8,7 @@
 //! - **Nothing happens without `apply`.** Planning is pure: it reads, decides, and prints. The default
 //!   is a dry run, so the destructive path is always opt-in and always previewable.
 //! - **Only byte-identical groups are eligible.** [`GroupKind::Similar`] findings are never planned, at
-//!   all, for any action — see [`plan`]. Visual similarity cannot distinguish a redundant re-encode
+//!   all, for any action; see [`plan`]. Visual similarity cannot distinguish a redundant re-encode
 //!   from two real photographs.
 //! - **Every group keeps a copy.** One member is chosen as the keeper by an explicit, deterministic
 //!   [`KeepPolicy`]; only the others are ever touched.
@@ -22,8 +22,8 @@
 //!
 //! ## Hard links, and their one caveat
 //!
-//! [`Action::Link`] leaves every path exactly where it was — the folder structure of a photo
-//! collection often *is* the meaning, so nothing disappears from view — while the redundant copies
+//! [`Action::Link`] leaves every path exactly where it was, the folder structure of a photo
+//! collection often *is* the meaning, so nothing disappears from view; while the redundant copies
 //! stop occupying space. The caveat, which callers must surface: linked paths are one file, so an
 //! editor that rewrites a photo **in place** changes it under every name. Tools that write a new file
 //! (the overwhelmingly common case) are unaffected. Quarantine is the alternative when that matters.
@@ -47,11 +47,11 @@ pub enum KeepPolicy {
     /// `misc/unsorted/Copy of Copy of x.jpg`.
     ///
     /// No heuristic can know which folder a person considers canonical, so with
-    /// [`Action::Quarantine`] — where the keeper is the copy that stays put — the chosen keeper is
+    /// [`Action::Quarantine`], where the keeper is the copy that stays put; the chosen keeper is
     /// printed in the preview for exactly that reason.
     #[default]
     ShortestPath,
-    /// Earliest modification time — the closest thing to "the original" when copies were made later.
+    /// Earliest modification time, the closest thing to "the original" when copies were made later.
     Oldest,
     /// First in path order. Dumb, total, and utterly predictable.
     First,
@@ -81,7 +81,7 @@ pub struct PlannedAction {
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub actions: Vec<PlannedAction>,
-    /// Files not planned for any action, with the reason — shown so a dry run is honest about its gaps
+    /// Files not planned for any action, with the reason; shown so a dry run is honest about its gaps
     /// rather than silently reclaiming less than the scan promised.
     pub skipped: Vec<(PathBuf, String)>,
 }
@@ -123,7 +123,7 @@ pub struct ReclaimReport {
     pub bytes_reclaimed: u64,
     /// Actions abandoned because the files no longer matched at the moment of truth.
     pub skipped_changed: u64,
-    /// Actions that failed, with the reason. A failure here never leaves data destroyed — see the
+    /// Actions that failed, with the reason. A failure here never leaves data destroyed, see the
     /// transaction in [`replace_with_hardlink`].
     pub failed: Vec<(PathBuf, String)>,
     pub cancelled: bool,
@@ -132,8 +132,8 @@ pub struct ReclaimReport {
 /// Decide what to do, touching nothing.
 ///
 /// **Only [`GroupKind::Exact`] groups are ever considered.** That filter is the single most important
-/// line in this module: it is what keeps perceptual "similar" findings — which may be different
-/// photographs — permanently out of reach of anything destructive.
+/// line in this module: it is what keeps perceptual "similar" findings, which may be different
+/// photographs, permanently out of reach of anything destructive.
 pub fn plan(report: &DedupReport, opts: &ReclaimOptions) -> Plan {
     let mut out = Plan::default();
     for group in report.groups.iter().filter(|g| g.kind == GroupKind::Exact) {
@@ -182,7 +182,7 @@ pub fn plan(report: &DedupReport, opts: &ReclaimOptions) -> Plan {
                 None => out.skipped.push((
                     victim.path.clone(),
                     if opts.link && !same_volume {
-                        "on a different drive from the copy being kept — a hard link cannot span \
+                        "on a different drive from the copy being kept, a hard link cannot span \
                          filesystems; use --quarantine as well"
                             .into()
                     } else {
@@ -228,7 +228,7 @@ fn choose_keeper(files: &[ScannedFile], policy: KeepPolicy) -> Option<&ScannedFi
 /// Does this filename look auto-generated by a copy operation rather than being an original?
 ///
 /// Windows, macOS and most file managers mint `Copy of x`, `x - Copy` and `x (2)` when duplicating,
-/// and those are exactly the copies a person would choose to lose. Only the *filename* is examined —
+/// and those are exactly the copies a person would choose to lose. Only the *filename* is examined,
 /// guessing from folder names ("backup", "unsorted") misfires on people who legitimately organise that
 /// way. This only ever breaks a tie in [`KeepPolicy::ShortestPath`]; it can never cause an action that
 /// would not otherwise happen.
@@ -240,7 +240,7 @@ fn looks_like_a_copy(path: &Path) -> bool {
     if name.contains("copy") || name.contains("duplicate") {
         return true;
     }
-    // A trailing parenthesised number — "photo (2).jpg" — is the near-universal auto-rename.
+    // A trailing parenthesised number, "photo (2).jpg", is the near-universal auto-rename.
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().trim_end().to_string())
@@ -253,7 +253,7 @@ fn looks_like_a_copy(path: &Path) -> bool {
 }
 
 /// Where a quarantined file lands: the original path rebuilt under the quarantine root, so what was
-/// moved — and where it came from — stays obvious, and putting it back is a plain move.
+/// moved, and where it came from, stays obvious, and putting it back is a plain move.
 fn quarantine_dest(qdir: &Path, victim: &Path) -> PathBuf {
     let mut dest = qdir.to_path_buf();
     for c in victim.components() {
@@ -277,8 +277,8 @@ fn quarantine_dest(qdir: &Path, victim: &Path) -> PathBuf {
     dest
 }
 
-/// Carry out a plan. Each action re-verifies its pair immediately beforehand and is skipped — never
-/// forced — if reality has moved on since the scan.
+/// Carry out a plan. Each action re-verifies its pair immediately beforehand and is skipped, never
+/// forced, if reality has moved on since the scan.
 pub fn apply(plan: &Plan, sink: &dyn ProgressSink) -> Result<ReclaimReport> {
     let mut rep = ReclaimReport::default();
     for act in &plan.actions {
@@ -312,7 +312,7 @@ pub fn apply(plan: &Plan, sink: &dyn ProgressSink) -> Result<ReclaimReport> {
 /// `None` when they are not (so the caller skips), and an error only when they could not be read.
 ///
 /// Sizes are compared first because that rules out most drift for free, and a full hash of both files
-/// follows — the scan's verdict is deliberately not trusted here, however recent it is.
+/// follows, the scan's verdict is deliberately not trusted here, however recent it is.
 fn verify_pair(keeper: &Path, victim: &Path) -> io::Result<Option<[u8; 32]>> {
     let (mk, mv) = (fs::metadata(keeper)?, fs::metadata(victim)?);
     if !mk.is_file() || !mv.is_file() || mk.len() != mv.len() {
@@ -383,7 +383,7 @@ fn replace_with_hardlink(keeper: &Path, victim: &Path) -> io::Result<()> {
 }
 
 /// Move `victim` into quarantine. A plain rename when the destination is on the same filesystem;
-/// otherwise copy, **verify the copy against `expect`**, and only then remove the original — so an
+/// otherwise copy, **verify the copy against `expect`**, and only then remove the original, so an
 /// interrupted or corrupted cross-drive move can never destroy the only good copy.
 fn move_to_quarantine(victim: &Path, dest: &Path, expect: &[u8; 32]) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
@@ -436,7 +436,7 @@ fn unique_dest(dest: &Path) -> PathBuf {
     dest.to_path_buf()
 }
 
-/// A scratch name beside `path` — same directory, therefore same filesystem, so the rename that
+/// A scratch name beside `path`, same directory, therefore same filesystem, so the rename that
 /// follows is a metadata operation rather than a copy.
 fn sibling_temp(path: &Path, tag: &str) -> PathBuf {
     let name = path
@@ -689,7 +689,7 @@ mod tests {
                     bytes: 1,
                     dest: None,
                 },
-                // /a is kept above but consumed here — applying both could destroy the last copy.
+                // /a is kept above but consumed here, applying both could destroy the last copy.
                 PlannedAction {
                     keeper: PathBuf::from("/c"),
                     victim: PathBuf::from("/a"),

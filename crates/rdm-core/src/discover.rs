@@ -1,15 +1,15 @@
-//! Mirror discovery — turn a single user-provided URL (or a Metalink) into a set of mirror URLs that
+//! Mirror discovery, turn a single user-provided URL (or a Metalink) into a set of mirror URLs that
 //! all serve the SAME file, so the segmented engine can stripe across them. Deterministic, **no LLM**:
 //! every backend is plain HTTP + parsing.
 //!
 //! Discovery only *proposes* candidates. The engine's [`crate::verify_sources`] gate still byte-checks
 //! every discovered mirror against the anchor before it's striped, so a bogus or hostile discovered
-//! mirror can't corrupt the download — discovery finds sources, verification disposes of bad ones.
+//! mirror can't corrupt the download, discovery finds sources, verification disposes of bad ones.
 //!
 //! Backends here are the safest, standards-based tiers:
-//!   - **Metalink files** (RFC 5854 `.meta4` v4 and the older v3 `.metalink`) — a document listing
+//!   - **Metalink files** (RFC 5854 `.meta4` v4 and the older v3 `.metalink`), a document listing
 //!     mirrors + a whole-file checksum (+ size). Parsed leniently so both versions work.
-//!   - **Metalink/HTTP** (RFC 6249) — one GET whose `Link: <url>; rel=duplicate` headers enumerate
+//!   - **Metalink/HTTP** (RFC 6249), one GET whose `Link: <url>; rel=duplicate` headers enumerate
 //!     mirrors (what Fedora's redirector and some CDNs serve).
 //!
 //! Riskier tiers are deliberately deferred: distro mirror-list adapters (Ubuntu/Debian/Arch),
@@ -28,7 +28,7 @@ pub struct Discovered {
     pub sources: Vec<String>,
     /// Whole-file size, if the source advertised it.
     pub size: Option<u64>,
-    /// Whole-file SHA-256 (lowercase hex), if the source carried it — lets the caller verify the
+    /// Whole-file SHA-256 (lowercase hex), if the source carried it; lets the caller verify the
     /// finished download end-to-end.
     pub sha256: Option<String>,
     /// Human label of the backend that produced this (for logging).
@@ -130,7 +130,7 @@ pub fn parse_metalink(xml: &str) -> Option<Discovered> {
 /// Probe a plain URL for RFC 6249 Metalink/HTTP: a GET whose `Link: <mirror>; rel=duplicate` headers
 /// enumerate equivalent mirrors. The original URL is kept as the anchor (sources[0]); mirrors are
 /// appended. Returns None if the server advertises no duplicates. We issue a GET (some redirectors
-/// only attach the headers on the resource response, not a HEAD) but never read the body — dropping
+/// only attach the headers on the resource response, not a HEAD) but never read the body; dropping
 /// the response cancels the transfer.
 async fn metalink_http(client: &Client, url: &str) -> Result<Option<Discovered>, Err> {
     let resp = match client.get(url).send().await {
@@ -151,7 +151,7 @@ async fn metalink_http(client: &Client, url: &str) -> Result<Option<Discovered>,
         }
     }
     if sources.len() <= 1 {
-        return Ok(None); // no mirrors advertised — nothing gained over a plain download
+        return Ok(None); // no mirrors advertised, nothing gained over a plain download
     }
     let size = resp
         .headers()

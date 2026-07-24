@@ -1,4 +1,4 @@
-//! tar writer backend — creates `.tar` and, by wrapping the output sink in a whole-stream encoder,
+//! tar writer backend, creates `.tar` and, by wrapping the output sink in a whole-stream encoder,
 //! the full tar-family: `.tar.gz` `.tar.xz` `.tar.bz2` `.tar.lz4` `.tar.br` `.tar.zst`. Built on the
 //! `tar` crate's `Builder` (`append_data` per entry, trailer on `into_inner`); the codec wrapper is
 //! chosen at construction and finalized explicitly in `finish` (each encoder needs its trailer
@@ -6,7 +6,7 @@
 //!
 //! All encoders are pure-Rust and stream, except **zstd**: `ruzstd`'s encoder is pull-model with no
 //! `Write` sink, so `.tar.zst` accumulates a bounded chunk (8 MiB) and emits it as an independent
-//! zstd *frame* — concatenated frames are spec-legal (`cat`/pzstd produce them; our reader and
+//! zstd *frame*, concatenated frames are spec-legal (`cat`/pzstd produce them; our reader and
 //! `zstd -d` decode them all), so memory stays bounded instead of buffering the entire tar. Since
 //! ruzstd only implements its `Fastest` level, `.tar.zst` is a fast-tier archive regardless of
 //! `--best` (use `.tar.xz` for maximum ratio). A future `zstd-c` feature can swap in the C zstd.
@@ -37,12 +37,12 @@ use crate::writer::{ArchiveWriter, CreateOptions, CreateReport, Level, WriteHint
 /// Streams **exactly** `remaining` bytes from `inner`: truncates if the source now yields more than
 /// the recorded size (it grew after being sized) and zero-pads if it yields fewer (it shrank/was
 /// truncated). tar writes a fixed `size` into each entry header and then pads the body to whatever
-/// the reader produced — if those disagree, the archive tail desyncs. A source file mutated between
+/// the reader produced, if those disagree, the archive tail desyncs. A source file mutated between
 /// the create pre-pass and this streaming write is the realistic trigger; forcing the body length to
 /// equal the header `size` keeps the archive structurally valid regardless (GNU tar's behavior).
 ///
 /// Padding keeps the *container* valid but the entry's CONTENT is no longer what the user asked to
-/// archive — `padded` records that so the caller can surface it as an error instead of reporting a
+/// archive, `padded` records that so the caller can surface it as an error instead of reporting a
 /// successful create over silently-corrupted data (GNU tar likewise exits non-zero with "file
 /// changed as we read it").
 struct ExactReader<'a> {
@@ -74,7 +74,7 @@ impl io::Read for ExactReader<'_> {
 
 /// The output sink: a plain file, or the file behind a whole-stream encoder. Implements `Write` (the
 /// tar `Builder` writes through it) and finalizes the codec + returns the underlying `File` in
-/// `finish`. Encoder variants are boxed (their structs dwarf a plain file — clippy `large_enum_variant`).
+/// `finish`. Encoder variants are boxed (their structs dwarf a plain file, clippy `large_enum_variant`).
 enum TarSink {
     Plain(BufWriter<File>),
     Gz(Box<GzEncoder<BufWriter<File>>>),
@@ -83,7 +83,7 @@ enum TarSink {
     Lz4(Box<FrameEncoder<BufWriter<File>>>),
     Br(Box<CompressorWriter<BufWriter<File>>>),
     /// zstd accumulates at most [`ZSTD_FRAME_CHUNK`] bytes (ruzstd has no `Write` sink), emitting
-    /// each full chunk as its own zstd frame — bounded memory instead of buffering the whole tar.
+    /// each full chunk as its own zstd frame, bounded memory instead of buffering the whole tar.
     Zstd {
         buf: Vec<u8>,
         file: BufWriter<File>,
@@ -92,7 +92,7 @@ enum TarSink {
 }
 
 /// Bytes of tar accumulated before being compressed out as one independent zstd frame. Bounds the
-/// `.tar.zst` writer's memory (the old design held the ENTIRE tar in RAM until `finish` — archiving
+/// `.tar.zst` writer's memory (the old design held the ENTIRE tar in RAM until `finish`, archiving
 /// a 100 GiB tree OOM'd the process). Per-frame compression costs a little ratio; at ruzstd's
 /// Fastest level the difference is small.
 const ZSTD_FRAME_CHUNK: usize = 8 * 1024 * 1024;
@@ -112,7 +112,7 @@ impl TarSink {
                 mut file,
                 level,
             } => {
-                // Compress the final partial chunk as the last frame (in memory, then write out —
+                // Compress the final partial chunk as the last frame (in memory, then write out;
                 // ruzstd's streaming `compress` swallows target write errors).
                 if !buf.is_empty() {
                     file.write_all(&compress_to_vec(&buf[..], level))?;
@@ -139,7 +139,7 @@ impl Write for TarSink {
                 level,
             } => {
                 b.extend_from_slice(buf);
-                // A full chunk becomes one independent zstd frame — memory stays ≤ ~1 chunk.
+                // A full chunk becomes one independent zstd frame, memory stays ≤ ~1 chunk.
                 if b.len() >= ZSTD_FRAME_CHUNK {
                     file.write_all(&compress_to_vec(&b[..], *level))?;
                     b.clear();
@@ -202,7 +202,7 @@ pub struct TarArchiveWriter {
 impl TarArchiveWriter {
     pub fn create(path: &Path, fmt: Format, opts: &CreateOptions) -> Result<Self> {
         if opts.encrypt.is_some() {
-            // tar has no encryption slot — wrap it in .zip/.cram to encrypt.
+            // tar has no encryption slot, wrap it in .zip/.cram to encrypt.
             return Err(ArchiveError::UnsupportedEncryption);
         }
         let file = BufWriter::new(File::create(path)?);
@@ -245,7 +245,7 @@ impl TarArchiveWriter {
 }
 
 /// The entry's mtime as tar's unix-seconds field. `0` when the source carried no timestamp (or a
-/// pre-1970 one) — matching tar's own behavior for timestamp-less members. mtime comes from the
+/// pre-1970 one), matching tar's own behavior for timestamp-less members. mtime comes from the
 /// source file, not the wall clock, so an identical input tree still produces an identical tar.
 fn mtime_secs(entry: &Entry) -> u64 {
     entry
@@ -258,7 +258,7 @@ fn mtime_secs(entry: &Entry) -> u64 {
 impl ArchiveWriter for TarArchiveWriter {
     fn add_file(&mut self, entry: &Entry, body: &mut dyn io::Read, _hint: WriteHint) -> Result<()> {
         // tar is a whole-stream codec (the whole concatenation is compressed as one), so there is
-        // no per-entry method to switch — the incompressibility hint is handled upstream by the
+        // no per-entry method to switch, the incompressibility hint is handled upstream by the
         // engine dropping an Auto level to Fastest for a mostly-incompressible input.
         let mut header = Header::new_gnu();
         header.set_size(entry.size);
@@ -267,7 +267,7 @@ impl ArchiveWriter for TarArchiveWriter {
         header.set_entry_type(EntryType::Regular);
         let name = tar_name(entry);
         // `append_data` writes the header (with `size`) then pads the body to however many bytes the
-        // reader yields — so the body MUST be exactly `entry.size` long or the archive desyncs. The
+        // reader yields, so the body MUST be exactly `entry.size` long or the archive desyncs. The
         // live file may have changed size since it was recorded; `ExactReader` forces the exact
         // length (truncate-if-grew / zero-pad-if-shrank) so the archive is always valid.
         let mut exact = ExactReader {
@@ -277,7 +277,7 @@ impl ArchiveWriter for TarArchiveWriter {
         };
         self.builder()?.append_data(&mut header, name, &mut exact)?;
         // The pad/truncate above keeps the archive structurally valid, but the entry's bytes then
-        // differ from the source — that must surface as an error, not a silent success.
+        // differ from the source, that must surface as an error, not a silent success.
         if exact.padded {
             return Err(ArchiveError::Backend(format!(
                 "{}: file shrank while being archived (tail zero-padded)",
@@ -395,7 +395,7 @@ mod tests {
     }
 
     /// An input larger than one `ZSTD_FRAME_CHUNK` forces the bounded writer to emit several
-    /// concatenated zstd frames — the decode side must reassemble the tar byte-for-byte.
+    /// concatenated zstd frames, the decode side must reassemble the tar byte-for-byte.
     #[test]
     fn tar_zst_multi_frame_round_trips() {
         use crate::codec::decode_stream;

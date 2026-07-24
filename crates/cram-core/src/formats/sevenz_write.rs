@@ -1,4 +1,4 @@
-//! 7z writer backend — the create counterpart to [`super::sevenz`], via `sevenz-rust2`'s encoder
+//! 7z writer backend, the create counterpart to [`super::sevenz`], via `sevenz-rust2`'s encoder
 //! (the `compress` feature). Uses `push_archive_entry` (one independently-decodable pack per entry,
 //! *non-solid*): this both fits the incremental [`ArchiveWriter`] contract (stream one entry at a
 //! time) and matches Cram's strategy of authoring parallel-extractable layouts.
@@ -6,18 +6,18 @@
 //! **Adaptive per-entry store:** because each entry is its own pack, the content-method chain can
 //! change between entries. `push_archive_entry` records whatever `set_content_methods` holds at the
 //! time of the call into that entry's folder, so an incompressible entry (per the probe's
-//! [`WriteHint`]) is written with a COPY chain while the rest use LZMA2 — heterogeneous folders in
+//! [`WriteHint`]) is written with a COPY chain while the rest use LZMA2, heterogeneous folders in
 //! one 7z are standard and both 7-Zip and our own reader handle them.
 //!
 //! Encryption is 7z's real strength and both create forks are honored:
-//!   - **AES-256** content encryption (`AesEncoderOptions`) — 7-Zip's own scheme: ONE random salt
+//!   - **AES-256** content encryption (`AesEncoderOptions`), 7-Zip's own scheme: ONE random salt
 //!     per archive (the KDF then runs once and is cached), a fresh random IV per entry, and the
-//!     7-Zip-standard KDF work factor (`num_cycles_power = 19`, ≈524k SHA-256 rounds — the library
+//!     7-Zip-standard KDF work factor (`num_cycles_power = 19`, ≈524k SHA-256 rounds; the library
 //!     default of 8 is ~256 rounds, far too weak against offline guessing).
-//!   - **Header (name) encryption** — [`HeaderMode::NamesToo`] maps to `set_encrypt_header(true)`,
+//!   - **Header (name) encryption**, [`HeaderMode::NamesToo`] maps to `set_encrypt_header(true)`,
 //!     so the file listing needs the password too; [`HeaderMode::ContentsOnly`] leaves names visible.
 //!     `finish` installs a FRESH AES configuration before finalizing: the library encrypts the
-//!     header with the last configuration it saw, which would otherwise reuse the last entry's IV —
+//!     header with the last configuration it saw, which would otherwise reuse the last entry's IV;
 //!     and an archive with no file entries would have no AES configuration at all, silently writing
 //!     a NamesToo header in plaintext.
 //!

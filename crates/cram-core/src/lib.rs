@@ -1,34 +1,34 @@
-//! Cram core engine — the format-agnostic read/write/verify machinery every Cram tool builds on.
+//! Cram core engine, the format-agnostic read/write/verify machinery every Cram tool builds on.
 //!
 //! The design is a thin **spine** of two traits ([`reader`], [`writer`]) that each container backend
-//! implements, with all the shared machinery — output-path safety, overwrite/skip policy, progress,
-//! cancellation, and the adaptive parallel scheduler — living once in [`engine`] so every format
+//! implements, with all the shared machinery; output-path safety, overwrite/skip policy, progress,
+//! cancellation, and the adaptive parallel scheduler; living once in [`engine`] so every format
 //! inherits it. Adding a format is implementing the spine, not re-plumbing the engine.
 //!
 //! ## The layers
 //!
-//! - [`format`](mod@format) / [`sniff`] — `Format = Container × Codec`; magic-byte detection (extension only as a
+//! - [`format`](mod@format) / [`sniff`], `Format = Container × Codec`; magic-byte detection (extension only as a
 //!   tiebreaker). Compound formats like `.tar.gz` compose a container with a whole-stream codec.
-//! - [`model`] — the unified [`Entry`] metadata every backend yields, and the centralized zip-slip
+//! - [`model`], the unified [`Entry`] metadata every backend yields, and the centralized zip-slip
 //!   guard ([`EntryPath`]): the one place archive names are normalized so no backend can escape the
 //!   output directory.
-//! - [`reader`] — [`ArchiveReader`] (sequential `next_entry` stream) plus the [`RandomAccessReader`]
+//! - [`reader`], [`ArchiveReader`] (sequential `next_entry` stream) plus the [`RandomAccessReader`]
 //!   capability (`copy_entry` = the parallel per-entry seam; `read_range` = the mount primitive).
-//! - [`writer`] — the incremental [`ArchiveWriter`] (`add_file` / `add_dir` / `finish`) and its
+//! - [`writer`], the incremental [`ArchiveWriter`] (`add_file` / `add_dir` / `finish`) and its
 //!   [`CreateOptions`] / [`CreateReport`].
-//! - [`formats`] — the concrete backends: ZIP, 7z, tar-family, ISO 9660, RAR (read-only), raw
+//! - [`formats`], the concrete backends: ZIP, 7z, tar-family, ISO 9660, RAR (read-only), raw
 //!   single-stream codecs, and the native `.cram` dedup format. `formats::open` / `formats::create`
 //!   map a `Format` to the right backend.
-//! - [`codec`] — the byte-transform layer (`decode_stream`) plus the three-codec `plan` glue that
+//! - [`codec`], the byte-transform layer (`decode_stream`) plus the three-codec `plan` glue that
 //!   bridges the on-disk codec to the cost model.
-//! - [`hw`] — adaptive parallelism: hardware auto-detect, calibration, and a per-job `derive_plan`
+//! - [`hw`], adaptive parallelism: hardware auto-detect, calibration, and a per-job `derive_plan`
 //!   that sizes the worker pool from the machine profile and the archive's block shape.
-//! - [`engine`] — the orchestrator: [`extract`], [`create`](engine::create), [`convert`](engine::convert),
+//! - [`engine`], the orchestrator: [`extract`], [`create`](engine::create), [`convert`](engine::convert),
 //!   and [`verify`](engine::verify), dispatching random-access formats to the tuned parallel path and
 //!   everything else to the sequential stream.
-//! - [`secret`] — password handling: zeroized [`Secret`], lazy [`PasswordProvider`], [`EncryptSpec`].
-//! - [`probe`] — the adaptive content classifier (store-vs-compress) that feeds create.
-//! - [`source`] / `net` — the `ByteSource` abstraction and its rdm-backed download implementation
+//! - [`secret`], password handling: zeroized [`Secret`], lazy [`PasswordProvider`], [`EncryptSpec`].
+//! - [`probe`], the adaptive content classifier (store-vs-compress) that feeds create.
+//! - [`source`] / `net`, the `ByteSource` abstraction and its rdm-backed download implementation
 //!   (the `net` module is behind the `download` feature) for extract-while-downloading.
 //!
 //! The `.cram` container format is specified normatively in `docs/CRAM_FORMAT.md`; the ProjFS mount,

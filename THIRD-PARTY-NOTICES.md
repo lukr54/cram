@@ -2,7 +2,7 @@
 
 Cram itself is licensed under **MIT OR Apache-2.0** (see `LICENSE-MIT` and `LICENSE-APACHE`). It also
 links, bundles or redistributes the third-party components listed below, each under its own licence.
-Several of those licences require their text to be reproduced in binary distributions — this file is
+Several of those licences require their text to be reproduced in binary distributions, this file is
 how Cram does that, and it is installed alongside the binaries.
 
 Sections 1–4 cover components whose licence obliges us to reproduce a specific notice (UnRAR, the
@@ -12,7 +12,7 @@ in full in the companion `THIRD-PARTY-LICENSES.md`.
 
 ---
 
-## 1. UnRAR (RARLAB) — RAR decoding
+## 1. UnRAR (RARLAB), RAR decoding
 
 Cram reads RAR archives using the official UnRAR C++ engine (via the `unrar` / `unrar_sys` crates),
 statically linked into `cram.exe` and `cram-studio.exe`.
@@ -70,7 +70,7 @@ is read-only (list, test, extract, convert-out) by design and by licence.
 
 Reproduced from the UnRAR source distribution's `acknow.txt`. The Intel Slicing-by-8 licence
 explicitly requires that its notice be reproduced **in binary form**, in the documentation or other
-materials provided with the distribution — which is what this section is.
+materials provided with the distribution, which is what this section is.
 
 ```
                            ACKNOWLEDGMENTS
@@ -134,7 +134,7 @@ materials provided with the distribution — which is what this section is.
   to significantly improve RAR compression and speed.
 ```
 
-## 3. MinGW-w64 winpthreads — `libwinpthread-1.dll`
+## 3. MinGW-w64 winpthreads, `libwinpthread-1.dll`
 
 Cram is built with the MinGW-w64 (GNU) toolchain. The UnRAR C++ code pulls in the pthreads shim, and
 that one runtime DLL is redistributed next to the executables (`libwinpthread-1.dll`); libstdc++ and
@@ -197,7 +197,7 @@ OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISE
 OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## 4. Zstandard — the bundled C library
+## 4. Zstandard, the bundled C library
 
 The release build enables the `zstd-c` feature, which compiles Meta's C Zstandard library into
 `cram.exe` / `cram-extract.exe` (through the `zstd` / `zstd-sys` crates) as a fast `.cram` pack codec.
@@ -244,11 +244,11 @@ appear, with their own notices, in `THIRD-PARTY-LICENSES.md`.)
 ## 5. Rust dependencies
 
 Cram statically links a large graph of third-party Rust crates. **There is no GPL, AGPL, LGPL or MPL
-anywhere in the graph** — every dependency is permissive (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause,
+anywhere in the graph**, every dependency is permissive (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause,
 ISC, Unicode-3.0, bzip2-1.0.6, and 0BSD / CC0 / Unlicense, in various combinations).
 
 The **full copyright notice and licence text for every one of these crates** is reproduced in the
-companion [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md) — generated from each crate's own
+companion [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md), generated from each crate's own
 `LICENSE` file and distributed alongside the binaries. That appendix, not a summary, is what discharges
 the reproduction requirement the MIT, BSD-2/3-Clause, ISC, Unicode-3.0 and bzip2 licences place on
 binary distributions.

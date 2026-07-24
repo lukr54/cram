@@ -1,4 +1,4 @@
-//! 7z encryption correctness — the create side must produce archives that (1) round-trip through
+//! 7z encryption correctness, the create side must produce archives that (1) round-trip through
 //! our own reader with the hardened KDF parameters (num_cycles_power = 19, one archive salt, fresh
 //! per-entry IVs), and (2) actually encrypt the header when NamesToo is requested, including the
 //! empty/dirs-only case (no files, only directories), where the header must still be encrypted.
@@ -86,7 +86,7 @@ fn sevenz_names_too_header_encrypted_even_without_file_entries() {
     )
     .expect("create dirs-only NamesToo 7z");
 
-    // Without the password the listing must be unreadable — before the fix this open SUCCEEDED
+    // Without the password the listing must be unreadable, before the fix this open SUCCEEDED
     // and revealed the directory name because the header went out in plaintext.
     let no_pw = formats::open(&archive, Format::sevenz(), Arc::new(NoPassword));
     assert!(

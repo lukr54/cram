@@ -1,4 +1,4 @@
-//! Growing byte sources — the seam for **extract-while-download**.
+//! Growing byte sources, the seam for **extract-while-download**.
 //!
 //! A [`ByteSource`] is a byte stream whose *contiguous prefix* grows over time: a segmented download
 //! in progress publishes a **watermark** (how many bytes are available from offset 0), and the
@@ -19,7 +19,7 @@ pub enum SourceStatus {
     /// At least the requested offset is now available; more may still arrive. Carries the current
     /// watermark.
     Available(u64),
-    /// The source is complete — no more bytes will arrive. Carries the final total.
+    /// The source is complete, no more bytes will arrive. Carries the final total.
     Finished(u64),
     /// The download failed or was cancelled before completing. Carries the watermark reached.
     Aborted(u64),
@@ -72,7 +72,7 @@ impl Read for SourceReader {
                 self.pos += n as u64;
                 return Ok(n);
             }
-            // At the frontier — block until more bytes, completion, or abort.
+            // At the frontier, block until more bytes, completion, or abort.
             match self.source.wait_until(self.pos + 1) {
                 SourceStatus::Available(_) => continue, // re-check available() and read
                 SourceStatus::Finished(total) => {
@@ -92,7 +92,7 @@ impl Read for SourceReader {
     }
 }
 
-/// A fully-available in-memory source — the degenerate [`ByteSource`] (watermark = length, already
+/// A fully-available in-memory source, the degenerate [`ByteSource`] (watermark = length, already
 /// finished). Useful for extracting from a buffer and as a test double.
 pub struct BufferSource {
     data: Vec<u8>,

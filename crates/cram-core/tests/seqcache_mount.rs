@@ -1,6 +1,6 @@
 //! Sequential-format archives (tar, 7z) made mountable via the decode-to-cache adapter.
 //!
-//! These drive the *exact* seam the ProjFS mount uses — [`formats::open_random_access`] — on formats
+//! These drive the *exact* seam the ProjFS mount uses, [`formats::open_random_access`]; on formats
 //! that have no native random-access ability, then check the resulting [`RandomAccessReader`] serves
 //! every entry's bytes correctly (whole-entry `copy_entry`, and arbitrary `read_range` slices,
 //! including out-of-range requests that must clamp/empty rather than panic).
@@ -103,7 +103,7 @@ fn check_random_access(tag: &str, fmt: Format, file_name: &str) {
             );
         }
 
-        // Out-of-range / boundary requests must clamp or return empty — never panic.
+        // Out-of-range / boundary requests must clamp or return empty, never panic.
         assert!(reader
             .read_range(idx, content.len() as u64, 10)
             .unwrap()

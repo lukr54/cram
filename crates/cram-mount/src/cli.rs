@@ -1,15 +1,15 @@
 //! The `mount` command-line, called by the unified `cram` binary. `args[0]` is treated as the program
-//! name (ignored) and the mount parameters are read from `args[1..]` — the same shape the former
+//! name (ignored) and the mount parameters are read from `args[1..]`, the same shape the former
 //! standalone `cram-mount` binary parsed, so behavior is unchanged.
 //!
-//! `cram mount [--selftest] [-p <pw>] <archive> <mount-dir>` — mount an archive as a virtual folder via
+//! `cram mount [--selftest] [-p <pw>] <archive> <mount-dir>`, mount an archive as a virtual folder via
 //! ProjFS. The format is sniffed; every readable container mounts: the natively-seekable ones (`.cram`,
 //! ZIP, ISO 9660) serve ranges straight from disk, and the sequential ones (tar/7z/rar/raw) are decoded
 //! once into a bounded in-memory cache and served from there.
 //!
 //! Without `--selftest`: mounts and waits for Enter (browse it in Explorer, then press Enter to
 //! unmount). With `--selftest`: mounts, walks + reads the whole virtual tree back through ProjFS,
-//! prints what it found, and unmounts — a self-contained end-to-end check.
+//! prints what it found, and unmounts; a self-contained end-to-end check.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

@@ -2,13 +2,13 @@
 //!
 //! The original file is split into `N` equal **data shards** (the last zero-padded); Reed-Solomon
 //! over GF(2^8) computes `M` **parity shards**. The sidecar `<file>.cramrec` stores only the parity
-//! shards, a BLAKE3 hash of every shard, and a little metadata — the data shards stay in the original
+//! shards, a BLAKE3 hash of every shard, and a little metadata; the data shards stay in the original
 //! file, so the sidecar costs only about `M/N` of the file size. If the original later suffers bit-rot
 //! or truncation, `repair` recomputes each data shard's hash to find the damaged/missing ones, then
 //! RS-reconstructs them from the surviving data and parity shards (recovering up to `M` lost shards).
 //!
 //! This is a **sidecar**: it is computed over the file's bytes and never changes the `.cram` format
-//! (which is frozen at v1), so it composes with any archive — or any file at all.
+//! (which is frozen at v1), so it composes with any archive, or any file at all.
 //!
 //! Sidecar byte layout (all integers little-endian):
 //! ```text
@@ -25,7 +25,7 @@ pub mod cli;
 
 /// GF(2^8) Reed-Solomon caps total shards at 255; keep headroom.
 const MAX_TOTAL_SHARDS: usize = 255;
-/// Target data-shard size — N scales so shards land near this, keeping the sidecar and per-shard
+/// Target data-shard size, N scales so shards land near this, keeping the sidecar and per-shard
 /// hashing overhead reasonable across tiny and large files.
 const TARGET_SHARD: u64 = 256 * 1024;
 /// Never more than this many data shards (bounds parity room + shard count).
@@ -38,7 +38,7 @@ pub const MAGIC: &[u8; 8] = b"CRAMREC\x01";
 pub const VERSION: u8 = 1;
 const HASH_LEN: usize = 32;
 
-/// A recovery error. Kept as strings — this is a small standalone tool.
+/// A recovery error. Kept as strings, this is a small standalone tool.
 pub type RecResult<T> = Result<T, String>;
 
 fn hash(bytes: &[u8]) -> [u8; 32] {
@@ -165,7 +165,7 @@ fn parse_sidecar(bytes: &[u8]) -> RecResult<Sidecar> {
     // Geometry must be internally consistent: `n` is exactly ⌈orig_len / shard_size⌉, so the file is
     // `(n-1)*shard_size < orig_len ≤ n*shard_size`. This ties the reconstructed buffer size
     // (`n*shard_size`, allocated in `repair`) to `orig_len`, so a hostile sidecar can't claim a tiny
-    // parity payload yet force a multi-hundred-GiB allocation. (The empty file — n=1, orig_len=0 — is
+    // parity payload yet force a multi-hundred-GiB allocation. (The empty file, n=1, orig_len=0; is
     // the one legitimate exception.)
     let total = (n as u64)
         .checked_mul(shard_size as u64)
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn rejects_geometry_bomb_sidecar() {
         // Take a well-formed sidecar (n>1) and shrink its declared orig_len to 1. The buffer `repair`
-        // reconstructs is n*shard_size, which is now wildly larger than the claimed original — exactly
+        // reconstructs is n*shard_size, which is now wildly larger than the claimed original; exactly
         // the "tiny declared size, huge allocation" shape. The geometry-consistency check must reject
         // it at parse time. Mutating orig_len (not n) keeps every hash/parity read in-bounds, so the
         // parse reaches the geometry check rather than tripping the earlier truncation guard.
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn parse_survives_fuzzed_sidecars() {
-        // A malformed / hostile `.cramrec` must always come back as `Err` — never a panic (OOB index,
+        // A malformed / hostile `.cramrec` must always come back as `Err`, never a panic (OOB index,
         // integer overflow, `unwrap` on `None`) and never a giant allocation. Feeds pure-random and
         // mutated-from-valid sidecars to both public entry points.
         let mut x = 0xDEAD_BEEF_1234_5678u64;

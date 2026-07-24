@@ -28,7 +28,7 @@ struct CreateItem {
 }
 
 /// Build a cram [`Entry`] for an archive member; `None` if the (generated) name is somehow unsafe.
-/// `modified` is the source's on-disk mtime — carried into the classic containers (tar/zip/7z) so
+/// `modified` is the source's on-disk mtime, carried into the classic containers (tar/zip/7z) so
 /// extraction can restore it. `.cram` ignores it (the frozen format stores no timestamps).
 fn make_entry(
     archive_name: &str,
@@ -139,7 +139,7 @@ pub fn create(
     // Adaptive probe (Level::Auto only): classify each file store-vs-compress. A per-entry hint is
     // honored by the random-access backends (ZIP, 7z); the aggregate summary lets a whole-stream
     // backend (tar.gz/xz) avoid burning CPU on a mostly-already-compressed input. An explicit
-    // `--store` or a forced codec skips the probe entirely — the user has already decided.
+    // `--store` or a forced codec skips the probe entirely, the user has already decided.
     if opts.level == Level::Auto && opts.codec.is_none() {
         let mut summary = ProbeSummary::default();
         for item in &mut items {
@@ -161,7 +161,7 @@ pub fn create(
         }
     }
 
-    // Build in a sibling staging file and rename over `archive` only after a successful finish —
+    // Build in a sibling staging file and rename over `archive` only after a successful finish,
     // writing directly to `archive` truncated any pre-existing archive at that path the moment the
     // writer opened, so a create that then failed (unreadable input, disk full, ZIP64 overflow)
     // destroyed the user's old archive and left a headerless fragment in its place.

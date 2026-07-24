@@ -1,7 +1,7 @@
 //! A damaged RAR must not cost you the files that are still good.
 //!
 //! UnRAR's safe Rust API takes the archive by value when reading an entry and drops the C handle if
-//! that read fails, so a single "File CRC error" leaves no cursor to continue through — and WinRAR,
+//! that read fails, so a single "File CRC error" leaves no cursor to continue through, and WinRAR,
 //! the reference behaviour here, reports that file and carries on to the next one. The backend
 //! therefore rebuilds the cursor past a damaged entry, which is what this test pins down.
 //!
@@ -35,7 +35,7 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Deterministic pseudo-random bytes — incompressible enough that the archive layout is predictable,
+/// Deterministic pseudo-random bytes, incompressible enough that the archive layout is predictable,
 /// so the corruption below lands inside one entry's payload rather than in a header.
 fn noise(seed: u64, n: usize) -> Vec<u8> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -60,7 +60,7 @@ fn one_damaged_entry_does_not_lose_the_others() {
     fs::create_dir_all(&src).unwrap();
 
     // The third file is much larger than the rest, so the middle of the archive is squarely inside
-    // its compressed payload — exactly one entry gets damaged.
+    // its compressed payload, exactly one entry gets damaged.
     let names = [
         "file1.bin",
         "file2.bin",

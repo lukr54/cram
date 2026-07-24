@@ -33,7 +33,7 @@ const DOMAIN: &[u8] = b"cram-signature-v1";
 const SIG_LEN: usize = 8 + 32 + 32 + 64;
 const KEY_LEN: usize = 8 + 32;
 
-/// A signing error. Kept as strings — this is a small standalone tool.
+/// A signing error. Kept as strings, this is a small standalone tool.
 pub type SigResult<T> = Result<T, String>;
 
 fn hash(bytes: &[u8]) -> [u8; 32] {
@@ -56,7 +56,7 @@ fn signing_message(file_hash: &[u8; 32]) -> Vec<u8> {
     m
 }
 
-/// Generate a fresh signing key. Returns `(key_file_bytes, public_key_hex)` — persist the key file
+/// Generate a fresh signing key. Returns `(key_file_bytes, public_key_hex)`; persist the key file
 /// privately and publish/pin the hex public key so verifiers can confirm the signer.
 pub fn generate_key() -> SigResult<(Vec<u8>, String)> {
     let mut seed = [0u8; 32];
@@ -94,7 +94,7 @@ pub fn sign(data: &[u8], key: &SigningKey) -> Vec<u8> {
     assemble_sidecar(key, &hash(data))
 }
 
-/// BLAKE3 a file by streaming it in bounded chunks — never loads the whole file into RAM, so an
+/// BLAKE3 a file by streaming it in bounded chunks, never loads the whole file into RAM, so an
 /// archive far larger than memory (hundreds of GB) can still be signed/verified.
 fn hash_file(path: &Path) -> SigResult<[u8; 32]> {
     let mut f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -131,7 +131,7 @@ pub fn verify(data: &[u8], sidecar: &[u8], expect_pubkey: Option<&str>) -> SigRe
     verify_hashed(&hash(data), sidecar, expect_pubkey)
 }
 
-/// Verify the file at `path` against `sidecar` bytes, streaming the file's hash (memory-bounded) —
+/// Verify the file at `path` against `sidecar` bytes, streaming the file's hash (memory-bounded);
 /// the large-file counterpart of [`verify`].
 pub fn verify_file(
     path: &Path,
@@ -155,7 +155,7 @@ fn verify_hashed(
     let sig_bytes: [u8; 64] = sidecar[72..136].try_into().unwrap();
 
     let pk = VerifyingKey::from_bytes(&pk_bytes).map_err(|e| format!("bad public key: {e}"))?;
-    // Pin the signer first, if requested — don't even bother verifying a key we won't accept.
+    // Pin the signer first, if requested; don't even bother verifying a key we won't accept.
     if let Some(exp) = expect_pubkey {
         if !exp.trim().eq_ignore_ascii_case(&hex(&pk_bytes)) {
             return Err("signer's public key does not match the expected key".into());

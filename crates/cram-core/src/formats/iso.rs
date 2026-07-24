@@ -1,4 +1,4 @@
-//! ISO 9660 (`.iso`) reader — CD/DVD filesystem images. **Read-only.**
+//! ISO 9660 (`.iso`) reader, CD/DVD filesystem images. **Read-only.**
 //!
 //! ISO 9660 stores each file as one or more uncompressed **extents** at sector offsets, with a tree of
 //! fixed-shape *directory records* describing the layout. There is no compression and no per-file
@@ -14,7 +14,7 @@
 //! The reader is hardened against hostile images: every extent is bounds-checked against the file
 //! length; directory recursion is depth-, cycle-, count-, and **cumulative-byte** guarded (so aliased
 //! or overlapping directory extents can't drive read/parse amplification); the entry count is capped
-//! *inside* the parse loop (no overshoot); and unsafe names are dropped — so pointing it at a crafted
+//! *inside* the parse loop (no overshoot), and unsafe names are dropped, so pointing it at a crafted
 //! `.iso` cannot escape the output dir, loop forever, or exhaust memory/IO.
 
 use std::fs::File;
@@ -132,7 +132,7 @@ impl IsoReader {
         let vol = read_volume(&mut file, file_len)?;
         let block = vol.block_size;
 
-        // Walk the directory tree from the root, iteratively (explicit stack — no recursion, so a
+        // Walk the directory tree from the root, iteratively (explicit stack; no recursion, so a
         // deep/hostile tree can't overflow the stack). `seen` breaks extent cycles.
         let mut entries = Vec::new();
         let mut locs = Vec::new();
@@ -143,7 +143,7 @@ impl IsoReader {
         // Cumulative anti-amplification guards: a valid image's total directory data is a small
         // fraction of the file, so cap cumulative directory bytes read at ~the image size (with a
         // floor for tiny images), and cap the number of directories descended. Distinct LBAs can alias
-        // the SAME byte range, which `seen` alone does not catch — the byte budget does.
+        // the SAME byte range, which `seen` alone does not catch; the byte budget does.
         let dir_budget = file_len.max(MIN_DIR_BUDGET);
         let mut dir_bytes_read: u64 = 0;
         let mut descended: usize = 0;
@@ -154,7 +154,7 @@ impl IsoReader {
 
         while let Some((extent, len, prefix, depth)) = stack.pop() {
             if depth > MAX_DEPTH {
-                continue; // too deep — stop descending this branch
+                continue; // too deep, stop descending this branch
             }
             descended += 1;
             if descended > MAX_ENTRIES {
@@ -168,7 +168,7 @@ impl IsoReader {
             {
                 // A directory whose extent runs past EOF (or is absurd) means the image is
                 // truncated or corrupt. Silently skipping it would open the ISO as a SUCCESS with
-                // a partial tree — extraction would then "complete" while missing entire branches.
+                // a partial tree, extraction would then "complete" while missing entire branches.
                 return Err(corrupt(
                     "ISO directory extent out of bounds (truncated or corrupt image)",
                 ));
@@ -244,7 +244,7 @@ fn read_volume(file: &mut File, file_len: u64) -> Result<Volume> {
                     joliet = parse_vol(&vd, true).ok();
                 }
             }
-            _ => {} // boot record / partition — ignore
+            _ => {} // boot record / partition, ignore
         }
     }
 
@@ -804,8 +804,8 @@ mod tests {
             file_len,
         )
         .unwrap();
-        // The directory IS an entry (kind Dir, empty Loc) — so listing shows it and extraction
-        // recreates empty dirs — and it is ALSO queued for traversal.
+        // The directory IS an entry (kind Dir, empty Loc), so listing shows it and extraction
+        // recreates empty dirs, and it is ALSO queued for traversal.
         assert_eq!(entries.len(), 1, "the directory is emitted as an entry");
         assert_eq!(entries[0].kind, EntryKind::Dir);
         assert_eq!(entries[0].path.raw(), "SUB");
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn multi_extent_exceeding_image_size_is_dropped() {
-        // Two aliased extents (same offset) whose coalesced size exceeds the image — the classic
+        // Two aliased extents (same offset) whose coalesced size exceeds the image, the classic
         // amplification shape. Must be dropped rather than reported as a file larger than the image.
         let file_len = 307_200u64; // 300 KiB
         let mut data = make_record(b"BIG;1", 1, 160_000, 0x80);

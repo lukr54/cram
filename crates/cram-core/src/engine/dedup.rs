@@ -1,4 +1,4 @@
-//! Find duplicate files across folders and drives — **without** archiving anything.
+//! Find duplicate files across folders and drives, **without** archiving anything.
 //!
 //! The `.cram` writer dedups *chunks inside one archive*; this dedups *whole files across a whole
 //! collection*, which is the problem an inherited photo/video pile actually has: the same JPEG sitting
@@ -10,11 +10,11 @@
 //! Hashing hundreds of terabytes is not viable, and it is not necessary. Three gates run in order, each
 //! only over what survived the last:
 //!
-//! 1. **Size.** A file whose size is unique in the whole set *cannot* have a byte-identical twin — no
+//! 1. **Size.** A file whose size is unique in the whole set *cannot* have a byte-identical twin, no
 //!    read at all. On a real collection this eliminates most files (and most bytes) outright.
-//! 2. **Partial hash** — the first and last 64 KiB of each same-size file. Near-misses (re-encodes,
+//! 2. **Partial hash**, the first and last 64 KiB of each same-size file. Near-misses (re-encodes,
 //!    different captures that happen to match in size) separate here for ~128 KiB instead of a full read.
-//! 3. **Full BLAKE3** — only for files that still share both size and partial hash. Equal full hash is
+//! 3. **Full BLAKE3**, only for files that still share both size and partial hash. Equal full hash is
 //!    the confirmation; nothing is called a duplicate on a partial read.
 //!
 //! ## Per-drive scheduling
@@ -27,7 +27,7 @@
 //! ## What is safe to act on
 //!
 //! [`GroupKind::Exact`] groups are byte-identical and interchangeable. [`GroupKind::Similar`] groups
-//! (see [`similar`]) are *visually* alike and are **not** interchangeable — a burst of near-identical
+//! (see [`similar`]) are *visually* alike and are **not** interchangeable, a burst of near-identical
 //! frames is a legitimate set of distinct photos. Similar groups always report `reclaimable == 0` and
 //! exist for human review only; no automated action may consume them.
 
@@ -57,7 +57,7 @@ const MAX_READERS_PER_VOLUME: usize = 8;
 /// Knobs for a duplicate scan.
 #[derive(Clone, Debug)]
 pub struct DedupOptions {
-    /// Ignore files smaller than this. Defaults to 1, which drops zero-byte files — every empty file
+    /// Ignore files smaller than this. Defaults to 1, which drops zero-byte files; every empty file
     /// is "identical" to every other, which is noise rather than a finding.
     pub min_size: u64,
     /// Also look for *visually similar* images (not just byte-identical ones). Report-only.
@@ -79,11 +79,11 @@ impl Default for DedupOptions {
 
 /// Filesystem identity of a file: two paths with the same [`FileId`] are the *same bytes on disk*
 /// (a hard link), not two copies. Reclaimable space must not count them twice, or the tool would
-/// promise back space that is not there — and, worse, claim to have freed it a second time on a
+/// promise back space that is not there, and, worse, claim to have freed it a second time on a
 /// re-run over an already-linked collection.
 ///
 /// On Unix this is `(dev, ino)` and comes free with the `stat` the walk already does. On Windows it is
-/// the volume serial plus 64-bit file index, which requires actually opening the file — so it is
+/// the volume serial plus 64-bit file index, which requires actually opening the file, so it is
 /// resolved lazily, only for files that turn out to be duplicates (see [`file_identity`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FileId {
@@ -100,13 +100,13 @@ pub struct ScannedFile {
     pub id: Option<FileId>,
 }
 
-/// Why a group's files are grouped — and, decisively, whether they are interchangeable.
+/// Why a group's files are grouped, and, decisively, whether they are interchangeable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GroupKind {
     /// Byte-identical: same size, same full BLAKE3. Interchangeable; safe to act on.
     Exact,
     /// Visually similar images within the perceptual-hash threshold. **Not** byte-identical and **not**
-    /// interchangeable — review by hand. Never eligible for automated deletion or linking.
+    /// interchangeable, review by hand. Never eligible for automated deletion or linking.
     Similar,
 }
 
@@ -129,7 +129,7 @@ pub struct DedupReport {
     pub files_scanned: u64,
     /// Total logical size of those files.
     pub bytes_scanned: u64,
-    /// Bytes actually read to reach the verdict — the number that shows how much work the size gate saved.
+    /// Bytes actually read to reach the verdict, the number that shows how much work the size gate saved.
     pub bytes_hashed: u64,
     /// Files skipped because they could not be opened or read (permissions, dead links, I/O errors).
     pub unreadable: u64,
@@ -138,7 +138,7 @@ pub struct DedupReport {
 }
 
 impl DedupReport {
-    /// Only the byte-identical groups — the ones that may be acted on.
+    /// Only the byte-identical groups, the ones that may be acted on.
     pub fn exact_groups(&self) -> impl Iterator<Item = &DupeGroup> {
         self.groups.iter().filter(|g| g.kind == GroupKind::Exact)
     }
@@ -215,7 +215,7 @@ pub fn scan(
         candidates.extend(small);
     }
 
-    // ---- 4. Full hash — the confirmation ------------------------------------------------------
+    // ---- 4. Full hash, the confirmation ------------------------------------------------------
     let full = hash_pass(&files, &candidates, HashMode::Full, sink, &mut report)?;
     let mut exact: HashMap<(u64, [u8; 32]), Vec<usize>> = HashMap::new();
     for (&i, h) in &full {
@@ -228,7 +228,7 @@ pub fn scan(
         let mut members: Vec<ScannedFile> = idxs.iter().map(|&i| files[i].clone()).collect();
         members.sort_by(|a, b| a.path.cmp(&b.path));
         // Resolve identity for any member the walk could not supply it for (Windows, where it costs
-        // an open). Only duplicates need it, so this is a handful of files rather than the whole set —
+        // an open). Only duplicates need it, so this is a handful of files rather than the whole set;
         // and without it, copies that are *already* hard-linked would be counted as reclaimable space
         // that does not exist.
         for m in &mut members {
@@ -263,7 +263,7 @@ pub fn scan(
         report.groups.extend(sim);
     }
 
-    // Biggest win first — that is the order a human wants to review.
+    // Biggest win first, that is the order a human wants to review.
     report.groups.sort_by(|a, b| {
         b.reclaimable.cmp(&a.reclaimable).then_with(|| {
             a.files
@@ -292,7 +292,7 @@ fn distinct_copies(files: &[ScannedFile]) -> usize {
     seen.len() + unknown
 }
 
-/// Recursively collect regular files at or above `min_size`. Symlinks are never followed — that would
+/// Recursively collect regular files at or above `min_size`. Symlinks are never followed, that would
 /// invent "duplicates" that are really one file, and could loop forever. Unreadable directories are
 /// counted and skipped rather than aborting a scan that may span many drives.
 fn walk(
@@ -345,7 +345,7 @@ fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
     })
 }
 
-/// Windows cannot answer this from a `Metadata` — it needs an open handle — so the walk leaves it
+/// Windows cannot answer this from a `Metadata`, it needs an open handle, so the walk leaves it
 /// unset and [`file_identity`] fills it in later for the few files that turn out to be duplicates.
 /// Paying an extra file open for every file in a multi-terabyte walk would cost far more than it saves.
 #[cfg(not(unix))]
@@ -426,7 +426,7 @@ fn hash_pass(
     Ok(out.into_inner().unwrap())
 }
 
-/// Bytes a pass actually reads for a file of `size` — what progress and the "bytes read" tally mean.
+/// Bytes a pass actually reads for a file of `size`, what progress and the "bytes read" tally mean.
 fn read_len(size: u64, mode: HashMode) -> u64 {
     match mode {
         HashMode::Full => size,
@@ -444,7 +444,7 @@ fn volume_key(f: &ScannedFile) -> String {
 }
 
 /// Volume identity for an arbitrary path, including one that does not exist yet (a quarantine
-/// directory about to be created) — in that case the nearest existing ancestor answers, since a new
+/// directory about to be created), in that case the nearest existing ancestor answers, since a new
 /// directory lands on the same filesystem as its parent.
 ///
 /// Whether two paths share a volume decides whether a hard link between them is even possible, so this
@@ -468,12 +468,12 @@ pub(crate) fn volume_of(path: &Path) -> String {
 }
 
 /// Whether two existing paths are the *same bytes on disk* (one inode, two names). Acting on a pair
-/// that is already hard-linked would be pure churn — and would "reclaim" space that was never in use,
+/// that is already hard-linked would be pure churn, and would "reclaim" space that was never in use,
 /// reporting a saving that did not happen.
 pub(crate) fn same_physical_file(a: &Path, b: &Path) -> bool {
     match (file_identity(a), file_identity(b)) {
         (Some(x), Some(y)) => x == y,
-        // Unknown identity must never be treated as "same file" — that would skip a real duplicate.
+        // Unknown identity must never be treated as "same file", that would skip a real duplicate.
         _ => false,
     }
 }
@@ -549,7 +549,7 @@ fn windows_identity(path: &Path) -> Option<FileId> {
     use std::os::windows::ffi::OsStrExt;
     const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // read | write | delete
     const OPEN_EXISTING: u32 = 3;
-    // Lets the handle open a directory as well as a file, and asks for no access rights at all —
+    // Lets the handle open a directory as well as a file, and asks for no access rights at all;
     // metadata only, so it cannot disturb anything else holding the file open.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
@@ -667,11 +667,9 @@ fn hash_file(
     Ok(Some(*hasher.finalize().as_bytes()))
 }
 
-// ===============================================================================================
 // Visually-similar images
-// ===============================================================================================
 
-/// Perceptual matching for images: finds photos that *look* the same without being byte-identical —
+/// Perceptual matching for images: finds photos that *look* the same without being byte-identical,
 /// a resized copy, a re-save at different quality, a screenshot of the same shot.
 ///
 /// **These findings are never actionable.** A perceptual hash cannot tell a redundant re-encode from
@@ -685,11 +683,11 @@ pub mod similar {
     /// Default Hamming distance.
     ///
     /// Two *unrelated* 64-bit dHashes differ in ~32 bits (half of them, σ ≈ 4), so 8 sits about six
-    /// standard deviations below chance — a coincidental match is vanishingly unlikely. It was chosen
+    /// standard deviations below chance, a coincidental match is vanishingly unlikely. It was chosen
     /// by measurement, not taste: at the stricter value of 3 a photo does **not** match its own
     /// resized/re-compressed copy, which is precisely the case this feature exists to catch, while at
     /// 8 it does and genuinely different photos still never group (verified up to [`MAX_DISTANCE`]).
-    /// Raising it trades review noise for recall — safely, since similar findings are never actionable.
+    /// Raising it trades review noise for recall, safely, since similar findings are never actionable.
     pub const DEFAULT_DISTANCE: u32 = 8;
     /// Largest distance the banded index can serve without missing matches (see [`find`]).
     pub const MAX_DISTANCE: u32 = 15;
@@ -713,7 +711,7 @@ pub mod similar {
     ///
     /// Comparing every image with every other is quadratic and hopeless at this scale, so candidate
     /// pairs come from a **banded index**: the 64-bit hash is split into `distance + 1` bands, and two
-    /// hashes within Hamming distance `d` must agree exactly on at least one band (pigeonhole — `d`
+    /// hashes within Hamming distance `d` must agree exactly on at least one band (pigeonhole, `d`
     /// differing bits cannot touch all `d + 1` bands). Only files sharing a band are compared, and the
     /// true distance is then checked. No matches are missed.
     pub fn find(
@@ -836,7 +834,7 @@ pub mod similar {
         Vec::new()
     }
 
-    /// **dHash**: downscale to 9×8 greyscale and emit one bit per horizontal neighbour pair —
+    /// **dHash**: downscale to 9×8 greyscale and emit one bit per horizontal neighbour pair,
     /// "is this pixel brighter than the one to its right". Encoding *gradients* rather than absolute
     /// values is what makes it survive re-encoding, resizing and brightness shifts while still
     /// separating genuinely different pictures.
@@ -939,7 +937,7 @@ mod tests {
     fn same_size_different_content_is_not_a_duplicate() {
         // Guards the gate that matters most for safety: size alone must never imply duplicate. These
         // differ only in the LAST byte, so they also survive the first-window partial hash and are
-        // separated only by reading further — exactly the case a naive "head hash" tool gets wrong.
+        // separated only by reading further, exactly the case a naive "head hash" tool gets wrong.
         let dir = scratch("collide");
         let n = 1024 * 1024;
         let mut a = vec![7u8; n];
@@ -978,7 +976,7 @@ mod tests {
     #[test]
     fn already_hardlinked_copies_reclaim_nothing() {
         // Two names, one file. The group is still worth showing, but claiming space back from it
-        // would be a lie — and would make a second run of `--link --apply` report a saving it did not
+        // would be a lie, and would make a second run of `--link --apply` report a saving it did not
         // make. This is what makes the whole operation idempotent.
         let dir = scratch("hardlink");
         let blob = vec![0x4Du8; 300 * 1024];
@@ -1011,7 +1009,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Build a photo-like image: a gradient sky over ground with scattered blobs. Structure matters —
+    /// Build a photo-like image: a gradient sky over ground with scattered blobs. Structure matters,
     /// a flat colour would hash identically to every other flat colour and prove nothing.
     #[cfg(feature = "phash")]
     fn synthetic_photo(seed: u32, w: u32, h: u32) -> image::RgbImage {
@@ -1056,7 +1054,7 @@ mod tests {
     }
 
     /// The two claims the perceptual feature lives or dies by: a photo matches its own resized copy
-    /// (recall), and two genuinely different photos never match (no false positives — the dangerous
+    /// (recall), and two genuinely different photos never match (no false positives; the dangerous
     /// direction, since a false pair invites a human to delete a photo that isn't a duplicate).
     #[cfg(feature = "phash")]
     #[test]
@@ -1064,7 +1062,7 @@ mod tests {
         let dir = scratch("similar");
         let photo = synthetic_photo(1, 640, 480);
         photo.save(dir.join("original.png")).unwrap();
-        // Same photo, half size — byte-wise unrelated, visually the same.
+        // Same photo, half size; byte-wise unrelated, visually the same.
         image::imageops::resize(&photo, 320, 240, image::imageops::FilterType::Triangle)
             .save(dir.join("resized.png"))
             .unwrap();

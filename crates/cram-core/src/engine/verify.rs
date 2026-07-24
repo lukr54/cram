@@ -1,17 +1,17 @@
-//! `cram test` — verify an archive's integrity **without extracting**. Decode every entry and, where
+//! `cram test`, verify an archive's integrity **without extracting**. Decode every entry and, where
 //! the container carries a per-entry checksum (ZIP / 7z CRC-32), confirm the decoded bytes match it.
-//! Nothing is written to disk — bodies stream through a hashing sink, so even a decompression-bombed
+//! Nothing is written to disk, bodies stream through a hashing sink, so even a decompression-bombed
 //! entry is bounded (counted and discarded, never buffered whole).
 //!
 //! Dispatch mirrors [`extract`](super::extract): **random-access** formats (ZIP, `.cram`) stream each
 //! entry via `RandomAccessReader::copy_entry`; everything else uses the sequential
-//! `ArchiveReader::next_entry` stream. Using `copy_entry` for `.cram` matters — `next_entry`
+//! `ArchiveReader::next_entry` stream. Using `copy_entry` for `.cram` matters, `next_entry`
 //! materializes a whole entry body in
 //! memory and refuses one past its in-RAM cap, so a large (multi-GiB) but perfectly healthy `.cram`
 //! entry would otherwise be reported as a failure even though `cram x` extracts it fine.
 //!
 //! What each format's "verified" means:
-//! - **ZIP / 7z**: a stored CRC-32 is recomputed over the decoded bytes and compared — real content
+//! - **ZIP / 7z**: a stored CRC-32 is recomputed over the decoded bytes and compared, real content
 //!   integrity.
 //! - **tar**: no per-entry checksum, so a clean full decode plus a declared-size match is the check
 //!   (catches truncation / a broken codec stream).
@@ -40,7 +40,7 @@ use crate::{formats, sniff};
 pub struct VerifyReport {
     /// File entries that decoded AND passed their checksum/size check.
     pub checked: u64,
-    /// Of those, how many had a stored CRC-32 that matched — the strongest per-entry guarantee.
+    /// Of those, how many had a stored CRC-32 that matched; the strongest per-entry guarantee.
     pub crc_verified: u64,
     /// Total uncompressed bytes decoded (across passed and failed entries alike).
     pub bytes: u64,
@@ -105,7 +105,7 @@ fn record(
 ) {
     report.bytes += n;
     // Length check runs INDEPENDENTLY of the CRC, never as its `else`. A crafted archive can declare
-    // a 10 GiB entry, supply only a few bytes, and store the CRC *of those few bytes* — the checksum
+    // a 10 GiB entry, supply only a few bytes, and store the CRC *of those few bytes*; the checksum
     // then matches and, if that short-circuited the size check, `cram test` would pass a file that
     // decoded to a fraction of its declared length. `meta_final == false` means the backend deferred
     // the real size (raw single-stream sources), where a mismatch is expected.
@@ -117,7 +117,7 @@ fn record(
         return;
     }
     // A stored CRC-32 (ZIP / 7z) additionally proves the bytes themselves are right, not just the
-    // count — the codec framing can accept a body that decoded to the wrong content.
+    // count, the codec framing can accept a body that decoded to the wrong content.
     if let Some(stored) = entry.crc32 {
         if crc != stored {
             report.failures.push((

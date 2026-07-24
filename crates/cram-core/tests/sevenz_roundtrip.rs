@@ -1,5 +1,5 @@
 //! End-to-end create → read round-trips for the 7z backend: plain LZMA2, AES-256 content
-//! encryption, and header (name) encryption — exercised through the public engine API.
+//! encryption, and header (name) encryption; exercised through the public engine API.
 
 use std::fs;
 use std::path::{Path, PathBuf};

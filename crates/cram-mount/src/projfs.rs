@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use windows::core::{GUID, HRESULT, PCWSTR};
-// Types only — the functions are bound at run time by `projfs_api`, because a load-time import of
+// Types only, the functions are bound at run time by `projfs_api`, because a load-time import of
 // ProjectedFSLib.dll stops the whole binary from starting wherever the optional feature is off.
 use windows::Win32::Storage::ProjectedFileSystem::{
     PRJ_CALLBACKS, PRJ_CALLBACK_DATA, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
@@ -28,7 +28,7 @@ const E_INVALIDARG: HRESULT = HRESULT(0x8007_0057u32 as i32);
 const E_FAIL: HRESULT = HRESULT(0x8000_4005u32 as i32);
 const E_OUTOFMEMORY: HRESULT = HRESULT(0x8007_000Eu32 as i32);
 const ERROR_FILE_NOT_FOUND_HR: HRESULT = HRESULT(0x8007_0002u32 as i32);
-/// `HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)` — returned for a read that fails because a password is
+/// `HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)`, returned for a read that fails because a password is
 /// missing/wrong (e.g. an encrypted ZIP entry the mount can list but not decrypt), so the OS surfaces
 /// a meaningful "access denied" instead of a generic failure.
 const ERROR_ACCESS_DENIED_HR: HRESULT = HRESULT(0x8007_0005u32 as i32);
@@ -152,8 +152,8 @@ fn force_remove_dir(dir: &Path) {
     }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // `cmd` splits on `/`, so a path like `C:/Users/...` — which is exactly what you get when the
-    // mount root comes from a shell or a Rust `Path` built from one — makes it read `/Users` as a
+    // `cmd` splits on `/`, so a path like `C:/Users/...`, which is exactly what you get when the
+    // mount root comes from a shell or a Rust `Path` built from one, makes it read `/Users` as a
     // switch and refuse ("Invalid switch"). The scrub would then silently do nothing, leaving the
     // reparse-tagged root on disk, and the NEXT mount of that same folder would fail for good with
     // ERROR_REPARSE_POINT_ENCOUNTERED. Hand it native separators.
@@ -266,7 +266,7 @@ unsafe extern "system" fn get_enum(
             }
             // Buffer full mid-batch: stop with S_OK; ProjFS re-invokes and we resume at the
             // preserved cursor. But if even the FIRST entry of this invocation didn't fit
-            // (caller's buffer too small for one record — e.g. a long name with a
+            // (caller's buffer too small for one record, e.g. a long name with a
             // single-entry query), S_OK would signal end-of-enumeration and every child from
             // the cursor onward would silently vanish from the listing. The contract is to
             // return the failure so the OS retries with a larger buffer.

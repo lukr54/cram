@@ -1,6 +1,6 @@
 //! The `sign` / `verify` / `keygen` command-line, called by the unified `cram` binary. `args` is the
 //! slice starting at the subcommand (e.g. `["sign", <file>, "-k", <keyfile>]`), so `args[0]` is the
-//! verb. Behavior is identical to the former standalone `cram-sign` binary — only the entry shape and
+//! verb. Behavior is identical to the former standalone `cram-sign` binary, only the entry shape and
 //! the program name in the usage text changed.
 
 use std::fs;
@@ -81,7 +81,7 @@ fn is_flag_value(args: &[String], val: &str) -> bool {
 fn run_keygen(keyfile: &Path) -> ExitCode {
     if keyfile.exists() {
         return fail(&format!(
-            "{} already exists — refusing to overwrite a key",
+            "{} already exists, refusing to overwrite a key",
             keyfile.display()
         ));
     }
@@ -99,7 +99,7 @@ fn run_keygen(keyfile: &Path) -> ExitCode {
 }
 
 fn run_sign(file: &Path, keyfile: &Path) -> ExitCode {
-    // Load the key BEFORE hashing — a bad key should fail instantly, not after streaming 200 GB.
+    // Load the key BEFORE hashing, a bad key should fail instantly, not after streaming 200 GB.
     let key_bytes = match fs::read(keyfile) {
         Ok(d) => d,
         Err(e) => return fail(&format!("read key {}: {e}", keyfile.display())),
@@ -122,13 +122,13 @@ fn run_sign(file: &Path, keyfile: &Path) -> ExitCode {
 }
 
 fn run_verify(file: &Path, expect_pubkey: Option<&str>) -> ExitCode {
-    // Read the sidecar first — a missing signature should fail instantly, not after hashing the file.
+    // Read the sidecar first, a missing signature should fail instantly, not after hashing the file.
     let sp = sidecar_path(file);
     let sig = match fs::read(&sp) {
         Ok(d) => d,
         Err(e) => return fail(&format!("read signature {}: {e}", sp.display())),
     };
-    // Stream the file's hash (bounded memory) — the archive may be far larger than RAM.
+    // Stream the file's hash (bounded memory), the archive may be far larger than RAM.
     match crate::verify_file(file, &sig, expect_pubkey) {
         Ok(v) => {
             println!("{}: signature OK", file.display());
@@ -136,13 +136,13 @@ fn run_verify(file: &Path, expect_pubkey: Option<&str>) -> ExitCode {
             println!("  file hash (blake3):   {}", v.file_hash_hex);
             if expect_pubkey.is_none() {
                 println!(
-                    "  note: no --key given, so this proves the file is intact — not who signed it"
+                    "  note: no --key given, so this proves the file is intact; not who signed it"
                 );
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{}: VERIFICATION FAILED — {e}", file.display());
+            eprintln!("{}: VERIFICATION FAILED, {e}", file.display());
             ExitCode::FAILURE
         }
     }

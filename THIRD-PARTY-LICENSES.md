@@ -7,13 +7,13 @@ see `THIRD-PARTY-NOTICES.md` for the hand-curated notices (UnRAR, the bundled C 
 
 Summary by licence:
 
-- **MIT License** — 216 crate(s)
-- **Unicode License v3** — 19 crate(s)
-- **Apache License 2.0** — 8 crate(s)
-- **BSD 3-Clause "New" or "Revised" License** — 8 crate(s)
-- **BSD 2-Clause "Simplified" License** — 1 crate(s)
-- **Creative Commons Zero v1.0 Universal** — 1 crate(s)
-- **bzip2 and libbzip2 License v1.0.6** — 1 crate(s)
+- **MIT License**, 216 crate(s)
+- **Unicode License v3**, 19 crate(s)
+- **Apache License 2.0**, 8 crate(s)
+- **BSD 3-Clause "New" or "Revised" License**, 8 crate(s)
+- **BSD 2-Clause "Simplified" License**, 1 crate(s)
+- **Creative Commons Zero v1.0 Universal**, 1 crate(s)
+- **bzip2 and libbzip2 License v1.0.6**, 1 crate(s)
 
 ---
 
@@ -5276,7 +5276,7 @@ authorization of the copyright holder.
 
 SPDX-License-Identifier: Unicode-3.0
 
-—
+, 
 
 Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.

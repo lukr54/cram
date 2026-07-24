@@ -37,13 +37,13 @@ pub fn plan_codec(fmt: Format, _entries: &[Entry]) -> PlanCodec {
 }
 
 /// How many independent decode units the plan can parallelize over. ZIP = one per file entry (each
-/// independently seekable/decodable — the parallel fast path). Everything else is a single
+/// independently seekable/decodable, the parallel fast path). Everything else is a single
 /// front-to-back stream until its backend can report real block/folder/pack counts.
 pub fn block_count(fmt: Format, entries: &[Entry]) -> usize {
     match fmt.container {
         // ZIP and ISO expose per-file random access → one independent unit per file.
         Container::Zip | Container::Iso => entries.iter().filter(|e| !e.is_dir()).count().max(1),
-        // TODO(7z): independent unit = folder count; TODO(cram): pack count — both need the
+        // TODO(7z): independent unit = folder count; TODO(cram): pack count, both need the
         // backend's structure map, which doesn't exist yet. Treat as one stream until then.
         _ => 1,
     }

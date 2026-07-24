@@ -1,15 +1,15 @@
-//! RAR backend — **read-only** via the official UnRAR C++ engine (the same decoder WinRAR uses).
+//! RAR backend, **read-only** via the official UnRAR C++ engine (the same decoder WinRAR uses).
 //! Creating RAR is legally forbidden by the UnRAR license, so there is no writer.
 //!
 //! RAR entries share one compressed stream (solid archives especially), so there's no per-file
 //! parallelism: this is a sequential [`ArchiveReader`]. It drives UnRAR's type-state cursor
-//! (`read_header` → `read`/`skip`) across [`next_entry`](RarReader::next_entry) calls — possible
+//! (`read_header` → `read`/`skip`) across [`next_entry`](RarReader::next_entry) calls, possible
 //! because `OpenArchive` owns its C handle (no borrow of the path/password), so it can live in the
 //! struct between calls. Each file entry is read fully into memory (UnRAR has no per-chunk hook),
 //! then streamed to disk by the sequential engine; only one entry is buffered at a time. Because
 //! that read is whole-entry (unbounded by anything but the declared size), an entry whose declared
 //! size exceeds `MAX_INMEM_ENTRY` is refused (surfaced as a per-entry failure) rather than allowed
-//! to OOM the process — a crafted RAR could otherwise claim a multi-TB entry.
+//! to OOM the process, a crafted RAR could otherwise claim a multi-TB entry.
 
 use std::io;
 use std::path::Path;
@@ -30,7 +30,7 @@ use crate::secret::{PasswordProvider, PasswordRequest, Secret};
 /// Generous so real files pass; a future extract-to-temp path could stream and lift this.
 const MAX_INMEM_ENTRY: u64 = 2 * 1024 * 1024 * 1024;
 
-/// A body that fails on first read — surfaces an entry we deliberately refuse to extract (an
+/// A body that fails on first read, surfaces an entry we deliberately refuse to extract (an
 /// oversized RAR entry UnRAR would buffer whole in RAM) as a per-entry failure via the engine's
 /// normal write loop, rather than aborting the whole job or silently dropping the entry.
 struct ErrBody(Option<String>);
@@ -61,7 +61,7 @@ fn map_unrar(e: unrar::error::UnrarError) -> ArchiveError {
 /// A RAR entry's MS-DOS packed mod-time (`file_time`) as a [`SystemTime`]. `0` (unset) → `None`. DOS
 /// time is local wall time at 2-second granularity with no zone; the fields are read as UTC (the best
 /// the format allows) and built through the `time` crate. Any out-of-range field yields `None`, never
-/// a panic — `file_time` is attacker-controlled in a hostile archive.
+/// a panic, `file_time` is attacker-controlled in a hostile archive.
 fn dos_time(dos: u32) -> Option<SystemTime> {
     if dos == 0 {
         return None;
@@ -107,7 +107,7 @@ fn try_list(path: &Path, pw: Option<&Secret>) -> Result<(Vec<Entry>, bool)> {
             .saturating_add(RAR_ENTRY_OVERHEAD);
         if meta > MAX_LIST_META {
             return Err(ArchiveError::Backend(format!(
-                "RAR lists more than {} MiB of entry metadata — too large to buffer; extract it instead",
+                "RAR lists more than {} MiB of entry metadata, too large to buffer; extract it instead",
                 MAX_LIST_META / (1024 * 1024)
             )));
         }
@@ -153,7 +153,7 @@ fn open_processing(
 pub struct RarReader {
     entries: Vec<Entry>,
     state: Option<OpenArchive<Process, CursorBeforeHeader>>,
-    /// Kept so the cursor can be REBUILT after a damaged entry — see [`RarReader::reposition`].
+    /// Kept so the cursor can be REBUILT after a damaged entry, see [`RarReader::reposition`].
     path: std::path::PathBuf,
     secret: Option<Secret>,
     /// How many headers have been consumed. This is the cursor position to restore to.
@@ -166,7 +166,7 @@ impl RarReader {
     /// Needed because `unrar`'s `read()` takes `self` by value and propagates with `?` *before*
     /// rebuilding the archive, so a failed entry read drops the C handle: there is no way to
     /// continue through the existing cursor. WinRAR reports a damaged file and carries on to the
-    /// next one, and a partly-corrupt archive is exactly when the remaining files matter most — so
+    /// next one, and a partly-corrupt archive is exactly when the remaining files matter most; so
     /// we pay a re-open and skip forward instead of abandoning the job.
     ///
     /// Skipping only walks headers and seeks over file data (no decode), so the cost is small
@@ -182,7 +182,7 @@ impl RarReader {
                     Ok(next) => arc = next,
                     Err(_) => return false,
                 },
-                // Ran out of entries, or the headers themselves are unreadable — nothing left to do.
+                // Ran out of entries, or the headers themselves are unreadable; nothing left to do.
                 _ => return false,
             }
         }
@@ -264,7 +264,7 @@ impl ArchiveReader for RarReader {
                 None => return Ok(None), // end of archive; state stays None
             };
             // This header is now consumed by whichever branch follows, so `pos` is the index of the
-            // NEXT header — exactly where `reposition` has to wind back to after a damaged entry.
+            // NEXT header, exactly where `reposition` has to wind back to after a damaged entry.
             self.pos += 1;
 
             // Copy metadata out before the cursor-advancing call consumes `header`.
@@ -327,13 +327,13 @@ impl ArchiveReader for RarReader {
             // cursor. The sequential engine streams that Vec to disk.
             let (bytes, next) = match header.read() {
                 Ok(v) => v,
-                // A damaged entry — most often "File CRC error" from a partly corrupt archive.
+                // A damaged entry, most often "File CRC error" from a partly corrupt archive.
                 // One bad file must not end the whole extraction: WinRAR reports the file and
                 // continues, and a damaged archive is precisely when the remaining files matter
                 // most. So report this entry as a per-entry failure (an `ErrBody` the engine turns
                 // into one `report.failed` line) and wind the cursor back to the next entry. A
-                // password problem is different in kind — it is not damage and it will affect every
-                // entry — so it still fails the job.
+                // password problem is different in kind, it is not damage and it will affect every
+                // entry, so it still fails the job.
                 Err(e)
                     if !matches!(
                         e.code,

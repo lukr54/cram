@@ -15,7 +15,7 @@ pub trait ProgressSink: Sync {
     fn on_file_done(&self, entry: &Entry);
     /// One entry started (optional; default no-op).
     fn on_entry_start(&self, _entry: &Entry) {}
-    /// Cooperative cancellation — engines check this between chunks/entries.
+    /// Cooperative cancellation, engines check this between chunks/entries.
     fn is_cancelled(&self) -> bool;
     /// Cooperative pause. Engines call this at the same points they check
     /// [`is_cancelled`](Self::is_cancelled); a paused job blocks here until it is resumed or
@@ -83,7 +83,7 @@ impl ProgressSink for NullSink {
     }
 }
 
-/// Wraps an output writer to report bytes to a `ProgressSink` as they are written — gives
+/// Wraps an output writer to report bytes to a `ProgressSink` as they are written, gives
 /// sequential engines (tar/7z/raw) precise per-chunk progress without watching the filesystem.
 pub struct CountingWriter<'s, W: Write> {
     inner: W,
@@ -110,7 +110,7 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 }
 
-/// Wraps an input reader to report bytes to a `ProgressSink` as they are consumed — the create side
+/// Wraps an input reader to report bytes to a `ProgressSink` as they are consumed, the create side
 /// (which reads source files *into* a writer) gets the same per-chunk progress the extract side has.
 pub struct CountingReader<'s, R: Read> {
     inner: R,

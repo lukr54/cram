@@ -1,9 +1,9 @@
 //! Regression: extraction must restore each entry's recorded modification time, not stamp
-//! the extracted files with "now". Covered for the formats that actually carry a per-entry mtime —
-//! ZIP (parallel/random-access path) and tar (sequential path) — so both engine paths are exercised.
+//! the extracted files with "now". Covered for the formats that actually carry a per-entry mtime,
+//! ZIP (parallel/random-access path) and tar (sequential path), so both engine paths are exercised.
 //!
 //! `.cram` v1 deliberately stores no per-entry mtime (the format is frozen), so its reader reports
-//! `modified: None` and there is nothing to restore — that's correct, not a regression, and is why
+//! `modified: None` and there is nothing to restore, that's correct, not a regression, and is why
 //! `.cram` is not asserted here.
 
 use std::path::{Path, PathBuf};
@@ -98,7 +98,7 @@ fn extract_restores_entry_mtime_for_zip_and_tar() {
         // Extra guard: prove it isn't just "now" (which a no-op restore would leave).
         assert!(
             (now_s - got_s) > 60,
-            "{name}: extracted mtime {got_s} looks like now ({now_s}) — restore did not take effect"
+            "{name}: extracted mtime {got_s} looks like now ({now_s}), restore did not take effect"
         );
     }
 

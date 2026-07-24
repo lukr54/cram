@@ -1,7 +1,7 @@
 //! The native `.cram` content-defined-dedup format. Proves (1) a mixed tree round-trips
 //! byte-for-byte through create → extract, and (2) cross-file dedup actually eliminates duplicate
 //! content: N identical files store their bytes once, so `dedup_saved == (N-1)*size` exactly and the
-//! archive is a fraction of the logical input — while every copy still extracts correctly.
+//! archive is a fraction of the logical input, while every copy still extracts correctly.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Deterministic high-entropy bytes (xorshift, seeded) — incompressible, so the archive size
+/// Deterministic high-entropy bytes (xorshift, seeded); incompressible, so the archive size
 /// reflects dedup rather than compression.
 fn blob(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed | 1;
@@ -69,7 +69,7 @@ fn failed_create_preserves_preexisting_archive() {
     fs::write(&dest, &sentinel).unwrap();
 
     // An input that exists at plan time but cannot be READ when the create loop streams it, so the
-    // failure lands AFTER the writer is live — the exact case the staging fix must survive.
+    // failure lands AFTER the writer is live, the exact case the staging fix must survive.
     let locked_path = dir.join("locked.bin");
     fs::write(&locked_path, b"soon locked").unwrap();
 
@@ -85,7 +85,7 @@ fn failed_create_preserves_preexisting_archive() {
             .unwrap()
     };
     // Unix: strip all read permission. Root ignores the mode bits, which would make the read succeed
-    // and the test meaningless — detect that by probing and skip rather than fail spuriously.
+    // and the test meaningless, detect that by probing and skip rather than fail spuriously.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

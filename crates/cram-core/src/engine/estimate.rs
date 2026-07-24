@@ -1,6 +1,6 @@
 //! Dedup-savings estimate: run the `.cram` content-defined chunker + BLAKE3 dedup accounting over a
 //! set of inputs WITHOUT compressing or writing anything, to answer "how much of this is duplicate
-//! content that `.cram` would store once?" — the cross-file dedup a zip/7z can't do.
+//! content that `.cram` would store once?", the cross-file dedup a zip/7z can't do.
 //!
 //! It reports the DEDUP saving only, never a compressed-size guess, so the number is honest and never
 //! overstated: it is exactly the bytes a real `.cram` create would eliminate by dedup, because it uses
@@ -28,7 +28,7 @@ pub struct DedupEstimate {
 }
 
 impl DedupEstimate {
-    /// Bytes eliminated by cross-file dedup — what `.cram` stores once and a zip/7z stores per copy.
+    /// Bytes eliminated by cross-file dedup, what `.cram` stores once and a zip/7z stores per copy.
     pub fn saved(&self) -> u64 {
         self.total_bytes.saturating_sub(self.unique_bytes)
     }
@@ -77,7 +77,7 @@ pub fn estimate_dedup(inputs: &[PathBuf], sink: &dyn ProgressSink) -> Result<Ded
 }
 
 /// Recursively collect regular files under `path` (a file yields itself; a directory yields its file
-/// tree). Symlinks are not followed — the same rule the create side uses, so the estimate matches what
+/// tree). Symlinks are not followed, the same rule the create side uses, so the estimate matches what
 /// a real create would actually archive.
 fn collect_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;

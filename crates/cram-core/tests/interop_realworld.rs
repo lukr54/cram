@@ -1,13 +1,13 @@
 //! Real-world interop. Fuzzing proves the parsers don't *crash*; it does NOT prove cram
 //! correctly reads an archive produced by the actual incumbents. This test drives whichever of the
-//! real tools are installed — 7-Zip (`7z.exe` → `.7z` and `.zip`), Windows' bundled bsdtar
-//! (`tar.exe` → `.tar`), and WinRAR (`Rar.exe` → `.rar`, which cram can only *read*) — over a corpus
+//! real tools are installed, 7-Zip (`7z.exe` → `.7z` and `.zip`), Windows' bundled bsdtar
+//! (`tar.exe` → `.tar`), and WinRAR (`Rar.exe` → `.rar`, which cram can only *read*); over a corpus
 //! with the things archivers actually trip on (nested dirs, an empty file, a Unicode name, a name with
 //! a space) and asserts cram extracts every file back byte-for-byte.
 //!
 //! It is **self-skipping**: a tool that isn't installed (or fails to produce an archive) is noted and
 //! skipped, so the test is a no-op on a machine without that tool rather than flaky. When a tool IS
-//! present, a mismatch is a hard failure — that's the interop guarantee.
+//! present, a mismatch is a hard failure; that's the interop guarantee.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -139,7 +139,7 @@ fn cram_reads_archives_made_by_the_real_incumbents() {
     }
 
     if cases.is_empty() {
-        eprintln!("no incumbent archivers installed — interop test is a no-op here");
+        eprintln!("no incumbent archivers installed, interop test is a no-op here");
         return;
     }
 

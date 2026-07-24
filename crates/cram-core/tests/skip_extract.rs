@@ -72,7 +72,7 @@ fn changed_file_is_reextracted() {
 
     engine::extract(&archive, &out, Arc::new(NoPassword), SKIP, &NullSink).unwrap();
 
-    // Corrupt one extracted file (same length so only the CRC differs — proves we check content,
+    // Corrupt one extracted file (same length so only the CRC differs, proves we check content,
     // not just size).
     let victim = out.join("data/a.txt");
     let mut bytes = fs::read(&victim).unwrap();

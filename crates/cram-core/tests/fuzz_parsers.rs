@@ -1,5 +1,5 @@
 //! Smoke-fuzz every archive parser: feed it random and mutated-from-valid bytes and assert it never
-//! **panics** — a corrupt/hostile archive must always come back as a typed `Err`, never an out-of-bounds
+//! **panics**, a corrupt/hostile archive must always come back as a typed `Err`, never an out-of-bounds
 //! index, integer-overflow panic, or `unwrap()` on `None`. This is the stable-Rust, mingw-friendly gate
 //! that runs in normal `cargo test`; for coverage-guided fuzzing point `cargo fuzz` (nightly/LLVM, a CI
 //! job) at the same `formats::open` entry point.
@@ -8,7 +8,7 @@
 //!
 //! The pure-Rust parsers (ZIP, 7z, tar, ISO, `.cram`) are covered here. RAR is deliberately excluded:
 //! it decodes through the UnRAR C++ library, where a bad input could fault the *process* rather than
-//! raise a catchable Rust panic — not something a unit test can contain.
+//! raise a catchable Rust panic, not something a unit test can contain.
 //!
 //! Two of these parsers (7z, tar) decode the body on a **spawned worker thread**, so a panic there
 //! would *not* unwind into `catch_unwind` on the test thread. To catch those too, a process-wide panic
@@ -30,7 +30,7 @@ use cram_core::writer::CreateOptions;
 /// Bumped by the panic hook on every panic on any thread (test or decode worker).
 static PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Tiny deterministic PRNG (xorshift64*) — reproducible so a failure prints a re-runnable seed.
+/// Tiny deterministic PRNG (xorshift64*), reproducible so a failure prints a re-runnable seed.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -56,7 +56,7 @@ fn iters() -> usize {
         .unwrap_or(150)
 }
 
-/// Drive `formats::open` + `entries` + a bounded body drain — the whole read path a caller would take.
+/// Drive `formats::open` + `entries` + a bounded body drain, the whole read path a caller would take.
 /// Any `Err` is fine; the point is that it must not panic. Bodies are capped so a crafted huge size
 /// can't turn the fuzzer into a memory hog.
 fn exercise(fmt: Format, path: &Path) {
@@ -77,7 +77,7 @@ fn exercise(fmt: Format, path: &Path) {
 }
 
 /// Feed `bytes` to the `fmt` parser (staged at the reused `path`). Returns `Some(message)` if it
-/// panicked — on the test thread (caught) or a decode worker thread (counter advanced). Returning the
+/// panicked, on the test thread (caught) or a decode worker thread (counter advanced). Returning the
 /// message instead of asserting lets the caller restore the real panic hook *before* failing, so the
 /// re-runnable seed is actually printed (rather than swallowed by the quiet hook).
 fn feed(fmt: Format, bytes: &[u8], seed: u64, path: &Path) -> Option<String> {

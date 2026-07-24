@@ -3,13 +3,13 @@
 //! ProjFS is delivered by the **optional** Windows feature `Client-ProjFS`, which is OFF by default:
 //! on a stock install the DLL is staged in WinSxS but never projected into `System32`. A *load-time*
 //! import of it therefore aborts the entire process at startup with `STATUS_DLL_NOT_FOUND`
-//! (0xC0000135) — before `main` runs — on every machine that has not enabled the feature.
+//! (0xC0000135), before `main` runs; on every machine that has not enabled the feature.
 //! `cram-mount` is linked into `cram.exe` unconditionally, so binding these functions the direct way
-//! would stop the whole CLI from starting on any machine without the feature — over a capability
+//! would stop the whole CLI from starting on any machine without the feature, over a capability
 //! that only the `mount` verb needs.
 //!
 //! So the DLL is loaded on first use instead, and its absence is an ordinary error from `mount`
-//! rather than a process that cannot launch. Type definitions still come from the `windows` crate —
+//! rather than a process that cannot launch. Type definitions still come from the `windows` crate,
 //! types carry no linkage; only the function bindings are ours. Each signature below mirrors the
 //! SDK's raw C ABI (the `windows` crate's ergonomic wrappers hide out-params and HRESULT checks,
 //! which we re-add by hand).
@@ -26,13 +26,13 @@ use windows::Win32::Storage::ProjectedFileSystem::{
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 /// What the user is told when the feature is off. ProjFS cannot be enabled from inside a normal
-/// process — it needs an elevated feature install — so the message carries the exact command rather
+/// process, it needs an elevated feature install, so the message carries the exact command rather
 /// than a bare "not supported".
 pub const UNAVAILABLE: &str = "This needs the Windows Projected File System feature, which is off by \
 default. Enable it in an admin PowerShell with:\r\n\r\n    Enable-WindowsOptionalFeature -Online \
 -FeatureName Client-ProjFS\r\n\r\nA restart may be required. Everything else in Cram works without it.";
 
-/// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` — what the shims return if the DLL is missing. In
+/// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`, what the shims return if the DLL is missing. In
 /// practice unreachable: `available()` is checked before a mount starts, and the callbacks only run
 /// while a mount is live.
 const E_NOT_SUPPORTED: HRESULT = HRESULT(0x8007_0032u32 as i32);
@@ -71,7 +71,7 @@ type FnWriteFileData = unsafe extern "system" fn(
 type FnFreeAlignedBuffer = unsafe extern "system" fn(*const c_void);
 
 /// The resolved entry points. Only function pointers are kept (they are `Send + Sync`); the module
-/// handle is deliberately not stored — the DLL stays loaded for the life of the process, which is
+/// handle is deliberately not stored, the DLL stays loaded for the life of the process, which is
 /// what we want, and `HMODULE` is not `Sync`.
 struct Api {
     mark_directory_as_placeholder: FnMarkDirectoryAsPlaceholder,

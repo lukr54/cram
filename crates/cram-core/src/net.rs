@@ -1,10 +1,10 @@
-//! Network sources — the `download` feature's bridge from rdm-core to the [`ByteSource`] seam.
+//! Network sources, the `download` feature's bridge from rdm-core to the [`ByteSource`] seam.
 //!
 //! [`RdmSource`] runs a segmented rdm download on its own thread (with a tokio runtime) and exposes
 //! it as a growing [`ByteSource`]: `available()` is the rdm engine's **contiguous watermark**,
 //! `read_at` positional-reads the growing output file, and `wait_until` blocks on the watermark
 //! condvar. Feeding this to [`crate::engine::stream::extract_stream`] gives true extract-while-
-//! download — the archive is unpacked as the bytes land, no full download first.
+//! download, the archive is unpacked as the bytes land, no full download first.
 //!
 //! Only a client (outbound) download is opened here; there is **no listening socket**, so this path
 //! does not carry the rdm-gui Defender false-positive concern (that was an unsigned GUI *listener*).
@@ -21,7 +21,7 @@ use rdm_core::Progress;
 use crate::source::{ByteSource, SourceStatus};
 
 /// Positional read at an explicit offset, bridging the differently-named std traits: `seek_read` on
-/// Windows, `read_at` on Unix. Neither is relied on to move the file cursor here — every call passes
+/// Windows, `read_at` on Unix. Neither is relied on to move the file cursor here, every call passes
 /// an explicit offset.
 #[cfg(windows)]
 fn pread(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
@@ -55,7 +55,7 @@ pub enum DownloadMode {
 pub struct RdmSource {
     prog: Arc<Progress>,
     /// Read handle onto the growing output file (positional `seek_read`; separate from the engine's
-    /// write handle — Windows allows the shared read+write handles).
+    /// write handle, Windows allows the shared read+write handles).
     file: File,
     out: PathBuf,
     worker: Option<JoinHandle<()>>,
@@ -66,8 +66,8 @@ impl RdmSource {
     /// connections. `mode` selects scheduling: [`DownloadMode::Stream`] (leading-edge, for extract-
     /// while-download), [`DownloadMode::Fixed`], or [`DownloadMode::Auto`] (adaptive ramping, `conns`
     /// = the ceiling). When more than one source is given the engine byte-verifies each mirror against
-    /// the anchor (`sources[0]`) before striping — a mirror serving a different file is dropped, never
-    /// spliced in — and fails over / tail-races across the healthy pool. `headers` are attached to
+    /// the anchor (`sources[0]`) before striping, a mirror serving a different file is dropped, never
+    /// spliced in, and fails over / tail-races across the healthy pool. `headers` are attached to
     /// every request (browser Cookie/Referer/User-Agent). Returns immediately; bytes flow in the
     /// background.
     pub fn start(
@@ -98,7 +98,7 @@ impl RdmSource {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(_) => {
-                        // Can't run — signal "no more bytes" so waiters unblock (as an abort).
+                        // Can't run, signal "no more bytes" so waiters unblock (as an abort).
                         prog.cancel.store(true, Ordering::Relaxed);
                         prog.request_cancel();
                         return;
@@ -200,15 +200,15 @@ impl Drop for RdmSource {
         // Ask the download to stop; don't block the dropping thread waiting for it.
         self.prog.request_cancel();
         if let Some(h) = self.worker.take() {
-            drop(h); // detach — the worker observes the cancel and exits on its own
+            drop(h); // detach, the worker observes the cancel and exits on its own
         }
     }
 }
 
-/// Run deterministic mirror discovery on `input` — a Metalink document (`.meta4` RFC 5854 / older
+/// Run deterministic mirror discovery on `input`, a Metalink document (`.meta4` RFC 5854 / older
 /// `.metalink`, given as a URL or a local path) or a plain URL probed for RFC 6249 Metalink/HTTP
 /// `Link: rel=duplicate` headers. Returns the discovered mirrors (+ optional whole-file SHA-256), or
-/// `Ok(None)` when nothing applies (the caller then downloads `input` directly). No LLM — plain HTTP +
+/// `Ok(None)` when nothing applies (the caller then downloads `input` directly). No LLM, plain HTTP +
 /// parsing. Discovery only *proposes*; [`RdmSource::start`]'s verify gate still byte-checks every
 /// mirror, so a bogus discovered link is harmless (it just gets dropped). Builds its own short-lived
 /// runtime + client so it's callable from synchronous code (the CLI).

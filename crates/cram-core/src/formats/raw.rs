@@ -1,4 +1,4 @@
-//! Raw single-stream backend — a bare compressed file (`foo.gz`, `foo.xz`, …) whose decoded stream
+//! Raw single-stream backend, a bare compressed file (`foo.gz`, `foo.xz`, …) whose decoded stream
 //! *is* the one and only entry. No container: we hand the engine one [`EntryStream`] over the
 //! decoder, streaming (no buffering). The entry's uncompressed size isn't known up front (the codec
 //! doesn't cheaply report it), so `size = 0` and `meta_final = false`.

@@ -3,7 +3,7 @@
 //! so a `.zip` that is actually a RAR is handled correctly.
 //!
 //! NOTE: for a bare compressed stream (`{Raw|Tar, codec}`) telling `Tar` from `Raw` ideally means
-//! decoding a prefix and checking for the `ustar` magic — that "peek inside the codec" upgrade
+//! decoding a prefix and checking for the `ustar` magic, that "peek inside the codec" upgrade
 //! lands with the codec layer. Until then we disambiguate `.tar.gz`/`.tgz`-style names by extension.
 
 use std::fs::File;
@@ -121,7 +121,7 @@ pub fn sniff_path(path: &Path) -> Result<Format> {
         return Ok(fmt);
     }
     // ISO 9660's `CD001` marker sits at offset 32769 (sector 16, +1), well past the 512-byte head, so
-    // it can't live in `sniff_bytes`. Probe it directly — this catches an ISO regardless of extension
+    // it can't live in `sniff_bytes`. Probe it directly, this catches an ISO regardless of extension
     // (a raw `.img` disc image) before falling back to the name.
     if is_iso9660(path) {
         return Ok(Format::iso());

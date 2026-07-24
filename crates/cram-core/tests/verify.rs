@@ -1,5 +1,5 @@
 //! `cram test` (integrity verification without extraction). Proves the happy path across
-//! formats AND that a real single-byte corruption of stored data is actually caught — the whole point
+//! formats AND that a real single-byte corruption of stored data is actually caught, the whole point
 //! of the feature (a verify that always says "ok" would be worse than none).
 
 use std::path::PathBuf;
@@ -70,7 +70,7 @@ fn verify_catches_single_byte_corruption_of_stored_data() {
     let src = build_src(&dir);
 
     // A STORE zip keeps file bytes verbatim, so we can flip one content byte and expect a CRC
-    // mismatch (the central directory — and thus archive open — is untouched).
+    // mismatch (the central directory, and thus archive open, is untouched).
     let arc = dir.join("store.zip");
     let opts = CreateOptions {
         level: Level::Explicit(0),
@@ -103,7 +103,7 @@ fn verify_catches_single_byte_corruption_of_stored_data() {
         rep.failures
     );
     // `checked` counts only entries that PASSED (b.bin + empty.txt = 2), so `checked + failures`
-    // equals the 3 files examined — no double-counting of the failed entry (the reported total is
+    // equals the 3 files examined, no double-counting of the failed entry (the reported total is
     // what the CLI prints as "N of TOTAL entries bad").
     assert_eq!(
         rep.checked, 2,

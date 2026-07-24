@@ -1,13 +1,13 @@
-//! Adaptive create-side probe: decide, per file, whether compressing it is worth the CPU — the
+//! Adaptive create-side probe: decide, per file, whether compressing it is worth the CPU; the
 //! "store the incompressible" optimization. Already-compressed media/archives (JPEG, MP4, ZIP, …)
 //! do not shrink under DEFLATE/LZMA; running the compressor over them only burns CPU and often
 //! grows the data slightly. Detecting them and storing them verbatim is the single biggest
 //! real-world archiver win, and it is what [`Level::Auto`](crate::writer::Level) turns on.
 //!
 //! Two-tier classification, cheapest first:
-//!   1. **Extension** — a hard list of formats that are essentially always incompressible (store)
+//!   1. **Extension**, a hard list of formats that are essentially always incompressible (store)
 //!      or reliably compressible (compress), decided with zero file I/O.
-//!   2. **Content sample** — for unknown extensions, read a small head sample and measure how far a
+//!   2. **Content sample**, for unknown extensions, read a small head sample and measure how far a
 //!      fast DEFLATE pass shrinks it (with a Shannon-entropy short-circuit for obvious noise).
 //!
 //! The whole-archive [`ProbeSummary`] aggregates the per-file verdicts so a whole-stream backend
@@ -38,7 +38,7 @@ impl Compressibility {
 
 /// Bytes read from the head of a file to judge compressibility.
 const SAMPLE_BYTES: u64 = 64 * 1024;
-/// Below this size, don't sample — just compress (per-entry overhead is tiny and the store/compress
+/// Below this size, don't sample; just compress (per-entry overhead is tiny and the store/compress
 /// choice barely matters for a sub-512-byte file).
 const MIN_SAMPLE: u64 = 512;
 /// DEFLATE shrink ratio (compressed/original) at or above which the data is deemed incompressible.
@@ -47,7 +47,7 @@ const INCOMPRESSIBLE_RATIO: f64 = 0.95;
 const HIGH_ENTROPY_BITS: f64 = 7.8;
 
 /// Lowercased final extension of a path (without the dot), or "" if none. For `foo.tar.gz` this is
-/// `gz` (→ store), for `foo.tar` it is `tar` (→ compress) — exactly the right granularity.
+/// `gz` (→ store), for `foo.tar` it is `tar` (→ compress), exactly the right granularity.
 fn ext_of(path: &Path) -> String {
     path.extension()
         .and_then(|s| s.to_str())
@@ -55,7 +55,7 @@ fn ext_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Formats that are already compressed or encrypted — DEFLATE/LZMA cannot shrink them. Covers
+/// Formats that are already compressed or encrypted, DEFLATE/LZMA cannot shrink them. Covers
 /// raster images, audio, video, already-compressed archives/installers (note `.tar.gz` → ext `gz`,
 /// so tarballs land here), zip/deflate-based containers (office, apk, jar…), web fonts, compressed
 /// disk images, and encrypted blobs.
@@ -65,7 +65,7 @@ const STORE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "png", "gif", "webp", "heic", "heif", "avif", "jxl",
     // audio
     "mp3", "aac", "m4a", "m4b", "ogg", "oga", "opus", "flac", "wma", "ape",
-    // video (NB: `.ts` is deliberately NOT here — it is overwhelmingly TypeScript source, which is
+    // video (NB: `.ts` is deliberately NOT here, it is overwhelmingly TypeScript source, which is
     // highly compressible; a genuine MPEG transport stream is high-entropy and the content sample
     // stores it anyway. `.m2ts` is unambiguously video.)
     "mp4", "m4v", "mkv", "webm", "avi", "mov", "wmv", "flv", "m2ts", "vob", "mpg", "mpeg",
@@ -79,7 +79,7 @@ const STORE_EXTS: &[&str] = &[
     "woff", "woff2", "dmg", "gpg", "pgp", "aes",
 ];
 
-/// Formats that reliably compress well — skip the content sample for these. Covers text/code/markup/
+/// Formats that reliably compress well, skip the content sample for these. Covers text/code/markup/
 /// data and uncompressed media (bmp/tiff/wav…). Deliberately excludes ambiguous binaries
 /// (exe/dll/pdf/iso/db…): those fall through to the content sample, which judges them correctly
 /// instead of guessing from the extension.
@@ -146,7 +146,7 @@ fn deflate_ratio(data: &[u8]) -> f64 {
 /// from this will usually be a little larger than what actually lands on disk.
 pub fn sample_ratio(sample: &[u8]) -> f64 {
     if (sample.len() as u64) < MIN_SAMPLE {
-        return 1.0; // too little to judge — assume no gain rather than promise one
+        return 1.0; // too little to judge, assume no gain rather than promise one
     }
     if shannon_bits(sample) >= HIGH_ENTROPY_BITS {
         return 1.0;
@@ -205,7 +205,7 @@ pub fn classify_file(path: &Path, size: u64) -> Compressibility {
     }
 }
 
-/// Aggregate compressibility of a whole input set — lets a whole-stream backend pick a level.
+/// Aggregate compressibility of a whole input set, lets a whole-stream backend pick a level.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeSummary {
     pub files: u64,
@@ -245,7 +245,7 @@ impl ProbeSummary {
 mod tests {
     use super::*;
 
-    /// Deterministic pseudo-random bytes (xorshift) — genuinely incompressible, no `rand` dep.
+    /// Deterministic pseudo-random bytes (xorshift), genuinely incompressible, no `rand` dep.
     fn noise(len: usize) -> Vec<u8> {
         let mut x = 0x2545_f491_4f6c_dd1du64;
         let mut out = Vec::with_capacity(len);

@@ -2,12 +2,12 @@
 //!
 //! Unlike the classic containers (which store each file's bytes once, compressed in isolation),
 //! `.cram` splits every file body into **content-defined chunks** (FastCDC v2020), identifies each
-//! chunk by its **BLAKE3 hash**, and stores each *unique* chunk exactly once — so identical files,
+//! chunk by its **BLAKE3 hash**, and stores each *unique* chunk exactly once, so identical files,
 //! or files that merely share regions (versioned assets, repacked game data), collapse to a single
 //! copy. Unique chunks are grouped into **solid packs** (~8 MiB) compressed as a whole (XZ/LZMA2,
 //! pure-Rust; a pack that doesn't shrink is stored raw), and a **footer index** maps entries → chunk
 //! lists and chunks → (pack, offset, length). Because chunks are individually addressable, `.cram`
-//! implements [`RandomAccessReader`] — extraction fans out on the parallel per-entry engine, and
+//! implements [`RandomAccessReader`], extraction fans out on the parallel per-entry engine, and
 //! [`read_range`](RandomAccessReader::read_range) is the on-access / mount primitive.
 //!
 //! The on-disk byte layout is **frozen** and specified normatively in
@@ -28,7 +28,7 @@
 //! every pack **and** the footer index are sealed with **AES-256-GCM** (compress-then-encrypt; a
 //! fresh random nonce per blob; the pack's id / an index tag as AAD). The index's own GCM tag is the
 //! password verifier, so a wrong password fails cleanly on open. `.cram` v1 always encrypts the index
-//! too (the listing needs the password) — the ContentsOnly/NamesToo split isn't exposed yet. A ProjFS
+//! too (the listing needs the password), the ContentsOnly/NamesToo split isn't exposed yet. A ProjFS
 //! mount builds on `read_range`.
 
 use std::collections::{HashMap, VecDeque};
@@ -59,7 +59,7 @@ const VERSION: u8 = 1;
 /// Written in place of [`VERSION`] **only** when the archive actually contains a per-entry transform
 /// (see [`XFORM_LEPTON`]). Both this crate's reader and the standalone `cram-extract` reject a version
 /// they don't know, so an older build refuses such an archive outright instead of writing out the
-/// transformed bytes as if they were the file — a clean failure rather than silent corruption. An
+/// transformed bytes as if they were the file, a clean failure rather than silent corruption. An
 /// archive with no transformed entries stays v1 and older readers keep working.
 const VERSION_XFORM: u8 = 2;
 /// Offset of the version byte, patched at `finish` once it is known whether any transform was used.
@@ -74,18 +74,18 @@ const XFORM_LEPTON: u8 = 1;
 /// huge mis-named file must not be able to balloon the writer's footprint.
 const MAX_XFORM_INPUT: u64 = 256 * 1024 * 1024;
 /// Largest ratio a stored transformed stream may claim to expand to. Real Lepton output is ~0.77× the
-/// JPEG, so this is enormously generous — it exists only to keep a hostile index from declaring a
+/// JPEG, so this is enormously generous; it exists only to keep a hostile index from declaring a
 /// vast size to weaken the decompression-bomb budget.
 const MAX_XFORM_EXPANSION: u64 = 64;
 const TRAILER_LEN: u64 = 22; // index_offset(8) + index_len(8) + magic(6)
 
-/// `flags` byte bit 0 — the archive's packs + index are AES-256-GCM encrypted.
+/// `flags` byte bit 0, the archive's packs + index are AES-256-GCM encrypted.
 const FLAG_ENCRYPTED: u8 = 0x01;
 
 // Pack compression codecs.
 const CODEC_STORE: u8 = 0;
 const CODEC_XZ: u8 = 1;
-/// zstd packs — written only by a `zstd-c` build (C encoder, full levels), but **decodable by ANY
+/// zstd packs, written only by a `zstd-c` build (C encoder, full levels), but **decodable by ANY
 /// build** via the always-present pure-Rust `ruzstd` decoder, so `.cram` files stay cross-compatible.
 const CODEC_ZSTD: u8 = 2;
 
@@ -102,7 +102,7 @@ const TAG_LEN: usize = 16;
 /// Crypto block written right after the header when encrypted: salt(16) + m_cost/t_cost/p_cost (u32 each).
 const CRYPTO_BLOCK_LEN: u64 = (SALT_LEN + 12) as u64;
 /// Argon2id cost parameters (stored in the archive so they remain tunable). ~19 MiB / 2 passes = the
-/// OWASP-recommended minimum — strong at rest, still fast enough to open interactively.
+/// OWASP-recommended minimum, strong at rest, still fast enough to open interactively.
 const ARGON_M_COST: u32 = 19_456;
 const ARGON_T_COST: u32 = 2;
 const ARGON_P_COST: u32 = 1;
@@ -123,7 +123,7 @@ fn random_bytes(buf: &mut [u8]) -> Result<()> {
 }
 
 /// Derive a 32-byte key from the password with Argon2id, returned in a [`Zeroizing`] wrapper so the
-/// key bytes are wiped on drop wherever they land — the derived material never survives in an
+/// key bytes are wiped on drop wherever they land, the derived material never survives in an
 /// un-zeroized copy (a bare `[u8; 32]` return is `Copy`, leaving the local behind after `Ok`).
 fn derive_key(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Zeroizing<[u8; 32]>> {
     // Reject absurd (attacker-supplied) costs before Argon2 tries to allocate `m` KiB of memory.
@@ -184,7 +184,7 @@ impl Crypter {
     }
 }
 
-// FastCDC v2020 chunk sizing: ~64 KiB average (16 KiB min, 256 KiB max) — a balance of dedup
+// FastCDC v2020 chunk sizing: ~64 KiB average (16 KiB min, 256 KiB max); a balance of dedup
 // granularity against index size for a general-purpose archiver.
 pub(crate) const CHUNK_MIN: u32 = 16 * 1024;
 pub(crate) const CHUNK_AVG: u32 = 64 * 1024;
@@ -196,7 +196,7 @@ const PACK_TARGET: usize = 8 * 1024 * 1024;
 const MAX_PACK_RAW: usize = 64 * 1024 * 1024;
 /// Anti-amplification: total decompression WORK for a whole extraction may be at most
 /// `max(MIN_DECOMP_BUDGET, RE_DECODE_FACTOR × total_output)`, where `total_output` is the sum of the
-/// entries' declared (and verified `size == Σ chunk length`) sizes — i.e. the bytes extraction will
+/// entries' declared (and verified `size == Σ chunk length`) sizes, i.e. the bytes extraction will
 /// actually write. This bounds *work relative to output*, so it catches the real bomb (a hostile
 /// chunk list that re-decompresses the same packs so decompression ≫ output) WITHOUT rejecting a
 /// legitimately large, highly-compressible archive (whose work ≈ output). Basing the bound on the
@@ -210,21 +210,19 @@ const MAX_PACK_RAW: usize = 64 * 1024 * 1024;
 /// locality can FIFO-thrash the cache and re-decode packs more than `RE_DECODE_FACTOR×`, tripping this
 /// guard. Such archives are rare (normal, local, or under-cache-sized working sets stay far under the
 /// factor), the failure is a clean error (never corruption), and lowering the guard to admit them
-/// would re-open the amplification DoS — so the bound is kept.
+/// would re-open the amplification DoS, so the bound is kept.
 const RE_DECODE_FACTOR: u64 = 16;
 const MIN_DECOMP_BUDGET: u64 = 256 * 1024 * 1024;
 /// Total bytes of decompressed packs kept in the shared cross-worker cache (see [`PackCache`]).
 const PACK_CACHE_CAP: usize = 256 * 1024 * 1024;
 /// Ceiling on a single entry buffered **whole in RAM** by the sequential reader ([`next_entry`],
 /// which must materialize the body to hand back a `Read`). Extraction of real archives goes through
-/// the random-access [`copy_entry`] path, which streams to disk unbounded — so this only bounds the
+/// the random-access [`copy_entry`] path, which streams to disk unbounded, so this only bounds the
 /// in-memory fallback, stopping a huge or hostile entry (e.g. a tiny archive whose chunk list
 /// repeats one chunk millions of times) from OOM-aborting the process.
 const MAX_INMEM_ENTRY: u64 = 512 * 1024 * 1024;
 
-// ============================================================================================
 // Index model (shared by writer + reader)
-// ============================================================================================
 
 /// Where one pack lives in the file and how it's encoded.
 #[derive(Clone, Copy)]
@@ -247,7 +245,7 @@ struct ChunkLoc {
 struct EntryMeta {
     name: String,
     is_dir: bool,
-    /// **Logical** size — the length of the file the user gets back. For a transformed entry this is
+    /// **Logical** size, the length of the file the user gets back. For a transformed entry this is
     /// the original JPEG's length, not the length of the stored (smaller) stream, so listings and
     /// extraction report what the user actually has.
     size: u64,
@@ -257,7 +255,7 @@ struct EntryMeta {
     transform: u8,
 }
 
-/// Does this name look like a JPEG? Only a hint for *whether to try* — the recompressor validates the
+/// Does this name look like a JPEG? Only a hint for *whether to try*, the recompressor validates the
 /// actual bytes and a mislabelled file simply falls back to being stored as-is.
 fn looks_like_jpeg(name: &str) -> bool {
     let n = name
@@ -273,7 +271,7 @@ fn looks_like_jpeg(name: &str) -> bool {
 ///
 /// Uses the verifying encoder, which decodes its own output and compares it to the input before
 /// returning. Nothing is ever stored transformed unless it has already been proven to reconstruct
-/// byte-for-byte — for irreplaceable photos, "probably reversible" is not good enough. Any failure is
+/// byte-for-byte, for irreplaceable photos, "probably reversible" is not good enough. Any failure is
 /// simply a `None` and the caller stores the original bytes.
 fn jpeg_recompress(data: &[u8]) -> Option<Vec<u8>> {
     let feats = lepton_jpeg::EnabledFeatures::compat_lepton_vector_write();
@@ -355,7 +353,7 @@ fn serialize_index(
     b
 }
 
-/// A bounds-checked cursor over the index bytes — every read validates length so a truncated or
+/// A bounds-checked cursor over the index bytes, every read validates length so a truncated or
 /// hostile index yields [`ArchiveError::Corrupt`] rather than a panic.
 struct Cur<'a> {
     b: &'a [u8],
@@ -464,9 +462,7 @@ fn cram_name(entry: &Entry) -> String {
     entry.path.safe().to_string_lossy().replace('\\', "/")
 }
 
-// ============================================================================================
 // Writer
-// ============================================================================================
 
 pub struct CramArchiveWriter {
     out: BufWriter<File>,
@@ -504,7 +500,7 @@ pub struct CramArchiveWriter {
 }
 
 /// Compress (and, when encrypting, seal) one pack's raw bytes into its on-disk payload. Pure and
-/// thread-safe — packs are independent, so a whole batch compresses in parallel. Returns
+/// thread-safe, packs are independent, so a whole batch compresses in parallel. Returns
 /// `(payload, raw_len, codec)`; a pack that the codec doesn't shrink is stored raw so it never grows.
 fn compress_pack(
     raw: Vec<u8>,
@@ -539,8 +535,8 @@ fn pack_compress(raw: Vec<u8>, level: u32, use_zstd: bool) -> Result<(u8, Vec<u8
     #[cfg(not(feature = "zstd-c"))]
     let _ = use_zstd; // XZ-only build: the flag is always false
 
-    // Adaptive: skip the (slow) LZMA pass on incompressible packs. High-entropy data — already-
-    // compressed media, game `.scs`/`.pak` archives, encrypted blobs — won't shrink, so LZMA just
+    // Adaptive: skip the (slow) LZMA pass on incompressible packs. High-entropy data, already-
+    // compressed media, game `.scs`/`.pak` archives, encrypted blobs; won't shrink, so LZMA just
     // burns CPU exhaustively searching for matches that aren't there, then stores it raw anyway. A
     // cheap sample verdict (entropy + a fast-deflate trial) catches that up front and stores
     // immediately, turning an incompressible `.cram` create from LZMA-bound into read-bound. (Same
@@ -566,7 +562,7 @@ impl CramArchiveWriter {
 
         // Encryption: derive a per-archive key with Argon2id over a random salt, and write the
         // header flag + crypto block (salt + Argon2 params) so the reader can re-derive it.
-        // `.cram` v1 always encrypts the index too (the listing needs the password) — the
+        // `.cram` v1 always encrypts the index too (the listing needs the password), the
         // ContentsOnly/NamesToo split isn't exposed yet, so HeaderMode is not consulted here.
         let (crypter, pos) = match &opts.encrypt {
             None => {
@@ -623,7 +619,7 @@ impl CramArchiveWriter {
     }
 
     /// Chunk everything `src` yields into the dedup table and the current pack, returning the chunk
-    /// ids. Shared by the plain path and the recompressed path so both dedup identically — two
+    /// ids. Shared by the plain path and the recompressed path so both dedup identically, two
     /// copies of one photo still collapse to a single stored copy.
     fn chunk_stream(&mut self, src: &mut dyn Read) -> Result<Vec<u32>> {
         let mut chunk_ids = Vec::new();
@@ -675,8 +671,8 @@ impl CramArchiveWriter {
     }
 
     /// Compress the pending batch **in parallel**, then write the results in id order (assigning
-    /// each pack's file offset as it's written). Packs are byte-identical to the serial path — only
-    /// the compression is parallelized — so the archive layout is unchanged.
+    /// each pack's file offset as it's written). Packs are byte-identical to the serial path, only
+    /// the compression is parallelized, so the archive layout is unchanged.
     fn flush_batch(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -712,12 +708,12 @@ impl ArchiveWriter for CramArchiveWriter {
         // A JPEG is stored as a Lepton stream when that round-trips provably: zip and 7z get ~0% on
         // photos because the data is already entropy-coded, whereas re-doing that coding is worth
         // ~23% with the original file still reconstructable byte-for-byte. The whole image has to be
-        // in memory for this, so it is bounded — and anything that isn't really a JPEG, is too big,
+        // in memory for this, so it is bounded, and anything that isn't really a JPEG, is too big,
         // or fails to verify simply streams through unchanged.
         // The planned size is a cheap first gate purely to avoid buffering: without it, a 10 GB file
         // misnamed `.jpg` would still be read 256 MiB into memory before being rejected. It is only a
-        // hint — the source can have changed since planning, and a source that reports 0 is treated as
-        // unknown — so the read cap below remains the real guard.
+        // hint, the source can have changed since planning, and a source that reports 0 is treated as
+        // unknown, so the read cap below remains the real guard.
         let plausible_size = entry.size == 0 || entry.size <= MAX_XFORM_INPUT;
         if self.recompress_images && plausible_size && looks_like_jpeg(&name) {
             let mut head = Vec::new();
@@ -828,7 +824,7 @@ impl ArchiveWriter for CramArchiveWriter {
             VERSION
         };
         let index = serialize_index(&self.packs, &self.chunks, &self.entries, version);
-        // When encrypted, the index is sealed too — the listing needs the password, and the index's
+        // When encrypted, the index is sealed too; the listing needs the password, and the index's
         // own GCM tag doubles as the password verifier on open.
         let index = match &self.crypter {
             Some(cr) => cr.seal(&index, INDEX_AAD)?,
@@ -867,13 +863,11 @@ impl ArchiveWriter for CramArchiveWriter {
     }
 }
 
-// ============================================================================================
 // Reader
-// ============================================================================================
 
 /// A bounded, thread-safe cache of **decompressed** packs, shared across all extraction workers.
 /// `.cram` dedup means many entries reference the same packs; without a shared cache, every worker
-/// re-decompresses them — the extract CPU bottleneck. FIFO eviction bounded by total bytes.
+/// re-decompresses them, the extract CPU bottleneck. FIFO eviction bounded by total bytes.
 struct PackCache {
     map: HashMap<u32, Arc<Vec<u8>>>,
     order: VecDeque<u32>,
@@ -929,7 +923,7 @@ pub struct CramReader {
     budget: u64,
     /// Cumulative bytes decompressed by the EXTRACTION paths (`reconstruct` / `copy_entry`) over this
     /// reader's life, charged once per cache-miss decode (re-decodes of evicted packs count too). The
-    /// mount path (`read_range`) does NOT touch this — it meters each call independently — and every
+    /// mount path (`read_range`) does NOT touch this, it meters each call independently, and every
     /// extraction/verify uses a fresh reader, so this is effectively per-operation and never starves a
     /// long-lived mount.
     decompressed: AtomicU64,
@@ -946,7 +940,7 @@ impl CramReader {
 
         // Validate header magic, version, and flags. The format is frozen at v1: an unknown version
         // or an unknown (reserved) flag bit means the archive was written by a newer/other producer
-        // whose layout this reader can't assume — so reject cleanly rather than silently misparse it
+        // whose layout this reader can't assume, so reject cleanly rather than silently misparse it
         // as v1 (forward-compatibility guarantee of the frozen `.cram` spec; see docs/CRAM_FORMAT.md).
         let mut head = [0u8; HEADER_LEN as usize];
         file.read_exact(&mut head)?;
@@ -997,7 +991,7 @@ impl CramReader {
         let index_len = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
         // The index must sit wholly within the packs region [packs_start, packs_end). Compare via
         // subtraction (never `index_offset + index_len`, which is attacker-controlled u64 that could
-        // wrap past the check and drive a huge `vec![0u8; index_len]`). `packs_end` can't underflow —
+        // wrap past the check and drive a huge `vec![0u8; index_len]`). `packs_end` can't underflow,
         // the size gate above guarantees `file_len >= HEADER_LEN + TRAILER_LEN`.
         let packs_end = file_len - TRAILER_LEN;
         if index_offset < packs_start
@@ -1079,8 +1073,8 @@ impl CramReader {
         for m in metas {
             // Validate chunk-id bounds AND that the chunk lengths sum to the declared size. The
             // writer guarantees `size == Σ chunk.length` (it does `size += data.len()` and pushes an
-            // id per chunk, deduped or not), so enforcing it here makes `entry.size` authoritative —
-            // reconstruction yields exactly that many bytes — and rejects an inconsistent/hostile
+            // id per chunk, deduped or not), so enforcing it here makes `entry.size` authoritative,
+            // reconstruction yields exactly that many bytes, and rejects an inconsistent/hostile
             // index whose declared size disagrees with its chunk list. Overflow-safe (saturating).
             let mut sum = 0u64;
             for &id in &m.chunk_ids {
@@ -1096,8 +1090,8 @@ impl CramReader {
             } else {
                 // A transformed entry stores a *smaller* stream than the file it reconstructs, so the
                 // sizes deliberately differ and the equality above cannot apply. The declared size is
-                // still bounded here — otherwise a hostile index could claim an enormous one purely to
-                // inflate the anti-bomb budget below — and it is checked exactly against the
+                // still bounded here, otherwise a hostile index could claim an enormous one purely to
+                // inflate the anti-bomb budget below, and it is checked exactly against the
                 // reconstructed length at extraction time, which is the real guarantee.
                 if sum == 0 || m.size > sum.saturating_mul(MAX_XFORM_EXPANSION) {
                     return Err(corrupt("implausible size for a recompressed entry"));
@@ -1153,7 +1147,7 @@ impl CramReader {
         })
     }
 
-    /// Fetch a decompressed pack, sharing it across workers. Returns `(bytes, decompressed_now)` —
+    /// Fetch a decompressed pack, sharing it across workers. Returns `(bytes, decompressed_now)`;
     /// `decompressed_now` is true only on a cache miss (so callers charge the anti-bomb budget once).
     /// The pack is decompressed WITHOUT holding the cache lock, so workers decompress in parallel.
     fn get_pack(&self, file: &mut File, pack_id: u32) -> Result<(Arc<Vec<u8>>, bool)> {
@@ -1192,7 +1186,7 @@ impl CramReader {
             CODEC_XZ => {
                 // BOUND the decompressor to `raw_len + 1` (raw_len itself is capped at MAX_PACK_RAW in
                 // `open`): a decompression bomb otherwise grows `raw` without limit (OOM). The one
-                // extra byte is a sentinel — a stream that decodes to MORE than raw_len yields
+                // extra byte is a sentinel, a stream that decodes to MORE than raw_len yields
                 // raw_len+1 bytes and is rejected by the exact-length check below, so an over-long
                 // pack is refused rather than silently truncated (matches the "exactly raw_len" spec).
                 let mut raw = Vec::with_capacity(p.raw_len as usize);
@@ -1202,7 +1196,7 @@ impl CramReader {
                 raw
             }
             // zstd packs decode with the always-present pure-Rust ruzstd (one frame per pack), bounded
-            // to raw_len(+1 sentinel) like XZ — so any build reads a zstd-c-written `.cram`.
+            // to raw_len(+1 sentinel) like XZ, so any build reads a zstd-c-written `.cram`.
             CODEC_ZSTD => {
                 let mut raw = Vec::with_capacity(p.raw_len as usize);
                 ruzstd::decoding::StreamingDecoder::new(comp.as_slice())
@@ -1237,7 +1231,7 @@ impl CramReader {
     /// original file.
     ///
     /// The reconstructed length is checked against the size the index declared. That is the promise
-    /// this whole feature rests on — the bytes handed back are the bytes that went in — so it is
+    /// this whole feature rests on, the bytes handed back are the bytes that went in, so it is
     /// verified on the way out rather than assumed from the writer having verified on the way in.
     fn restore_entry(&self, index: usize, chunk_ids: &[u32]) -> Result<Vec<u8>> {
         let mut stored = Vec::new();
@@ -1313,7 +1307,7 @@ impl ArchiveReader for CramReader {
         if !entry.is_dir() {
             // The sequential path buffers the whole body in RAM to hand back a `Read`. `entry.size`
             // is authoritative (validated at open to equal the chunk-length sum), so refuse an entry
-            // too large to hold in memory before reconstructing — it would otherwise OOM the process
+            // too large to hold in memory before reconstructing, it would otherwise OOM the process
             // (a hostile chunk list can force huge output from a tiny archive). Big legitimate
             // entries extract via the random-access `copy_entry` path, which streams to disk.
             if entry.size > MAX_INMEM_ENTRY {
@@ -1359,7 +1353,7 @@ impl RandomAccessReader for CramReader {
             .entry_chunks
             .get(index)
             .ok_or_else(|| corrupt("bad entry index"))?;
-        // A Lepton stream cannot be seeked into — the whole image is one arithmetic-coded unit — so a
+        // A Lepton stream cannot be seeked into, the whole image is one arithmetic-coded unit, so a
         // ranged read reconstructs the entry and slices the result. That keeps the ProjFS mount and
         // every other random-access consumer working transparently on recompressed photos; the cost is
         // whole-file work per range, which is acceptable for image-sized entries.
@@ -1554,7 +1548,7 @@ mod tests {
     fn cumulative_budget_trips_across_entries_not_per_entry() {
         // Three distinct STORE packs of 50 bytes each; a tiny budget of 100. Reconstructing entry 0
         // then entry 1 (each decodes ONE 50-byte pack) stays under budget individually, but the
-        // CUMULATIVE counter reaches 150 by the third distinct pack and must trip — a per-entry reset
+        // CUMULATIVE counter reaches 150 by the third distinct pack and must trip, a per-entry reset
         // would let all three through. This is the amplification the fix closes.
         let region = vec![0u8; 150]; // three 50-byte packs laid end to end
         let packs: Vec<PackLoc> = (0..3)
@@ -1704,7 +1698,7 @@ mod tests {
         )
         .unwrap();
 
-        // The transform was actually used, so the header must have been patched to v2 — which is what
+        // The transform was actually used, so the header must have been patched to v2; which is what
         // makes an older reader refuse rather than emit Lepton bytes as if they were a JPEG.
         let head = std::fs::read(&archive).unwrap();
         assert_eq!(
@@ -1736,7 +1730,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With recompression off, the same photo is stored verbatim and the archive stays v1 — so
+    /// With recompression off, the same photo is stored verbatim and the archive stays v1; so
     /// disabling the feature really does opt out of the new format, not just the saving.
     #[test]
     fn recompression_can_be_disabled_and_then_stays_v1() {

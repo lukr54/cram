@@ -1,11 +1,11 @@
 //! Adaptive parallelism: auto-detect hardware, calibrate codec throughput, and derive the
-//! best settings per job — "detect coarse, measure fine, cache the result."
+//! best settings per job, "detect coarse, measure fine, cache the result."
 //!
 //! Layers:
-//!   1. [`HwProfile::detect`] — static profile (cores, RAM, per-drive media/bus/physical-id).
-//!   2. [`classify`]          — per-job bottleneck side from the archive's own header metadata.
-//!   3. [`Governor`]          — runtime self-tuning from decode→writer queue occupancy.
-//!   4. [`calibrate`]         — one-time micro-bench → this machine's real per-core codec rates;
+//!   1. [`HwProfile::detect`], static profile (cores, RAM, per-drive media/bus/physical-id).
+//!   2. [`classify`], per-job bottleneck side from the archive's own header metadata.
+//!   3. [`Governor`], runtime self-tuning from decode→writer queue occupancy.
+//!   4. [`calibrate`], one-time micro-bench → this machine's real per-core codec rates;
 //!      [`measure_write_wall`] measures the number no API exposes (gated: it writes to disk).
 //!
 //! [`derive_plan`] combines them into a [`Plan`] (workers, writers, pipeline shape, buffers, …).
@@ -24,11 +24,9 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use lzma_rust2::{XzOptions, XzReader, XzWriter};
 
-// ===========================================================================================
-// Hardware detection — platform layer. Windows uses raw kernel32 FFI; Unix reads /proc + /sys +
+// Hardware detection, platform layer. Windows uses raw kernel32 FFI; Unix reads /proc + /sys +
 // statvfs. Every probe degrades to a safe default on failure, so a wrong volume / missing
-// permission / absent sysfs never panics — detection is only advisory input to the parallel planner.
-// ===========================================================================================
+// permission / absent sysfs never panics, detection is only advisory input to the parallel planner.
 
 #[cfg(windows)]
 #[repr(C)]
@@ -257,7 +255,7 @@ mod unix_platform {
         }
     }
 
-    /// Bus class inferred from the kernel device name — enough to seed the write-ceiling prior.
+    /// Bus class inferred from the kernel device name, enough to seed the write-ceiling prior.
     #[cfg(target_os = "linux")]
     pub(super) fn drive_bus_type(id: u32) -> Bus {
         match disk_name_for_id(id) {
@@ -291,7 +289,7 @@ mod unix_platform {
     // ---- macOS media detection -------------------------------------------------------------------
     //
     // Whether a drive is spinning decides between one sequential reader and several parallel ones, and
-    // getting it wrong on an external USB hard disk means seek thrash — precisely the case a big photo
+    // getting it wrong on an external USB hard disk means seek thrash, precisely the case a big photo
     // collection lives on. macOS answers it through IOKit, which `diskutil` already wraps, so this
     // shells out **once per volume** and caches the result rather than binding IOKit. Any failure
     // leaves the entry unknown and the caller falls back to today's defaults.
@@ -318,7 +316,7 @@ mod unix_platform {
             .map(|c| c.contains_key(&id))
             .unwrap_or(true)
         {
-            return; // already known (or the lock is poisoned — then just skip detection)
+            return; // already known (or the lock is poisoned, then just skip detection)
         }
         let media = mount_point(path)
             .and_then(|mp| query_diskutil(&mp))
@@ -328,7 +326,7 @@ mod unix_platform {
         }
     }
 
-    /// The mount point containing `path`, via `statfs` — `diskutil` accepts a mount point but not an
+    /// The mount point containing `path`, via `statfs`; `diskutil` accepts a mount point but not an
     /// arbitrary file inside it.
     #[cfg(target_os = "macos")]
     fn mount_point(path: &Path) -> Option<std::path::PathBuf> {
@@ -365,7 +363,7 @@ mod unix_platform {
             return None;
         }
         let text = String::from_utf8_lossy(&out.stdout);
-        // `SolidState` is absent on some devices (notably disk images) — absent stays unknown.
+        // `SolidState` is absent on some devices (notably disk images), absent stays unknown.
         let ssd = super::plist_bool(&text, "SolidState");
         let bus = match super::plist_string(&text, "BusProtocol").as_deref() {
             Some("PCI-Express") | Some("PCI") | Some("Apple Fabric") => Bus::Nvme,
@@ -453,8 +451,8 @@ pub use unix_platform::{free_space_mib, physical_drives_for_path};
 /// Scan an Apple plist for `<key>NAME</key><true/>` → `Some(true)`, `<false/>` → `Some(false)`,
 /// absent → `None`.
 ///
-/// Compiled everywhere (not just macOS) so this parsing — the error-prone part of the macOS drive
-/// probe, and the part that decides sequential-vs-parallel reads — is unit-tested on whatever machine
+/// Compiled everywhere (not just macOS) so this parsing, the error-prone part of the macOS drive
+/// probe, and the part that decides sequential-vs-parallel reads; is unit-tested on whatever machine
 /// the tests are run on, including ones that can never execute the macOS path.
 #[cfg(any(target_os = "macos", test))]
 fn plist_bool(text: &str, key: &str) -> Option<bool> {
@@ -480,7 +478,7 @@ fn plist_string(text: &str, key: &str) -> Option<String> {
 }
 
 /// Extract total/available physical RAM (bytes) from a `/proc/meminfo` body. Kept OS-agnostic (and
-/// compiled under `test`) so the parsing — the error-prone part — is unit-tested even on a host that
+/// compiled under `test`) so the parsing, the error-prone part; is unit-tested even on a host that
 /// has no `/proc`. The `MemAvailable` field is the kernel's own estimate of allocatable RAM.
 #[cfg(any(unix, test))]
 fn parse_meminfo(text: &str) -> (u64, u64) {
@@ -502,9 +500,7 @@ fn parse_meminfo(text: &str) -> (u64, u64) {
     (total, avail)
 }
 
-// ===========================================================================================
 // Static hardware profile
-// ===========================================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Bus {
@@ -524,7 +520,7 @@ pub struct DriveInfo {
 
 impl DriveInfo {
     /// Best-guess sustained-write ceiling before a real measurement (see [`measure_write_wall`]).
-    /// NOTE: DRAM-less / QLC SSDs run FAR below these priors post-SLC — that gap is exactly why
+    /// NOTE: DRAM-less / QLC SSDs run FAR below these priors post-SLC, that gap is exactly why
     /// the write probe exists.
     pub fn default_wall_mibs(&self) -> f64 {
         match self.ssd {
@@ -551,7 +547,7 @@ pub struct HwProfile {
 
 impl HwProfile {
     /// Profile the machine, describing the drive backing `work` (the destination we're about to
-    /// write to). Profiling the CWD instead — as plain `detect()` does — describes the wrong disk
+    /// write to). Profiling the CWD instead, as plain `detect()` does; describes the wrong disk
     /// whenever the destination lives on another volume: extracting from C: onto a D: HDD would be
     /// planned as if D: were C:.
     pub fn detect_for(work: &Path) -> Self {
@@ -778,9 +774,7 @@ pub fn topology(src: &Path, dst: &Path) -> Topology {
     }
 }
 
-// ===========================================================================================
-// Calibration — measure this machine's real per-core codec throughput (light, in-memory)
-// ===========================================================================================
+// Calibration, measure this machine's real per-core codec throughput (light, in-memory)
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Rates {
@@ -856,7 +850,7 @@ fn gen_text(bytes: usize) -> Vec<u8> {
 
 /// Median of `f` over `n` runs after one discarded warm-up. A single timed sample of a codec on a
 /// busy desktop is dominated by scheduling noise, turbo state and cold caches, and whatever comes
-/// out of here is persisted permanently as this machine's "measured" rate — so it has to be a
+/// out of here is persisted permanently as this machine's "measured" rate, so it has to be a
 /// number that survives a noisy desktop, not one lucky or unlucky run.
 fn median_of<F: FnMut() -> f64>(n: usize, mut f: F) -> f64 {
     let _warmup = f();
@@ -910,9 +904,7 @@ pub fn calibrate(sample_mib: usize) -> Rates {
     }
 }
 
-// ===========================================================================================
 // Bottleneck classification + settings derivation
-// ===========================================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Codec {
@@ -939,7 +931,7 @@ pub enum Bottleneck {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Shape {
-    /// Each worker reads+decodes+writes its own entry — the default. Parallel per-entry writers keep
+    /// Each worker reads+decodes+writes its own entry, the default. Parallel per-entry writers keep
     /// the SSD saturated where a single write stream underutilizes it, so they beat a one-writer
     /// pipeline on the drives we measured.
     PerEntry,
@@ -998,7 +990,7 @@ pub fn classify(
     }
 }
 
-/// Approx. per-thread compressor memory (MiB) — the LZMA/xz RAM trap. zstd is far cheaper.
+/// Approx. per-thread compressor memory (MiB), the LZMA/xz RAM trap. zstd is far cheaper.
 fn codec_mem_per_thread_mib(codec: Codec) -> f64 {
     match codec {
         Codec::Lzma => 2400.0, // xz/LZMA2 level ~9: ~2.4 GiB/thread → -T0 -9 blows up RAM
@@ -1031,7 +1023,7 @@ pub fn derive_plan(
             queue_bytes: 16 * MIB,
             preallocate: true,
             codec_threads: 1,
-            note: "HDD: serialize — parallel seeks thrash a spinning disk",
+            note: "HDD: serialize, parallel seeks thrash a spinning disk",
         };
     }
 
@@ -1122,13 +1114,11 @@ pub fn derive_plan(
     }
 }
 
-// ===========================================================================================
-// Runtime governor — the free feedback loop that self-corrects worker count from queue fill.
-// ===========================================================================================
+// Runtime governor, the free feedback loop that self-corrects worker count from queue fill.
 
 /// EWMA of decode→writer queue occupancy with hysteresis. Full queue ⇒ writer is the wall ⇒
 /// shed a worker; starved ⇒ decode is the wall ⇒ add one. Corrects any static mis-estimate
-/// and tracks the SLC-cache cliff mid-job — no hardware database required.
+/// and tracks the SLC-cache cliff mid-job, no hardware database required.
 pub struct Governor {
     fill: f64,
     alpha: f64,
@@ -1192,9 +1182,7 @@ impl Governor {
     }
 }
 
-// ===========================================================================================
-// Write-wall probe — measures the number no API exposes. GATED: it writes to disk.
-// ===========================================================================================
+// Write-wall probe, measures the number no API exposes. GATED: it writes to disk.
 
 #[derive(Clone, Copy, Debug)]
 pub struct WriteWall {
@@ -1208,7 +1196,7 @@ pub struct WriteWall {
 /// Heavy: call only with the user's go-ahead.
 pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
     // Sampling window, adapted to the probe length. A fixed 512 MiB window would close NO window at
-    // all on any probe shorter than that and report zero throughput — a short automatic probe would
+    // all on any probe shorter than that and report zero throughput, a short automatic probe would
     // measure nothing while the caller silently fell back to a guess. A quarter of the cap gives a
     // short probe several samples, while a long probe keeps the full 512 MiB granularity.
     let win_mib: usize = (cap_mib / 4).clamp(32, 512);
@@ -1222,7 +1210,7 @@ pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
     let mut written_mib = 0usize;
     let mut win_bytes = 0usize;
     let mut win_start = Instant::now();
-    // Run the write loop through an inner closure so EVERY exit — including the error path — falls
+    // Run the write loop through an inner closure so EVERY exit, including the error path; falls
     // through to the temp-file cleanup below. ENOSPC is this probe's *expected* failure mode (it
     // deliberately writes toward the cap), and erroring straight out would leave a multi-GiB
     // `.cram_writeprobe.tmp` permanently occupying the space of an already-full drive: the worst
@@ -1296,12 +1284,10 @@ pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
     })
 }
 
-// ===========================================================================================
-// Persistence — cache the profile so calibration is a one-time cost.
-// ===========================================================================================
+// Persistence, cache the profile so calibration is a one-time cost.
 
 /// Free space available to this user on the volume containing `dir`, in MiB. Used to refuse a write
-/// probe on a drive that can't spare the room — a calibration must never be what fills someone's disk.
+/// probe on a drive that can't spare the room, a calibration must never be what fills someone's disk.
 #[cfg(windows)]
 pub fn free_space_mib(dir: &Path) -> Option<u64> {
     let w = wide(dir.to_str()?);
@@ -1319,7 +1305,7 @@ pub fn profile_path() -> Option<std::path::PathBuf> {
 }
 
 /// Per-user profile location on Unix: `$XDG_CONFIG_HOME/cram/profile.toml`, falling back to
-/// `~/.config/cram/profile.toml` — the standard spot for a CLI tool's cached state.
+/// `~/.config/cram/profile.toml`, the standard spot for a CLI tool's cached state.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn profile_path() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -1347,8 +1333,8 @@ pub fn profile_path() -> Option<std::path::PathBuf> {
 pub const PROFILE_SCHEMA: u32 = 2;
 
 /// Identity of the machine a profile was measured on: core counts plus the work drive's media and
-/// bus. Without this stamp a profile copied between machines — or a *roaming* profile following the
-/// user onto different hardware, which is where this one lives — is indistinguishable from one
+/// bus. Without this stamp a profile copied between machines, or a *roaming* profile following the
+/// user onto different hardware, which is where this one lives; is indistinguishable from one
 /// measured locally, so another machine's numbers would be trusted as this machine's.
 pub fn machine_id() -> String {
     let hw = HwProfile::detect();
@@ -1375,7 +1361,7 @@ fn unix_now() -> u64 {
 }
 
 /// Persist calibrated rates. `wall` must be a **measured** sustained ceiling from
-/// [`measure_write_wall`] — pass `None` if it was never measured. Writing a bus-table guess here
+/// [`measure_write_wall`], pass `None` if it was never measured. Writing a bus-table guess here
 /// would launder an estimate into a number everything downstream treats as measured.
 pub fn save_profile(rates: &Rates, wall: Option<f64>) -> io::Result<()> {
     if let Some(p) = profile_path() {
@@ -1402,7 +1388,7 @@ pub fn save_profile(rates: &Rates, wall: Option<f64>) -> io::Result<()> {
     Ok(())
 }
 
-/// Parse a profile file body into (rates, wall). Blank and `#` comment lines are skipped —
+/// Parse a profile file body into (rates, wall). Blank and `#` comment lines are skipped,
 /// crucially WITHOUT early-returning, so one comment line can't discard the whole profile.
 fn parse_profile(text: &str) -> (Rates, f64) {
     let mut r = Rates::default();
@@ -1429,7 +1415,7 @@ fn parse_profile(text: &str) -> (Rates, f64) {
 }
 
 /// Load cached rates (+ measured wall, 0.0 when never measured) so we can skip re-calibration.
-/// Returns `None` — forcing a fresh calibration — when the profile was written by an older schema
+/// Returns `None`, forcing a fresh calibration; when the profile was written by an older schema
 /// or measured on different hardware.
 pub fn load_profile() -> Option<(Rates, f64)> {
     let p = profile_path()?;
@@ -1492,7 +1478,7 @@ mod tests {
             Some("Apple Fabric")
         );
 
-        // Absent keys must read as unknown, never as a confident wrong answer — a disk image reports
+        // Absent keys must read as unknown, never as a confident wrong answer; a disk image reports
         // no SolidState at all, and guessing "SSD" there would pick parallel reads on unknown media.
         let no_media_key =
             r#"<plist><dict><key>VolumeName</key><string>Backup</string></dict></plist>"#;

@@ -1,16 +1,16 @@
-//! `SeqCacheReader` — mount a sequential-only archive (tar / 7z / rar / raw single-stream) by decoding
+//! `SeqCacheReader`, mount a sequential-only archive (tar / 7z / rar / raw single-stream) by decoding
 //! it **once** into a bounded in-memory cache, then serving random-access reads from RAM.
 //!
 //! tar, 7z, rar and raw single-stream codecs are front-to-back streams with no random-access seam, so
 //! unlike ZIP / `.cram` / ISO they can't directly back a ProjFS mount. This adapter bridges the gap:
 //! at open time it drains every entry body into memory (up to `MOUNT_CACHE_CAP`), then implements
-//! [`RandomAccessReader`] over those buffers. It is deliberately the simple option — the whole
-//! *uncompressed* archive must fit under the cap — but it makes every readable format mountable through
+//! [`RandomAccessReader`] over those buffers. It is deliberately the simple option, the whole
+//! *uncompressed* archive must fit under the cap, but it makes every readable format mountable through
 //! the exact same seam as the natively-seekable ones.
 //!
 //! Because all decoding finishes *before* the adapter is returned (the underlying backend is opened,
 //! fully drained, and dropped inside [`SeqCacheReader::decode`]), the resulting reader owns only
-//! `Vec`/`Arc` buffers and is therefore `Send + Sync` — even for a backend like RAR whose native
+//! `Vec`/`Arc` buffers and is therefore `Send + Sync`, even for a backend like RAR whose native
 //! handle is neither. That is what lets the parallel mount callbacks fan out over it safely.
 
 use std::io::{Read, Write};
@@ -75,7 +75,7 @@ impl SeqCacheReader {
             // Charge BOTH the body bytes and the per-entry metadata (name string + Entry + Arc
             // bookkeeping) against the cap. Counting body bytes alone let an archive of millions of
             // zero-length entries (or entries with megabyte-long PAX names) grow `entries`/`bodies`
-            // without ever tripping the cap — an OOM from a ~50 MB hostile file.
+            // without ever tripping the cap, an OOM from a ~50 MB hostile file.
             const PER_ENTRY_OVERHEAD: u64 = 512;
             total = total
                 .saturating_add(buf.len() as u64)
@@ -83,7 +83,7 @@ impl SeqCacheReader {
                 .saturating_add(PER_ENTRY_OVERHEAD);
             if total > cap {
                 return Err(ArchiveError::Backend(format!(
-                    "archive is larger than {} MiB uncompressed — too large to mount in memory; extract it instead",
+                    "archive is larger than {} MiB uncompressed, too large to mount in memory; extract it instead",
                     cap / (1024 * 1024)
                 )));
             }

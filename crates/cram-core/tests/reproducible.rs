@@ -5,7 +5,7 @@
 //!
 //! The format stores no timestamps and no absolute paths; the create walk sorts directory children;
 //! chunking (FastCDC), dedup (BLAKE3), pack assembly, and the order-preserving parallel compression
-//! are all deterministic — so determinism is a property of the design, and these tests pin it down.
+//! are all deterministic, so determinism is a property of the design, and these tests pin it down.
 //!
 //! Encrypted archives are intentionally NOT reproducible: each carries a fresh random Argon2 salt and
 //! per-blob AES-GCM nonces (reusing a GCM nonce would be catastrophic), so two encrypted builds of the
@@ -36,7 +36,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// nested dirs, a file duplicated across two paths (exercises cross-file dedup), and (when `extra` is
 /// set) a few small distinct files so the index carries a mix of new and deduped chunks.
 ///
-/// This fixture is deliberately small — well under one ~8 MiB pack — so it does NOT exercise the
+/// This fixture is deliberately small, well under one ~8 MiB pack, so it does NOT exercise the
 /// multi-pack parallel-compression path (that is covered separately by
 /// [`unencrypted_multipack_build_is_byte_identical`]). It pins down the size-independent parts of
 /// determinism (sorted walk, chunking, dedup, single-pack compression, index, trailer, path
@@ -122,12 +122,12 @@ fn unencrypted_cram_is_byte_identical_across_paths_and_runs() {
 
 /// Genuinely exercises the MULTI-PACK parallel-compression path: > 16 MiB of INCOMPRESSIBLE data so
 /// the writer crosses the ~8 MiB raw pack boundary twice (≥ 2 packs) and `flush_batch` runs on
-/// multi-element batches, and so the archive is large (STORE codec) — proving the size is real
+/// multi-element batches, and so the archive is large (STORE codec); proving the size is real
 /// multi-pack, not a compression artifact. Two builds must be byte-identical; this is what would catch
 /// a regression making pack write-order depend on thread/batch completion order.
 ///
 /// Marked `#[ignore]` because it feeds > 16 MiB through the pure-Rust XZ compressor, which is ~15×
-/// slower in a debug build (tens of seconds) — too slow for the default `cargo test` gate. Run it
+/// slower in a debug build (tens of seconds), too slow for the default `cargo test` gate. Run it
 /// explicitly with `cargo test -- --ignored`. (The same property was also verified directly against a
 /// release build: two independent builds of 18 MiB of random data hash-identically.)
 #[test]
@@ -137,7 +137,7 @@ fn unencrypted_multipack_build_is_byte_identical() {
     let proj = dir.join("proj");
     fs::create_dir_all(proj.join("d")).unwrap();
     for f in 0..6u32 {
-        // Deterministic xorshift byte stream — incompressible, so each pack is stored raw and the
+        // Deterministic xorshift byte stream, incompressible, so each pack is stored raw and the
         // archive is ~= the input size (a genuine multi-pack layout, not a heavily-compressed blob).
         let mut v = Vec::with_capacity(3_000_000);
         let mut x = 0x9E37_79B9u32 ^ f.wrapping_mul(0x0100_0193);
@@ -171,7 +171,7 @@ fn unencrypted_multipack_build_is_byte_identical() {
 #[test]
 fn encrypted_cram_is_intentionally_not_reproducible() {
     // Encryption must inject randomness (a fresh salt + nonces), so two encrypted builds of the same
-    // input differ. If these ever became equal, the salt/nonce would be static — a security defect.
+    // input differ. If these ever became equal, the salt/nonce would be static; a security defect.
     let dir = scratch("enc");
     let proj = build_tree(&dir, false);
     let opts = || CreateOptions {
@@ -189,7 +189,7 @@ fn encrypted_cram_is_intentionally_not_reproducible() {
         b1, b2,
         "encrypted archives must differ (random salt + GCM nonces)"
     );
-    // Same overall size, though — only the random/keyed bytes differ, not the structure.
+    // Same overall size, though; only the random/keyed bytes differ, not the structure.
     assert_eq!(
         b1.len(),
         b2.len(),

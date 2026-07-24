@@ -26,7 +26,7 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Deterministic high-entropy bytes (xorshift) — genuinely incompressible, no RNG dep.
+/// Deterministic high-entropy bytes (xorshift), genuinely incompressible, no RNG dep.
 fn noise(len: usize) -> Vec<u8> {
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
     let mut out = Vec::with_capacity(len);

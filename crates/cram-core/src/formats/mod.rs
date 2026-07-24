@@ -39,13 +39,13 @@ pub fn open(
     }
 }
 
-/// Open an archive as a [`RandomAccessReader`] — the mount / on-access primitive.
+/// Open an archive as a [`RandomAccessReader`], the mount / on-access primitive.
 ///
 /// Two tiers back this:
-/// - **Natively seekable** — ZIP (central directory + per-entry local headers), `.cram` (a footer
+/// - **Natively seekable**, ZIP (central directory + per-entry local headers), `.cram` (a footer
 ///   index over content-addressed packs), and ISO 9660 (each file is a contiguous extent). These serve
 ///   ranges straight from disk with no whole-archive buffering.
-/// - **Sequential, staged to RAM** — tar / 7z / rar / raw are front-to-back streams with no seek seam,
+/// - **Sequential, staged to RAM**; tar / 7z / rar / raw are front-to-back streams with no seek seam,
 ///   so [`seqcache::SeqCacheReader`] decodes them once into a bounded in-memory cache and serves ranges
 ///   from there. Capped, so a too-large archive is refused (extract it instead of mounting).
 ///

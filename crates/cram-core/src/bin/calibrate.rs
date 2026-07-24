@@ -1,4 +1,4 @@
-//! `calibrate` — auto-detect this machine and show the settings Cram's engine derives.
+//! `calibrate`, auto-detect this machine and show the settings Cram's engine derives.
 //!
 //!   calibrate                 detect + light in-memory calibration + derived plans (no disk writes)
 //!   calibrate --recalibrate   ignore any cached profile and re-run the micro-bench
@@ -31,7 +31,7 @@ fn drive_str(d: &Option<DriveInfo>) -> String {
                 None => "unknown media",
             };
             format!(
-                "PhysicalDrive{} — {} ({})",
+                "PhysicalDrive{}, {} ({})",
                 di.number,
                 media,
                 bus_str(di.bus)
@@ -68,7 +68,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(160);
 
-    println!("Cram — hardware auto-detect & calibration\n");
+    println!("Cram, hardware auto-detect & calibration\n");
 
     // ---- Layer 1: static profile ----
     let hw = HwProfile::detect();
@@ -154,7 +154,7 @@ fn main() {
         if measured_wall {
             "measured on your drive"
         } else {
-            "ESTIMATE from bus/media — run `calibrate --write-probe` to measure; QLC/DRAM-less drives run far lower"
+            "ESTIMATE from bus/media, run `calibrate --write-probe` to measure; QLC/DRAM-less drives run far lower"
         }
     );
 

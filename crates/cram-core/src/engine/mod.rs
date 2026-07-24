@@ -1,6 +1,6 @@
 //! The orchestrator: the piece that consumes [`hw::derive_plan`]. It sniffs the format, opens a
 //! reader, derives the plan from the machine profile + the archive's codec/block shape, and
-//! dispatches — the parallel per-entry path when the format is random-access (ZIP), otherwise the
+//! dispatches, the parallel per-entry path when the format is random-access (ZIP), otherwise the
 //! sequential path (RAR/tar/7z/raw).
 
 use std::io::{self, Write};
@@ -30,11 +30,11 @@ pub mod verify;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExtractOptions {
     /// Skip an entry when its destination already matches by size + CRC32 (formats that carry a
-    /// CRC — ZIP/7z). See [`skip`]. Off by default (always overwrite).
+    /// CRC, ZIP/7z). See [`skip`]. Off by default (always overwrite).
     pub skip_existing: bool,
 }
 
-/// What happened to one entry during extraction — a written file (with its byte count) or a
+/// What happened to one entry during extraction, a written file (with its byte count) or a
 /// skip-already-correct hit. Feeds the [`Report`] tally in both engine paths.
 pub(crate) enum EntryOutcome {
     Wrote(u64),
@@ -42,13 +42,13 @@ pub(crate) enum EntryOutcome {
 }
 
 /// Restore an entry's recorded modification time onto its extracted path. Best-effort: a filesystem
-/// that can't set times, or a missing timestamp, is silently ignored — never a reason to fail an
+/// that can't set times, or a missing timestamp, is silently ignored; never a reason to fail an
 /// otherwise-good extraction. Uses `filetime` (not `File::set_modified`) because it sets the time
 /// **by path**, which is the only portable way to stamp a *directory* on Windows (`File::open` on a
 /// dir there needs `FILE_FLAG_BACKUP_SEMANTICS`, which std does not pass).
 ///
-/// Directory times must be applied only **after** every child is written — creating a child updates
-/// the parent's mtime — so both engine paths collect dir times and flush them in a final pass.
+/// Directory times must be applied only **after** every child is written, creating a child updates
+/// the parent's mtime, so both engine paths collect dir times and flush them in a final pass.
 pub(crate) fn restore_mtime(path: &Path, modified: Option<SystemTime>) {
     if let Some(t) = modified {
         let ft = filetime::FileTime::from_system_time(t);
@@ -110,7 +110,7 @@ pub fn warm_profile(dest: &Path) {
 }
 
 /// One bounded, real write probe on `dest`'s drive. Returns `None` (and measures nothing) unless
-/// there is comfortable headroom — a calibration must never be the thing that fills someone's disk.
+/// there is comfortable headroom, a calibration must never be the thing that fills someone's disk.
 fn probe_wall_if_safe(dest: &Path) -> Option<f64> {
     const PROBE_MIB: usize = 512; // 4 x 128 MiB windows -> a median has something to work with
     const REQUIRED_FREE_MIB: u64 = 4096;
@@ -174,7 +174,7 @@ pub fn extract(
 }
 
 /// A `Write` shared by both engine paths: reports written bytes to the sink and aborts when
-/// cancellation is requested — so a long entry stops mid-stream.
+/// cancellation is requested, so a long entry stops mid-stream.
 pub(crate) struct ProgressWriter<'a, W: Write> {
     inner: W,
     sink: &'a dyn ProgressSink,
@@ -186,7 +186,7 @@ impl<'a, W: Write> ProgressWriter<'a, W> {
     }
 
     /// The cancellation sentinel. Deliberately NOT `ErrorKind::Interrupted`: `io::copy` writes
-    /// through `write_all`, which silently *retries* `Interrupted` — with a one-way cancel latch
+    /// through `write_all`, which silently *retries* `Interrupted`; with a one-way cancel latch
     /// that spins forever at 100% CPU. `Other` propagates instead, unwinding the copy at once.
     fn cancelled_err() -> io::Error {
         io::Error::other("cancelled")
@@ -202,7 +202,7 @@ impl<W: Write> Write for ProgressWriter<'_, W> {
         self.sink.on_bytes(n as u64);
         Ok(n)
     }
-    /// Bail on cancel before entering the retry loop — belt-and-braces against `write_all`'s
+    /// Bail on cancel before entering the retry loop, belt-and-braces against `write_all`'s
     /// `Interrupted` retry semantics regardless of the sentinel kind chosen above.
     fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
         while !buf.is_empty() {

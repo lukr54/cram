@@ -1,10 +1,10 @@
 //! Skip-already-correct: on extract, an entry whose destination file already holds exactly this
-//! content can be skipped entirely — the "write fewer bytes than the disk wall allows" win that
+//! content can be skipped entirely, the "write fewer bytes than the disk wall allows" win that
 //! matters most on re-extracting over an existing tree.
 //!
 //! We only skip when a match can be **proven**: same size *and* same CRC32. Formats that carry a
 //! per-entry CRC (ZIP, 7z) get the full win; those that don't (tar, raw, RAR today) report no match,
-//! so extraction stays correct — we never skip on a guess. On the random-access ZIP path the check
+//! so extraction stays correct, we never skip on a guess. On the random-access ZIP path the check
 //! runs before decode+write (saves both); on the sequential path it still saves the write (the wall).
 
 use std::fs::{self, File};
@@ -33,7 +33,7 @@ pub(crate) fn dest_already_correct(dest: &Path, entry: &Entry) -> bool {
     matches!(crc32_of(dest), Ok(got) if got == want_crc)
 }
 
-/// Streamed CRC32 (IEEE — the polynomial ZIP and 7z both use) of a file's contents.
+/// Streamed CRC32 (IEEE, the polynomial ZIP and 7z both use) of a file's contents.
 fn crc32_of(path: &Path) -> std::io::Result<u32> {
     let mut file = File::open(path)?;
     let mut crc = Crc::new();

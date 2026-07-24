@@ -1,4 +1,4 @@
-//! ZIP writer backend — the create counterpart to [`super::zip`]. Wraps the `zip` crate's
+//! ZIP writer backend, the create counterpart to [`super::zip`]. Wraps the `zip` crate's
 //! `ZipWriter` behind the incremental [`ArchiveWriter`] trait: `start_file` + stream the body,
 //! `add_directory`, then `finish` writes the central directory.
 //!
@@ -62,17 +62,17 @@ fn file_options(
 }
 
 /// The entry's mtime as a ZIP `DateTime`, or `None` if absent or outside ZIP's DOS-time range (which
-/// starts at 1980 — an older or missing timestamp is simply not stored, leaving the crate default).
+/// starts at 1980, an older or missing timestamp is simply not stored, leaving the crate default).
 /// Sourced from the input file's mtime (UTC), so an identical input tree still yields an identical zip.
 ///
 /// The input may be a mtime a *reader* surfaced from an untrusted archive (via `convert`), so it must
-/// be bounded before `time::OffsetDateTime::from(SystemTime)` — that conversion **panics** for a time
+/// be bounded before `time::OffsetDateTime::from(SystemTime)`, that conversion **panics** for a time
 /// beyond `time`'s ±9999-year range. A far-future or pre-epoch timestamp is dropped, not stored.
 fn zip_datetime(modified: Option<SystemTime>) -> Option<zip::DateTime> {
     let t = modified?;
     // `duration_since` is `Err` for a pre-1970 time; DOS time can't hold those anyway.
     let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    const MAX_SANE_UNIX: u64 = 32_503_680_000; // ~year 3000 — well inside `time`'s range, absurdly future
+    const MAX_SANE_UNIX: u64 = 32_503_680_000; // ~year 3000, well inside `time`'s range, absurdly future
     if secs > MAX_SANE_UNIX {
         return None;
     }
@@ -121,12 +121,12 @@ impl ZipArchiveWriter {
         };
 
         // ZIP encrypts file *contents* but not the central-directory names. Honoring a "hide names"
-        // request silently would expose every filename while the user believes they're hidden — so
+        // request silently would expose every filename while the user believes they're hidden, so
         // refuse it here. .7z and .cram encrypt the listing and should be used instead.
         if let Some(spec) = &opts.encrypt {
             if spec.header == HeaderMode::NamesToo {
                 return Err(ArchiveError::Backend(
-                    "ZIP cannot hide file names — use .7z or .cram to encrypt the file listing"
+                    "ZIP cannot hide file names, use .7z or .cram to encrypt the file listing"
                         .into(),
                 ));
             }
@@ -177,7 +177,7 @@ impl ArchiveWriter for ZipArchiveWriter {
         };
         // ZIP64 is needed when EITHER size crosses 4 GiB. The compressed stream can exceed the raw
         // size: AES-256 framing adds 28 bytes, and DEFLATE on incompressible data grows ~0.03% plus
-        // block overhead — so a raw size just under the threshold (e.g. 0xFFFF_FFF0 stored+AES)
+        // block overhead, so a raw size just under the threshold (e.g. 0xFFFF_FFF0 stored+AES)
         // overflows the 32-bit compressed-size field mid-write and the zip crate hard-errors after
         // streaming the whole entry. Decide with a worst-case margin instead of the raw size alone.
         let large = entry.size.saturating_add(entry.size / 1000 + (64 << 10)) >= ZIP64_THRESHOLD;

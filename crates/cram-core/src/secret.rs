@@ -2,7 +2,7 @@
 //!
 //! Two rules the whole engine follows:
 //!   1. **Passwords are never stored in plain `String`.** They live in [`Secret`], a `Zeroizing`
-//!      wrapper that wipes its bytes on drop and refuses to `Debug`/`Display` its contents — so a
+//!      wrapper that wipes its bytes on drop and refuses to `Debug`/`Display` its contents, so a
 //!      password can't leak into a log line, a panic message, or a serialized struct.
 //!   2. **Backends never hold the password; they ask for it.** Extraction takes a
 //!      [`PasswordProvider`] and calls back *only when it actually meets an encrypted entry or an
@@ -26,7 +26,7 @@ impl Secret {
     pub fn new(password: impl Into<String>) -> Self {
         Self(Zeroizing::new(password.into()))
     }
-    /// Borrow the plaintext — call this as late as possible and don't copy it into an
+    /// Borrow the plaintext, call this as late as possible and don't copy it into an
     /// un-zeroized `String`.
     pub fn expose(&self) -> &str {
         &self.0
@@ -51,7 +51,7 @@ pub struct PasswordRequest<'a> {
     /// The specific entry needing a password, if the format uses per-entry passwords (rare).
     pub entry: Option<&'a str>,
     /// `true` when the password is needed to read the *header/listing* itself (encrypted-names
-    /// 7z/RAR/.cram) — the GUI must prompt before it can even show the file tree.
+    /// 7z/RAR/.cram), the GUI must prompt before it can even show the file tree.
     pub for_header: bool,
     /// 0 on the first ask; incremented after each `WrongPassword` so the UI can say "try again".
     pub attempt: u32,
@@ -63,7 +63,7 @@ pub trait PasswordProvider: Send + Sync {
     fn password(&self, req: &PasswordRequest<'_>) -> Option<Secret>;
 }
 
-/// Never supplies a password — encrypted archives surface `PasswordRequired` cleanly.
+/// Never supplies a password, encrypted archives surface `PasswordRequired` cleanly.
 pub struct NoPassword;
 impl PasswordProvider for NoPassword {
     fn password(&self, _req: &PasswordRequest<'_>) -> Option<Secret> {
@@ -94,10 +94,10 @@ where
 /// ZIP encryption method chosen at creation time (fork #1). Other containers are always AES-256.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ZipCipher {
-    /// WinZip AES-256 — strong, modern, read by 7-Zip/WinZip/recent Windows.
+    /// WinZip AES-256, strong, modern, read by 7-Zip/WinZip/recent Windows.
     #[default]
     Aes256,
-    /// Legacy PKWARE ZipCrypto — weak/breakable, offered only for compatibility and surfaced as
+    /// Legacy PKWARE ZipCrypto, weak/breakable, offered only for compatibility and surfaced as
     /// such in the UI. Never the default.
     LegacyZipCrypto,
 }
@@ -109,7 +109,7 @@ pub enum HeaderMode {
     /// Contents encrypted, listing browsable without the password.
     #[default]
     ContentsOnly,
-    /// Listing encrypted too — the password is required even to see what's inside.
+    /// Listing encrypted too, the password is required even to see what's inside.
     NamesToo,
 }
 
@@ -118,9 +118,9 @@ pub enum HeaderMode {
 #[derive(Debug, Clone)]
 pub struct EncryptSpec {
     pub password: Secret,
-    /// ZIP only — ignored by other containers.
+    /// ZIP only, ignored by other containers.
     pub zip_cipher: ZipCipher,
-    /// 7z / `.cram` only — the per-archive choice from the create dialog.
+    /// 7z / `.cram` only, the per-archive choice from the create dialog.
     pub header: HeaderMode,
 }
 

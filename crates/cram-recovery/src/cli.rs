@@ -1,6 +1,6 @@
 //! The `rec create` / `rec verify` / `rec repair` command-line, called by the unified `cram` binary.
 //! `args` is the slice starting at the subcommand (e.g. `["create", <file>, "-r", "10"]`), so `args[0]`
-//! is the verb. Behavior is identical to the former standalone `cram-rec` binary — only the entry shape
+//! is the verb. Behavior is identical to the former standalone `cram-rec` binary, only the entry shape
 //! and the program name in the usage text changed.
 
 use std::fs;
@@ -117,7 +117,7 @@ fn run_verify(file: &Path) -> ExitCode {
         }
         Ok(false) => {
             println!(
-                "{}: DAMAGED but recoverable — run `cram rec repair`",
+                "{}: DAMAGED but recoverable, run `cram rec repair`",
                 file.display()
             );
             ExitCode::from(1)
@@ -135,7 +135,7 @@ fn run_repair(file: &Path, out: Option<PathBuf>, in_place: bool) -> ExitCode {
         Ok(r) => r,
         Err(e) => return fail(&e),
     };
-    // Default: non-destructive — write <file>.repaired. --in-place overwrites the original.
+    // Default: non-destructive, write <file>.repaired. --in-place overwrites the original.
     let dest = if in_place {
         file.to_path_buf()
     } else {
@@ -146,7 +146,7 @@ fn run_repair(file: &Path, out: Option<PathBuf>, in_place: bool) -> ExitCode {
         })
     };
     // Write to a sibling temp then atomically rename over `dest`. This matters most for `--in-place`:
-    // the original (the only copy) is never left half-overwritten if the write fails midway — it is
+    // the original (the only copy) is never left half-overwritten if the write fails midway, it is
     // replaced only once the full reconstructed content is safely on disk.
     if let Err(e) = write_atomic(&dest, &repair.data) {
         return fail(&format!("write {}: {e}", dest.display()));
@@ -169,14 +169,14 @@ fn run_repair(file: &Path, out: Option<PathBuf>, in_place: bool) -> ExitCode {
 
 /// Write `data` to `dest` durably: stage it in a sibling temp file, then rename over `dest`. `rename`
 /// replaces an existing file atomically on the same volume (Windows `MoveFileEx`), so a mid-write
-/// failure can never truncate or corrupt `dest` — critical for the in-place case where `dest` is the
+/// failure can never truncate or corrupt `dest`, critical for the in-place case where `dest` is the
 /// user's only copy.
 fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut tmp = dest.as_os_str().to_os_string();
     tmp.push(".cram-rec.tmp");
     let tmp = PathBuf::from(tmp);
     // Write + fsync BEFORE the rename. The rename is journaled metadata; without the data fsync a
-    // power cut can replay the rename over never-flushed blocks, leaving `dest` full of zeros —
+    // power cut can replay the rename over never-flushed blocks, leaving `dest` full of zeros;
     // fatal for `--in-place`, where `dest` is the user's ONLY copy.
     let write_synced = (|| -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;

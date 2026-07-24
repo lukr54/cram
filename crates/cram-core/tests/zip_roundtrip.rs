@@ -136,8 +136,8 @@ fn aes256_zip_round_trips_and_rejects_wrong_password() {
 ///
 /// Guards against: an AE-2 zero CRC being read as if it were a checksum. WinZip AES has two
 /// variants: AE-1 stores the plaintext CRC-32, AE-2 stores `0` and omits it because the AES
-/// authentication already proves integrity. The writer picks per entry — anything under 20 bytes
-/// gets AE-2 — so a reader that compares that `0` against the recomputed CRC of a short encrypted
+/// authentication already proves integrity. The writer picks per entry, anything under 20 bytes
+/// gets AE-2, so a reader that compares that `0` against the recomputed CRC of a short encrypted
 /// entry would declare corrupt an archive Cram has just written itself. A false "your archive is
 /// damaged" is the one verdict a user cannot safely ignore, so the boundary is worth a test of its
 /// own.
@@ -178,7 +178,7 @@ fn small_entries_in_an_encrypted_zip_do_not_fail_verification() {
     );
     assert_eq!(report.checked, 3, "every entry should have been checked");
     // Two of the three are genuinely CRC-checked: `long.txt` keeps a real AE-1 CRC, and `empty.txt`
-    // has a stored CRC of 0 that is *correct* — the CRC of no bytes is 0 — which is exactly why
+    // has a stored CRC of 0 that is *correct*, the CRC of no bytes is 0; which is exactly why
     // `stored_crc` discounts a zero CRC only on a non-empty entry. Only `tiny.txt` is AE-2 with no
     // checksum to compare, and it is proven by its AES authentication instead. Pinning the count
     // stops a future change from satisfying this test by dropping CRC checking for encrypted ZIPs

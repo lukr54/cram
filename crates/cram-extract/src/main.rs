@@ -1,9 +1,9 @@
-//! `cram-extract <archive.cram> <dest-dir> [-p <password>]` — a **standalone** extractor for the
+//! `cram-extract <archive.cram> <dest-dir> [-p <password>]`, a **standalone** extractor for the
 //! `.cram` v1 format (see docs/CRAM_FORMAT.md).
 //!
 //! This binary shares **no code** with `cram-core`. It is an independent, from-the-spec reader whose
 //! whole job is to get your files back out of a `.cram` with the smallest possible trusted surface:
-//! four pure-Rust decode crates (XZ, zstd, AES-GCM, Argon2) and the standard library, nothing else —
+//! four pure-Rust decode crates (XZ, zstd, AES-GCM, Argon2) and the standard library, nothing else;
 //! no chunker, no hasher, no parallel engine, no writer. That makes it (a) a second, independent
 //! implementation that validates the frozen format really is implementable from the document alone,
 //! and (b) a tiny auditable recovery tool you can build and run even if the main Cram tool is gone.
@@ -14,7 +14,7 @@
 //!
 //! It also doubles as the **self-extractor toolkit**: `--make-sfx <archive.cram> <out.exe>` appends a
 //! `.cram` payload to a copy of this binary, producing a standalone `.exe` that extracts itself on any
-//! Windows machine with nothing installed — the interop escape hatch that keeps `.cram` from ever
+//! Windows machine with nothing installed, the interop escape hatch that keeps `.cram` from ever
 //! being a dead end. When run with an embedded payload it self-extracts through this same safe reader.
 
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ const VERSION: u8 = 1;
 const VERSION_XFORM: u8 = 2;
 /// Entry stored exactly as read.
 const XFORM_NONE: u8 = 0;
-/// Entry stored as a Lepton stream — the original JPEG is reconstructed byte-for-byte on the way out.
+/// Entry stored as a Lepton stream, the original JPEG is reconstructed byte-for-byte on the way out.
 /// This reader must be able to reverse anything the writer does, or a photo archive would not be
 /// recoverable with the very tool that exists to recover it.
 const XFORM_LEPTON: u8 = 1;
@@ -58,7 +58,7 @@ const MAX_PACK_RAW: u64 = 64 * 1024 * 1024;
 // Caps on the Argon2 params READ from an untrusted archive. Enforced before the KDF allocates, these
 // bound both the memory AND the CPU a single password attempt can cost. Kept comfortably above the
 // only writer's fixed 19 MiB / t=2 (see cram-core), but far below the old 1 GiB / t=64 ceiling, which
-// let a hostile header demand ~64 GiB of memory traffic per "wrong password" — a nuisance DoS.
+// let a hostile header demand ~64 GiB of memory traffic per "wrong password", a nuisance DoS.
 const MAX_ARGON_M: u32 = 262_144; // 256 MiB (in KiB)
 const MAX_ARGON_T: u32 = 8;
 const MAX_ARGON_P: u32 = 16;
@@ -168,7 +168,7 @@ fn deserialize_index(buf: &[u8], version: u8) -> R<(Vec<PackLoc>, Vec<ChunkLoc>,
         let name =
             String::from_utf8(c.take(name_len)?.to_vec()).map_err(|_| "entry name is not utf-8")?;
         let size = c.u64()?;
-        let _mode = c.u32()?; // permissions — not applied by this minimal extractor
+        let _mode = c.u32()?; // permissions, not applied by this minimal extractor
         let nci = c.u32()?;
         let mut chunk_ids = Vec::new();
         for _ in 0..nci {
@@ -195,7 +195,7 @@ fn deserialize_index(buf: &[u8], version: u8) -> R<(Vec<PackLoc>, Vec<ChunkLoc>,
     Ok((packs, chunks, entries))
 }
 
-/// Windows reserved device names — matches the reference `is_reserved_dos_name`: the device is
+/// Windows reserved device names, matches the reference `is_reserved_dos_name`: the device is
 /// matched on the stem before the first '.', ignoring the trailing spaces/dots that Win32 also
 /// ignores (so `CON`, `CON.`, `CON ` and `CON.txt` all match), and covers `CONIN$`/`CONOUT$`,
 /// `COM0-9`/`LPT0-9`, and the superscript `COM¹/²/³` forms newer Windows reserves.
@@ -380,8 +380,8 @@ struct Archive {
     total_out: u64,
     cache: PackCache,
     /// Cumulative decompressed bytes across the WHOLE run. Metering per entry (the old scheme)
-    /// let an archive whose entries each stay under the budget — but which evict each other's
-    /// packs from the cache — multiply total decompression without bound: N entries × budget of
+    /// let an archive whose entries each stay under the budget, but which evict each other's
+    /// packs from the cache, multiply total decompression without bound: N entries × budget of
     /// CPU work from a sub-megabyte file. The anti-bomb budget must cover the whole extraction.
     decompressed: u64,
 }
@@ -492,7 +492,7 @@ impl Archive {
 
         // Sanitize names and DROP any entry whose path is unsafe (traversal / device / too deep), so a
         // hostile name is never listed, never printed by --list (no terminal-escape injection), and
-        // never extracted — matching the reference reader. Retained entries carry their safe path.
+        // never extracted, matching the reference reader. Retained entries carry their safe path.
         let total = entries.len();
         let entries: Vec<EntryMeta> = entries
             .into_iter()
@@ -530,7 +530,7 @@ impl Archive {
     /// Anti-bomb ceiling on total decompression WORK for the whole extraction: `RE_DECODE_FACTOR ×
     /// the bytes extraction will actually write` (Σ entry sizes, each already checked == Σ its chunk
     /// lengths). Bounds work-vs-output amplification without rejecting a legitimately large,
-    /// highly-compressible archive — basing it on `file_len × ratio` wrongly refused a sparse /
+    /// highly-compressible archive, basing it on `file_len × ratio` wrongly refused a sparse /
     /// low-entropy archive compressing >1000:1.
     fn budget(&self) -> u64 {
         self.total_out
@@ -550,7 +550,7 @@ impl Archive {
     }
 
     /// Reconstruct one entry's body into `out`, metering decompression against the anti-bomb budget
-    /// (cumulative across the whole run — see `Archive::decompressed`).
+    /// (cumulative across the whole run, see `Archive::decompressed`).
     fn write_entry(&mut self, idx: usize, out: &mut dyn Write) -> R<()> {
         // A recompressed JPEG is reassembled in full and then reversed, because a Lepton stream is one
         // arithmetic-coded unit and cannot be written out piecewise. The reconstructed length is
@@ -618,7 +618,7 @@ impl Archive {
     }
 
     /// Extract every entry under `dest`. Returns (files, dirs). Unsafe entries were already dropped at
-    /// open, so every entry here carries a validated relative `safe` path — just join it under `dest`.
+    /// open, so every entry here carries a validated relative `safe` path; just join it under `dest`.
     fn extract_all(&mut self, dest: &Path) -> R<(u64, u64)> {
         fs::create_dir_all(dest).map_err(io_err)?;
         let (mut files, mut dirs) = (0u64, 0u64);
@@ -691,7 +691,7 @@ fn payload_in(bytes: &[u8]) -> Option<&[u8]> {
 /// A plain `cram-extract` has no trailer → `None` → it behaves as the ordinary extractor. Any read
 /// failure is treated as "no payload" so a normal invocation can never be derailed by this probe.
 ///
-/// Reads ONLY the 24-byte trailer and then exactly the payload range — the old `fs::read` of the
+/// Reads ONLY the 24-byte trailer and then exactly the payload range, the old `fs::read` of the
 /// whole exe plus a `to_vec` of the payload slice held ~2× the payload in RAM at peak (a 2 GiB SFX
 /// transiently needed ~4 GiB).
 fn embedded_payload() -> Option<Vec<u8>> {
@@ -719,7 +719,7 @@ fn embedded_payload() -> Option<Vec<u8>> {
     Some(payload)
 }
 
-/// If `bytes` is already an SFX (stub+payload+trailer), return just the stub — so re-wrapping doesn't
+/// If `bytes` is already an SFX (stub+payload+trailer), return just the stub, so re-wrapping doesn't
 /// nest payloads. Otherwise return it unchanged.
 fn stub_only(mut bytes: Vec<u8>) -> Vec<u8> {
     let total = bytes.len() as u64;
@@ -822,7 +822,7 @@ fn main() -> ExitCode {
                 }
                 "-h" | "--help" => {
                     eprintln!(
-                        "self-extracting archive — run it to extract into the current folder,"
+                        "self-extracting archive, run it to extract into the current folder,"
                     );
                     eprintln!("or: <self-extractor> [<dest-dir>] [-p <password>]");
                     return ExitCode::from(2);
@@ -884,7 +884,7 @@ fn main() -> ExitCode {
     };
 
     if list {
-        println!("{} — {} entries", archive.display(), arc.entries.len());
+        println!("{}, {} entries", archive.display(), arc.entries.len());
         arc.list();
         return ExitCode::SUCCESS;
     }

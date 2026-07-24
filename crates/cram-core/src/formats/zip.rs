@@ -1,4 +1,4 @@
-//! ZIP backend — the random-access fast path. Each entry is independently decodable, so the engine
+//! ZIP backend, the random-access fast path. Each entry is independently decodable, so the engine
 //! extracts many at once, every worker opening its **own** file handle (see [`ZipReader::copy_entry`]);
 //! the ceiling becomes the disk write wall, not one CPU core. It is rebound to cram-core's
 //! `Entry`/`Report`/`PasswordProvider` and the centralized zip-slip guard.
@@ -24,7 +24,7 @@ use crate::secret::{PasswordProvider, PasswordRequest};
 /// WinZip AES comes in two flavours. **AE-1** stores the real CRC-32 of the plaintext; **AE-2**
 /// stores `0` and deliberately omits it, because the AES authentication code already proves the
 /// data is intact and a plaintext CRC leaks information about short entries. Writers pick between
-/// them per entry — the `zip` crate emits AE-2 for anything under 20 bytes — so a zero here is not a
+/// them per entry, the `zip` crate emits AE-2 for anything under 20 bytes, so a zero here is not a
 /// checksum, it is the absence of one.
 ///
 /// Taking that zero literally would make `cram t` recompute the CRC of a small encrypted entry,
@@ -70,11 +70,11 @@ fn map_zip_err(e: ZipError) -> ArchiveError {
 }
 
 /// Scan the central directory once into cram-core `Entry`s. Entries whose names would escape the
-/// output dir (zip-slip) are dropped here via [`EntryPath::from_raw`] — they can't be listed or
+/// output dir (zip-slip) are dropped here via [`EntryPath::from_raw`], they can't be listed or
 /// extracted. `Entry::index` keeps the true archive index so `by_index` still resolves.
 ///
-/// Uses `by_index_raw` (not `by_index`): raw access reads central-directory metadata — including the
-/// `encrypted` flag — **without** preparing/decrypting the data stream, so an AES/ZipCrypto archive
+/// Uses `by_index_raw` (not `by_index`): raw access reads central-directory metadata, including the
+/// `encrypted` flag, **without** preparing/decrypting the data stream, so an AES/ZipCrypto archive
 /// can be listed without a password (WinZip AES leaves names in the clear). `by_index` would return
 /// `PASSWORD_REQUIRED` here and make even listing an encrypted archive fail.
 fn scan(path: &Path) -> Result<(Vec<Entry>, Arc<ZipArchiveMetadata>)> {
@@ -112,7 +112,7 @@ pub struct ZipReader {
     name: String,
     entries: Vec<Entry>,
     /// The central directory, parsed ONCE at open and shared by every per-call handle. Without
-    /// it, `copy_entry`/`read_range` would re-parse the whole CD on every call — O(n²) work across
+    /// it, `copy_entry`/`read_range` would re-parse the whole CD on every call; O(n²) work across
     /// an n-entry extraction, and an O(n) parse per on-access read of a mounted ZIP.
     meta: Arc<ZipArchiveMetadata>,
     pw: Arc<dyn PasswordProvider>,
@@ -142,10 +142,10 @@ impl ZipReader {
 
     /// A fresh archive handle over an independent `File`, reusing the once-parsed central
     /// directory. SAFETY (the crate's documented invariant for `unsafe_new_with_metadata`): the
-    /// reader must view the same byte stream the metadata was parsed from — we re-open the same
+    /// reader must view the same byte stream the metadata was parsed from, we re-open the same
     /// path, exactly as the crate's own multi-handle example does. If the file is swapped on disk
     /// mid-run, the stored offsets land on wrong bytes and decoding fails with a typed error /
-    /// CRC mismatch — the same TOCTOU exposure any re-open-and-read design carries, never UB.
+    /// CRC mismatch, the same TOCTOU exposure any re-open-and-read design carries, never UB.
     fn handle(&self) -> Result<ZipArchive<File>> {
         let file = File::open(&self.path)?;
         Ok(unsafe { ZipArchive::unsafe_new_with_metadata(file, self.meta.clone()) })
@@ -238,12 +238,12 @@ impl RandomAccessReader for ZipReader {
     }
 
     /// Mount / on-access primitive: return the `[off, off+len)` window of the entry's *uncompressed*
-    /// stream. DEFLATE has no random seek, so we decode from the start — but we **stream**: skip the
+    /// stream. DEFLATE has no random seek, so we decode from the start, but we **stream**: skip the
     /// leading `off` bytes through a small scratch buffer, copy out at most `len`, and stop, never
     /// materializing the whole entry. This bounds memory to the requested window, so a huge or
     /// zip-bombed entry cannot OOM the process hosting the mount when only a slice is read.
     /// Decoding the entry in full and slicing afterwards would instead make every mount read an
-    /// unbounded allocation sized by the archive rather than by the caller's request — and once
+    /// unbounded allocation sized by the archive rather than by the caller's request, and once
     /// ZIP is mountable, that path is reachable from any read. Cost note: each call re-opens the
     /// archive and re-decodes from the entry start, so many small out-of-order reads are O(offset)
     /// each; the common mount patterns (copy / read-to-end) issue one large range and decode once.

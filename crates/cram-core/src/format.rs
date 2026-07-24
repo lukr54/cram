@@ -5,17 +5,17 @@
 /// The container structure that holds entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Container {
-    /// PKZIP — per-entry compressed, random-access (the parallel fast path).
+    /// PKZIP, per-entry compressed, random-access (the parallel fast path).
     Zip,
-    /// 7z — solid/blocked LZMA2 et al.
+    /// 7z, solid/blocked LZMA2 et al.
     SevenZ,
-    /// RAR — read-only (creating RAR is legally forbidden).
+    /// RAR, read-only (creating RAR is legally forbidden).
     Rar,
-    /// tar — uncompressed concatenation, usually wrapped in a whole-stream `Codec`.
+    /// tar, uncompressed concatenation, usually wrapped in a whole-stream `Codec`.
     Tar,
-    /// Cram-native chunk-store (cross-file dedup) — see the dedup format design.
+    /// Cram-native chunk-store (cross-file dedup), see the dedup format design.
     Cram,
-    /// ISO 9660 (+ Joliet) CD/DVD image — read-only, uncompressed extents, random-access/mountable.
+    /// ISO 9660 (+ Joliet) CD/DVD image, read-only, uncompressed extents, random-access/mountable.
     Iso,
     /// No container: the decoded `Codec` stream is itself a single entry (`foo.gz`, `foo.xz`).
     Raw,

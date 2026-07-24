@@ -1,4 +1,4 @@
-//! rdm engine — segmented, resumable, multi-source download with optional request headers.
+//! rdm engine, segmented, resumable, multi-source download with optional request headers.
 //!
 //! The file is split into fixed chunks held in a shared queue; each connection pulls the
 //! next undone chunk (HTTP `Range`) and streams its bytes to a **dedicated writer thread**
@@ -11,9 +11,9 @@
 //!
 //! This is the **library** crate: the standalone rdm app (CLI/GUI/native host) and Cram both
 //! depend on it. Two features exist specifically for Cram's extract-while-download:
-//!   - a **contiguous watermark** ([`Progress::contiguous`]) — how many bytes are available
+//!   - a **contiguous watermark** ([`Progress::contiguous`]), how many bytes are available
 //!     from offset 0, so a consumer can stream the in-order prefix while the tail still downloads;
-//!   - a **leading-edge** scheduling mode ([`download_stream`]) — dedicate one connection to the
+//!   - a **leading-edge** scheduling mode ([`download_stream`]), dedicate one connection to the
 //!     lowest-index pending chunk so the frontier advances fast despite out-of-order writes.
 
 use std::collections::VecDeque;
@@ -36,7 +36,7 @@ pub type Err = Box<dyn std::error::Error + Send + Sync>;
 
 /// Positional write at an explicit offset without disturbing the file's implicit cursor. Windows
 /// exposes this as `seek_write` and Unix as `write_at` (the Windows call advances the cursor, the Unix
-/// one doesn't — but the writer thread always passes an explicit offset, so the two are equivalent).
+/// one doesn't, but the writer thread always passes an explicit offset, so the two are equivalent).
 trait PositionalIo {
     fn pwrite(&self, buf: &[u8], off: u64) -> std::io::Result<usize>;
 }
@@ -67,7 +67,7 @@ const WRITE_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 /// let a new batch ramp (TCP slow-start) before judging it; `RAMP_GAIN` = the minimum throughput
 /// improvement a doubling must produce to count as "still helping"; `RAMP_STALLS` = how many
 /// *consecutive* below-gain intervals to tolerate before settling. Hysteresis matters because the
-/// first interval after a doubling often catches the new connections still in slow-start — one flat
+/// first interval after a doubling often catches the new connections still in slow-start, one flat
 /// sample must NOT be mistaken for the plateau (that stranded a 10G line at 16 conns in testing).
 const RAMP_START: usize = 8;
 const RAMP_INTERVAL: Duration = Duration::from_millis(1000);
@@ -79,12 +79,12 @@ enum WriteMsg {
     /// Bytes to write at an absolute file offset.
     Data { offset: u64, bytes: Bytes },
     /// Chunk `idx` has been fully streamed; every `Data` for it precedes this message, so when the
-    /// writer reaches it the whole chunk is on disk — safe to mark done and resume-journal.
+    /// writer reaches it the whole chunk is on disk, safe to mark done and resume-journal.
     Complete { idx: usize },
 }
 
-/// Closes the write-back semaphore on drop, so however the writer thread exits — a clean drain, a
-/// disk error, or a panic (e.g. a poisoned lock) — any fetch task blocked waiting for buffer room is
+/// Closes the write-back semaphore on drop, so however the writer thread exits; a clean drain, a
+/// disk error, or a panic (e.g. a poisoned lock), any fetch task blocked waiting for buffer room is
 /// woken (its `acquire` errors) and bails, instead of hanging the whole download forever.
 struct SemCloser<'a>(&'a Semaphore);
 impl Drop for SemCloser<'_> {
@@ -93,7 +93,7 @@ impl Drop for SemCloser<'_> {
     }
 }
 
-/// Marks the progress finished on **every** exit of the download loop — success, error, an early `?`
+/// Marks the progress finished on **every** exit of the download loop, success, error, an early `?`
 /// return, or the future being dropped. Without this a streaming consumer (Cram's extract-while-
 /// download) parked in [`Progress::wait_contiguous`] would hang forever whenever `run` bailed before
 /// reaching its finish point (a failed probe/open/set_len, or the writer join/panic paths).
@@ -105,8 +105,8 @@ impl Drop for FinishGuard {
 }
 
 /// Shared progress + control for a download. Besides the total-bytes counter (`done`, incremented
-/// out-of-order as chunks land), it publishes the **contiguous watermark** (`contiguous`) — the
-/// in-order prefix length — plus a `finished` flag and a condvar so a streaming consumer can block
+/// out-of-order as chunks land), it publishes the **contiguous watermark** (`contiguous`); the
+/// in-order prefix length, plus a `finished` flag and a condvar so a streaming consumer can block
 /// until the watermark advances.
 pub struct Progress {
     pub done: AtomicU64,
@@ -117,7 +117,7 @@ pub struct Progress {
     /// High-water mark of concurrent connections the engine settled on (informational; grows during
     /// adaptive ramping, or equals the fixed count for a non-ramp download).
     pub peak_conns: AtomicUsize,
-    /// Set once the download loop exits (complete or gave up) — no more bytes will arrive.
+    /// Set once the download loop exits (complete or gave up), no more bytes will arrive.
     finished: AtomicBool,
     wm_lock: Mutex<()>,
     wm_cond: Condvar,
@@ -266,7 +266,7 @@ fn write_sidecar(scp: &Path, snap: &Sidecar) {
     }
 }
 
-/// Stream one chunk's bytes into the writer channel — the bytes are handed to the dedicated writer
+/// Stream one chunk's bytes into the writer channel, the bytes are handed to the dedicated writer
 /// thread and never written on this async task, so a blocking/slow disk can't stall the socket.
 /// `prog.done` advances per received buffer for a smooth, byte-granular speed readout, and is rolled
 /// back if the stream fails partway so a retried chunk isn't double-counted. On success a `Complete`
@@ -295,7 +295,7 @@ async fn fetch_chunk(
 
     // Validate the server actually honored the Range. We always send one, so a conforming server
     // answers 206 Partial Content. A server that IGNORES Range answers 200 with the whole file from
-    // byte 0 — only correct to write when this chunk itself begins at offset 0 (a non-range source is
+    // byte 0, only correct to write when this chunk itself begins at offset 0 (a non-range source is
     // handled upstream as a single whole-file chunk). Any other case (a mirror/proxy answering 200 to
     // a mid-file range, a shifted Content-Range, or an error status) would land the wrong bytes at
     // `start`, so we reject it → the chunk is retried / left not-done rather than silently corrupting
@@ -322,7 +322,7 @@ async fn fetch_chunk(
 
     let mut stream = resp.bytes_stream();
     let mut offset = start;
-    let mut counted: u64 = 0; // bytes this attempt added to prog.done — rolled back if it fails.
+    let mut counted: u64 = 0; // bytes this attempt added to prog.done, rolled back if it fails.
     loop {
         // Observe cancellation mid-chunk (the outer loop only checks between chunks); with the read
         // timeout above bounding a stall, this keeps request_cancel responsive even on a big chunk.
@@ -331,7 +331,7 @@ async fn fetch_chunk(
             return Err("cancelled".into());
         }
         // Tail-redundancy race: if another worker already committed this same chunk, stop streaming
-        // and roll back our bytes. This is NOT a failure (the chunk is done) — return Ok so the caller
+        // and roll back our bytes. This is NOT a failure (the chunk is done), return Ok so the caller
         // doesn't re-queue it; we simply lost the race to the faster mirror.
         if committed.load(Ordering::Relaxed) {
             prog.done.fetch_sub(counted, Ordering::Relaxed);
@@ -365,7 +365,7 @@ async fn fetch_chunk(
         };
         let len = bytes.len();
         // Backpressure: wait until the write-back buffer has room. `forget()` the permits so they
-        // aren't auto-released on drop — the writer returns exactly this many once the bytes land.
+        // aren't auto-released on drop, the writer returns exactly this many once the bytes land.
         let want = len.min(WRITE_BUFFER_BYTES);
         match sem.acquire_many(want as u32).await {
             Ok(p) => p.forget(),
@@ -386,7 +386,7 @@ async fn fetch_chunk(
     }
 
     // The stream ended: require the FULL requested range before committing the chunk. A short body
-    // (a clean EOF before the range is satisfied — a truncating proxy, or a length-less
+    // (a clean EOF before the range is satisfied, a truncating proxy, or a length-less
     // connection-close response) must NOT be marked done, or resume would skip a permanent gap and
     // the watermark would advance past bytes that aren't on disk. Roll back and fail → retry.
     if offset != end + 1 {
@@ -400,7 +400,7 @@ async fn fetch_chunk(
     }
     // Claim the chunk atomically: exactly one worker's fully-streamed copy "wins". If a duplicate
     // (tail-redundancy race) committed first in a photo-finish, roll back our count and DON'T send a
-    // second Complete — the winner already marked it done and counted its bytes.
+    // second Complete, the winner already marked it done and counted its bytes.
     if committed.swap(true, Ordering::Relaxed) {
         prog.done.fetch_sub(counted, Ordering::Relaxed);
         return Ok(());
@@ -440,7 +440,7 @@ fn advance_watermark(
     prog.set_contiguous(wm);
 }
 
-/// Fetch a small byte range fully into memory — used to compare two sources' content during
+/// Fetch a small byte range fully into memory, used to compare two sources' content during
 /// verification. Requires a 206 (a source that can't honor this range can't be striped anyway).
 async fn fetch_range_bytes(
     client: &reqwest::Client,
@@ -464,12 +464,12 @@ async fn fetch_range_bytes(
     Ok(resp.bytes().await?.to_vec())
 }
 
-/// Vet the source list before striping. `sources[0]` is the **anchor** — the URL the user actually
+/// Vet the source list before striping. `sources[0]` is the **anchor**, the URL the user actually
 /// chose; it is always kept. Every other candidate is admitted only if it (a) reports the same total
 /// size, (b) supports Range, and (c) returns byte-identical content at an interior probe offset.
 ///
-/// This single gate is both correctness and safety: a mirror serving a *different* file — a wrong
-/// mirror, a stale copy, or malware substituted on a dodgy site — fails the byte match and is dropped,
+/// This single gate is both correctness and safety: a mirror serving a *different* file, a wrong
+/// mirror, a stale copy, or malware substituted on a dodgy site; fails the byte match and is dropped,
 /// so it can never be merged into the output. Multi-source only ever ACCELERATES the anchor file; it
 /// never substitutes a different file by "majority vote" (on a hostile page the majority could be the
 /// bad copy). Returns the vetted list (anchor first), the total size, and whether Range is supported.
@@ -538,9 +538,9 @@ async fn verify_sources(
     Ok((vetted, total, true))
 }
 
-/// Health-tracked pool of vetted sources. Workers `acquire()` the best source for the next chunk —
+/// Health-tracked pool of vetted sources. Workers `acquire()` the best source for the next chunk,
 /// fewest in-flight, weighted by measured throughput, skipping temporarily-benched (repeatedly
-/// failing) mirrors — then report the outcome so weighting and benching adapt as the download runs.
+/// failing) mirrors, then report the outcome so weighting and benching adapt as the download runs.
 struct SrcHealth {
     url: String,
     inflight: u32,
@@ -578,7 +578,7 @@ impl Pool {
     /// Pick the best source whose index is NOT in `exclude`, increment its in-flight count, and return
     /// it. Prefers the smallest estimated time-to-drain (`(inflight+1) / throughput`), so fast mirrors
     /// attract more chunks and slow ones fewer; benched mirrors are skipped unless every eligible one
-    /// is benched (then retry the least-bad — never deadlock). Returns None only when `exclude` covers
+    /// is benched (then retry the least-bad, never deadlock). Returns None only when `exclude` covers
     /// every source (a single-mirror download has no alternative to duplicate onto).
     fn acquire_excluding(&self, exclude: &[usize]) -> Option<(usize, String)> {
         let now = Instant::now();
@@ -633,7 +633,7 @@ impl Pool {
     }
 
     /// Record a failed chunk: three consecutive strikes bench the source with a growing cooldown
-    /// (6..12 s) so a flapping mirror stops being handed chunks for a while — but always gets another
+    /// (6..12 s) so a flapping mirror stops being handed chunks for a while, but always gets another
     /// chance once the cooldown lapses.
     fn release_fail(&self, i: usize) {
         let now = Instant::now();
@@ -649,9 +649,9 @@ impl Pool {
 }
 
 /// Core download. Returns Ok(true) if fully complete, Ok(false) if interrupted/incomplete
-/// (cancelled or a chunk gave up — re-run to resume), Err on setup failure. `leading_edge` dedicates
+/// (cancelled or a chunk gave up, re-run to resume), Err on setup failure. `leading_edge` dedicates
 /// connection 0 to the lowest-index pending chunk (others take the highest) so the contiguous
-/// watermark advances fast — used by streaming consumers; `false` keeps the original FIFO behavior.
+/// watermark advances fast, used by streaming consumers; `false` keeps the original FIFO behavior.
 /// `ramp` grows the connection count adaptively from a small start up to `conns` while throughput
 /// improves (stopping on plateau or disk-bound); `false` spawns all `conns` immediately.
 #[allow(clippy::too_many_arguments)]
@@ -679,11 +679,11 @@ async fn run(
     // never penalizes a large-but-steady chunk.
     let client = reqwest::Client::builder()
         // Force HTTP/1.1. This is CRITICAL for a segmented downloader: over HTTP/2 (which reqwest
-        // negotiates by default with any server that offers it — most modern CDNs do), all N chunk
+        // negotiates by default with any server that offers it, most modern CDNs do), all N chunk
         // requests get MULTIPLEXED onto a SINGLE TCP connection, subject to one connection's congestion
         // window + the server's per-connection HTTP/2 flow control. That silently collapses our
         // parallelism to single-stream throughput (the "fast server, only 100 MB/s" symptom). HTTP/1.1
-        // gives each worker its own real TCP connection — separate windows, which is the entire point
+        // gives each worker its own real TCP connection, separate windows, which is the entire point
         // (beats per-connection throttling + fills a high bandwidth-delay pipe). File servers all speak
         // h1, so there's no downside for downloads.
         .http1_only()
@@ -696,7 +696,7 @@ async fn run(
         .build()?;
     // Verify + vet the source list: keep only mirrors that serve byte-identical content to the anchor
     // (sources[0], the file the user chose). This is correctness and the anti-malware / wrong-mirror
-    // gate in one — a source serving a different file is dropped here, never spliced into the output.
+    // gate in one, a source serving a different file is dropped here, never spliced into the output.
     let (sources_vec, total, ranges) = verify_sources(&client, sources, headers).await?;
     let sources: &[String] = &sources_vec;
     prog.total.store(total, Ordering::Relaxed);
@@ -715,7 +715,7 @@ async fn run(
     let mut done = vec![false; n];
     // Only trust the resume bitmap if the output file is still present and full-size. A genuine
     // interrupted download was pre-sized via set_len(total); a file that is now missing or a different
-    // size was deleted/truncated out from under us, so the bitmap is stale — start fresh rather than
+    // size was deleted/truncated out from under us, so the bitmap is stale; start fresh rather than
     // reporting a zero-filled false-complete over bytes that are no longer there.
     let file_full = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0) == total;
     if file_full {
@@ -818,7 +818,7 @@ async fn run(
 
     // Vetted sources become a health-tracked pool: workers pull the best available source per chunk
     // (fast, low-inflight, not benched) instead of being pinned to one mirror for life. A chunk whose
-    // fetch fails is pushed BACK onto the queue to be retried on a *different* source — so one slow or
+    // fetch fails is pushed BACK onto the queue to be retried on a *different* source, so one slow or
     // dead mirror can no longer strand a chunk and fail the whole download at 97% (the straggler bug).
     let pool = Arc::new(Pool::new(sources));
     // Per-chunk attempt budget: enough to rotate through every source several times before giving up.
@@ -827,7 +827,7 @@ async fn run(
     let attempt_cap = (sources.len() as u32).saturating_mul(4).max(8);
 
     // A worker pulls chunks (or tail-race duplicates) from the shared queue until there's no work.
-    // Factored into a closure so the ramp controller below can spawn MORE of them on demand — each
+    // Factored into a closure so the ramp controller below can spawn MORE of them on demand, each
     // call clones the shared handles into a fresh task.
     let spawn_worker = |w: usize| -> tokio::task::JoinHandle<()> {
         let client = client.clone();
@@ -844,12 +844,12 @@ async fn run(
                 if prog.cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                // Next chunk to fetch, plus the source to fetch it from — the whole decision is made
+                // Next chunk to fetch, plus the source to fetch it from; the whole decision is made
                 // under the pending lock so a primary's in-flight registration is visible to the next
                 // worker that finds the queue empty (otherwise idle workers scan an empty `inflight`
                 // table at startup, before pops register, and exit before any tail chunk exists to
                 // race). `inflight[idx]` holds the source indices currently fetching that chunk, so a
-                // duplicate can pick a DIFFERENT mirror than the primary — a duplicate on the same
+                // duplicate can pick a DIFFERENT mirror than the primary, a duplicate on the same
                 // (slow) mirror would be pointless. Lock order is always pending → inflight → pool.
                 let acquired = {
                     let mut q = pending.lock().unwrap();
@@ -920,7 +920,7 @@ async fn run(
                         if prog.cancel.load(Ordering::Relaxed) {
                             break;
                         }
-                        // Retry on another source — but only the PRIMARY owner re-queues; a race copy
+                        // Retry on another source, but only the PRIMARY owner re-queues; a race copy
                         // failing is a no-op (the original is still in flight / will itself re-queue),
                         // and a chunk another worker just committed needs no retry.
                         if !is_race && !committed[idx].load(Ordering::Relaxed) {
@@ -965,9 +965,9 @@ async fn run(
     });
 
     // Ramp + completion loop. Each tick checks for completion (so a finished download returns promptly
-    // and any straggler blocked on a slow mirror gets aborted — its bytes are already on disk). Every
+    // and any straggler blocked on a slow mirror gets aborted, its bytes are already on disk). Every
     // RAMP_INTERVAL it also makes a ramp decision: grow the fleet while throughput keeps improving, and
-    // stop growing for good once it plateaus or the write buffer saturates (disk-bound — more
+    // stop growing for good once it plateaus or the write buffer saturates (disk-bound, more
     // connections would just thrash it). Non-ramp downloads set `settled` immediately and only poll.
     let mut settled = !ramp;
     let mut baseline_rate = 0.0f64; // throughput measured just before the most recent fleet growth
@@ -998,7 +998,7 @@ async fn run(
         if sem.available_permits() < WRITE_BUFFER_BYTES / 8 {
             settled = true; // disk-bound: fetch tasks are backed up on the writer, not the network
         } else if active > start && rate <= baseline_rate * RAMP_GAIN {
-            // Below the gain threshold — but the batch we just added may still be in slow-start, so
+            // Below the gain threshold, but the batch we just added may still be in slow-start, so
             // tolerate a couple of flat intervals before declaring the real plateau.
             stalls += 1;
             if stalls >= RAMP_STALLS {
@@ -1051,7 +1051,7 @@ async fn run(
         };
         write_sidecar(&scp, &snap);
     }
-    // FinishGuard wakes any streaming consumer on drop (return) — no explicit mark_finished needed.
+    // FinishGuard wakes any streaming consumer on drop (return), no explicit mark_finished needed.
     Ok(complete)
 }
 
@@ -1069,7 +1069,7 @@ pub async fn download_with(
 }
 
 /// Streaming download: same as [`download_with`] but with **leading-edge** scheduling so the
-/// contiguous watermark advances quickly — for extract-while-download consumers.
+/// contiguous watermark advances quickly, for extract-while-download consumers.
 pub async fn download_stream(
     sources: &[String],
     out: &Path,
@@ -1083,7 +1083,7 @@ pub async fn download_stream(
 
 /// Auto-ramping download: same as [`download_with`] but grows the connection count adaptively from a
 /// small start up to `conns` (the ceiling) while throughput keeps improving, stopping on plateau or
-/// when the disk becomes the bottleneck — so the caller doesn't have to hand-tune the count.
+/// when the disk becomes the bottleneck, so the caller doesn't have to hand-tune the count.
 pub async fn download_auto(
     sources: &[String],
     out: &Path,
@@ -1176,7 +1176,7 @@ pub async fn download(
             );
             Ok(())
         }
-        Ok(false) => Err("incomplete — re-run the same command to resume".into()),
+        Ok(false) => Err("incomplete, re-run the same command to resume".into()),
         Err(e) => Err(e),
     }
 }
@@ -1225,7 +1225,7 @@ mod tests {
 
 /// End-to-end tests that drive a real download through the dedicated-writer / semaphore-backpressure
 /// path against a tiny in-process HTTP server, verifying byte-exact output, the progress counter, and
-/// resume — the parts the unit tests above can't reach.
+/// resume, the parts the unit tests above can't reach.
 #[cfg(test)]
 mod net_tests {
     use super::*;
@@ -1244,8 +1244,8 @@ mod net_tests {
 
     /// Minimal HTTP/1.1 server serving the deterministic body, keeping connections alive so the
     /// client's pool reuse is exercised. With `support_ranges` it advertises `Accept-Ranges` and
-    /// answers ranged GETs with 206; without it, it omits `Accept-Ranges` and answers every GET —
-    /// even a ranged one — with a full 200 body (a Range-ignoring origin).
+    /// answers ranged GETs with 206; without it, it omits `Accept-Ranges` and answers every GET;
+    /// even a ranged one, with a full 200 body (a Range-ignoring origin).
     async fn serve(total: u64, support_ranges: bool) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1355,7 +1355,7 @@ mod net_tests {
         let _ = std::fs::remove_file(&out);
     }
 
-    /// A file smaller than one chunk (n == 1) — the single-chunk / range edge case.
+    /// A file smaller than one chunk (n == 1), the single-chunk / range edge case.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn single_chunk_download() {
         let total: u64 = 100 * 1024;
@@ -1424,7 +1424,7 @@ mod net_tests {
     }
 
     /// A source that ignores Range (200 full body, no Accept-Ranges) and is LARGER than one chunk:
-    /// it must be fetched as a single whole-file chunk and land byte-exact at exactly `total` bytes —
+    /// it must be fetched as a single whole-file chunk and land byte-exact at exactly `total` bytes,
     /// not corrupted and grown past total by writing the full body at every chunk offset.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn non_range_server_downloads_whole_file() {
@@ -1446,7 +1446,7 @@ mod net_tests {
     }
 
     /// A stale sidecar claiming everything is done, but the output file is GONE: the size guard must
-    /// reject the bitmap and re-download for real, producing correct bytes — not a zero-filled
+    /// reject the bitmap and re-download for real, producing correct bytes; not a zero-filled
     /// false-complete.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ignores_sidecar_when_output_missing() {
@@ -1483,9 +1483,9 @@ mod net_tests {
         Flaky,
         /// Correct SIZE + Range support, but serves DIFFERENT bytes everywhere (wrong/stale/malicious).
         Wrong,
-        /// Correct bytes, but delays every real (large) chunk by 2 s — a reachable but slow mirror.
+        /// Correct bytes, but delays every real (large) chunk by 2 s; a reachable but slow mirror.
         Slow,
-        /// Correct bytes, each real chunk paced by 150 ms — a per-request-latency source where more
+        /// Correct bytes, each real chunk paced by 150 ms; a per-request-latency source where more
         /// parallel connections raise aggregate throughput (exercises adaptive ramping).
         Paced,
     }
@@ -1588,7 +1588,7 @@ mod net_tests {
     }
 
     /// Multi-source failover: a mirror that verifies OK but then fails every real chunk (reachable but
-    /// broken mid-download) must not sink the download — its chunks are re-queued and completed by the
+    /// broken mid-download) must not sink the download, its chunks are re-queued and completed by the
     /// healthy anchor, byte-exact. This is the fix for the "failed at 97%" straggler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failover_past_a_broken_mirror() {
@@ -1641,7 +1641,7 @@ mod net_tests {
         assert!(ok);
         let data = std::fs::read(&out).unwrap();
         assert_eq!(data.len() as u64, total);
-        assert_pattern(&data); // canonical bytes only — the wrong mirror contributed nothing
+        assert_pattern(&data); // canonical bytes only, the wrong mirror contributed nothing
         assert_eq!(prog.done(), total);
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(sidecar_path(&out));
@@ -1649,7 +1649,7 @@ mod net_tests {
 
     /// Tail redundancy: a slow-but-alive mirror holding a tail chunk must not gate completion. Idle
     /// fast workers duplicate the in-flight chunks and win the race, so the whole download finishes far
-    /// sooner than the 2 s/chunk the slow mirror would take — byte-exact, with an exact progress count
+    /// sooner than the 2 s/chunk the slow mirror would take, byte-exact, with an exact progress count
     /// (no double-count from the discarded loser), and no straggler left hanging the return.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tail_redundancy_beats_a_slow_mirror() {
@@ -1679,7 +1679,7 @@ mod net_tests {
         assert_eq!(
             prog.done(),
             total,
-            "exact byte count — no double-count from the raced duplicate"
+            "exact byte count, no double-count from the raced duplicate"
         );
         assert!(
             elapsed < Duration::from_millis(1500),
@@ -1691,7 +1691,7 @@ mod net_tests {
 
     /// Adaptive ramping: on a sustained, per-request-latency source (throughput scales with
     /// connections), `download_auto` grows the fleet above its small start and still finishes
-    /// byte-exact — proving dynamic worker spawn/join/abort is correct.
+    /// byte-exact, proving dynamic worker spawn/join/abort is correct.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ramping_grows_connections() {
         // Sized so it lasts through at least one ramp interval at the 8-connection start.

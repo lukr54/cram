@@ -1,4 +1,4 @@
-//! 7z backend — **read-only** for now (create lands with the writer phase), via the pure-Rust
+//! 7z backend, **read-only** for now (create lands with the writer phase), via the pure-Rust
 //! `sevenz-rust2` decoder (LZMA/LZMA2 always; BZip2/PPMd/Deflate/LZ4/AES-256 behind features).
 //!
 //! 7z is solid/blocked: entries in a block share one decode stream, so there's no cheap per-entry
@@ -27,7 +27,7 @@ use crate::model::{Entry, EntryKind, EntryPath};
 use crate::reader::{ArchiveReader, EntryStream};
 use crate::secret::{PasswordProvider, PasswordRequest, Secret};
 
-/// Bytes per streamed body chunk — bounds the worker's in-flight buffer so a huge or compression-
+/// Bytes per streamed body chunk, bounds the worker's in-flight buffer so a huge or compression-
 /// bombed entry is streamed to the destination, never buffered whole in RAM (a crafted metadata size
 /// would otherwise force an allocation that aborts the process). Reused each read.
 const STREAM_CHUNK: usize = 1024 * 1024;
@@ -74,7 +74,7 @@ fn seven_z_mtime(f: &ArchiveEntry) -> Option<std::time::SystemTime> {
     if !f.has_last_modified_date {
         return None;
     }
-    // 100 ns ticks since 1601. ~year 9999 ≈ 2.65e18 ticks — far below `u64::MAX` (1.8e19) and within
+    // 100 ns ticks since 1601. ~year 9999 ≈ 2.65e18 ticks, far below `u64::MAX` (1.8e19) and within
     // the representable `SystemTime` range on Windows, so the `+` in the conversion cannot overflow.
     const MAX_SANE_TICKS: u64 = 2_650_000_000_000_000_000;
     let raw = u64::from(f.last_modified_date);
@@ -100,7 +100,7 @@ fn cram_entry(f: &ArchiveEntry, encrypted: bool) -> Option<Entry> {
         compressed_size: None, // per-file compressed size is meaningless in a solid block
         // 7z stores an NTFS FILETIME (100 ns ticks since 1601) per entry; surface it so extract can
         // restore it. The value is attacker-controlled, and `NtTime -> SystemTime` adds a `Duration`
-        // with a plain `+` that PANICS on overflow — so a crafted near-`u64::MAX` FILETIME could crash
+        // with a plain `+` that PANICS on overflow, so a crafted near-`u64::MAX` FILETIME could crash
         // the reader. Bound it to a sane range (0 < t < ~year 9999) before converting; anything else
         // is treated as "no timestamp" rather than trusted.
         modified: seven_z_mtime(f),
@@ -113,7 +113,7 @@ fn cram_entry(f: &ArchiveEntry, encrypted: bool) -> Option<Entry> {
 /// Whether any block's coder chain uses the AES-256-SHA-256 method (id `06 F1 07 01`). 7z never sets a
 /// per-entry encryption flag, so content encryption (a `7z a -pPASS` archive, whose header lists fine
 /// without a password) would otherwise be reported as "unprotected". Reading it off the header blocks
-/// is the reliable signal — a header-encrypted (`-mhe`) archive never reaches here (open fails first
+/// is the reliable signal, a header-encrypted (`-mhe`) archive never reaches here (open fails first
 /// with a password error, handled upstream).
 fn archive_has_aes(archive: &sevenz_rust2::Archive) -> bool {
     archive.blocks.iter().any(|b| {
@@ -138,8 +138,8 @@ fn read_metadata(path: &Path, secret: &Secret) -> std::result::Result<Vec<Entry>
 }
 
 /// One extraction pass: decode every block, buffering each entry and pushing it over `tx`. Sets
-/// `*sent_any` once anything has been emitted (so a caller can tell a pre-emit failure — safe to
-/// retry with a new password — from a mid-stream one). Stops early (Ok) if the consumer drops.
+/// `*sent_any` once anything has been emitted (so a caller can tell a pre-emit failure, safe to
+/// retry with a new password, from a mid-stream one). Stops early (Ok) if the consumer drops.
 fn extract_pass(
     path: &Path,
     secret: &Secret,
@@ -149,7 +149,7 @@ fn extract_pass(
     let mut reader = SzReader::open(path, Password::new(secret.expose()))?;
     // Entries needing NO block decode (directories, empty files) are BUFFERED until the content
     // password is proven by the first successful non-empty read, then flushed in walk order. This
-    // keeps `sent_any` false until a real decode succeeds — so even when such an entry precedes the
+    // keeps `sent_any` false until a real decode succeeds, so even when such an entry precedes the
     // first encrypted file in the walk (common in `7z a -p` archives, whose header is plaintext and
     // whose folders are listed first), a content-password failure still satisfies the worker's
     // `!sent_any` retry gate. Emitting them eagerly would set `sent_any` before any block decode and
@@ -179,7 +179,7 @@ fn extract_pass(
         let mut buf = vec![0u8; STREAM_CHUNK];
         let mut n = rd.read(&mut buf)?;
         if n == 0 {
-            // Empty file: no block decoded, so it can't prove the password — buffer it too (unless
+            // Empty file: no block decoded, so it can't prove the password; buffer it too (unless
             // the password is already proven, in which case emit it now).
             let (start, end) = (SzMsg::FileStart(cram), SzMsg::FileEnd);
             if proven {
@@ -230,7 +230,7 @@ fn extract_pass(
 
 /// The worker: run [`extract_pass`], resolving a *content* password on the first pre-emit failure
 /// (header-plain / content-encrypted archives) and retrying from the start. `secret` starts as the
-/// password that read the header (empty when the header was plain — 7z uses one password archive-wide).
+/// password that read the header (empty when the header was plain, 7z uses one password archive-wide).
 fn worker(
     path: PathBuf,
     name: String,
@@ -272,7 +272,7 @@ fn worker(
 
 /// Streams one file entry's body from the worker channel, one chunk at a time. On drop it drains any
 /// unread chunks up to `FileEnd`, so an entry the engine abandons early (e.g. a write error, where
-/// the sequential path does not drain) still leaves the channel aligned to the next entry — the
+/// the sequential path does not drain) still leaves the channel aligned to the next entry, the
 /// "drain before the next `next_entry`" invariant stays local to this backend.
 struct SzBody<'a> {
     rx: &'a Receiver<SzMsg>,
@@ -453,7 +453,7 @@ mod mtime_guard_tests {
     #[test]
     fn seven_z_mtime_rejects_hostile_filetime_without_panicking() {
         let mut e = ArchiveEntry::new();
-        // A near-`u64::MAX` FILETIME would overflow `NtTime -> SystemTime` — must be rejected, not
+        // A near-`u64::MAX` FILETIME would overflow `NtTime -> SystemTime`, must be rejected, not
         // converted (the conversion uses a panicking `+`).
         e.has_last_modified_date = true;
         e.last_modified_date = NtTime::from(u64::MAX);

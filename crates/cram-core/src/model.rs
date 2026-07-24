@@ -1,5 +1,5 @@
 //! Unified entry/metadata model shared by every backend. The one place the zip-slip guard
-//! lives is [`EntryPath::from_raw`] — every backend must funnel entry names through it, so no
+//! lives is [`EntryPath::from_raw`], every backend must funnel entry names through it, so no
 //! backend can accidentally write outside the output directory.
 
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ pub struct EntryPath {
 }
 
 /// Does this single path component resolve to a Win32 DOS device? Win32 name parsing ignores
-/// trailing spaces/dots and matches the name *before* the first `.`, case-insensitively — so
+/// trailing spaces/dots and matches the name *before* the first `.`, case-insensitively; so
 /// `nul`, `NUL.txt`, and `COM1 ` all name devices. Used to mangle such names on extraction.
 fn is_reserved_dos_name(comp: &str) -> bool {
     let trimmed = comp.trim_end_matches([' ', '.']);
@@ -70,7 +70,7 @@ impl EntryPath {
     ///
     /// Windows reserved device names (`NUL`, `CON`, `COM1`, …) are *mangled* (prefixed with `_`),
     /// not rejected: a Unix-authored archive may legitimately contain a file named `NUL`, and
-    /// `File::create("…\\NUL")` opens the null device — the bytes vanish while the extractor
+    /// `File::create("…\\NUL")` opens the null device, the bytes vanish while the extractor
     /// reports success. Mangling extracts the file under a safe name instead of losing it.
     pub fn from_raw(raw: &str) -> Option<Self> {
         let mut safe = PathBuf::new();
@@ -84,7 +84,7 @@ impl EntryPath {
             };
             depth += 1;
             if depth > MAX_PATH_DEPTH {
-                return None; // pathologically deep path — reject rather than process it
+                return None; // pathologically deep path, reject rather than process it
             }
             if is_reserved_dos_name(c) {
                 safe.push(format!("_{c}"));
@@ -113,7 +113,7 @@ impl EntryPath {
     }
 }
 
-/// One archive member (metadata only — no content).
+/// One archive member (metadata only, no content).
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub index: usize,
@@ -140,13 +140,13 @@ impl Entry {
     }
 }
 
-/// Total uncompressed bytes and file count (directories excluded) — sizes the progress bar.
+/// Total uncompressed bytes and file count (directories excluded), sizes the progress bar.
 pub fn totals(entries: &[Entry]) -> (u64, u64) {
     let mut bytes: u64 = 0;
     let mut files = 0;
     for e in entries {
         if !e.is_dir() {
-            // Declared sizes are untrusted (ZIP64 allows u64::MAX per entry) — saturate, don't
+            // Declared sizes are untrusted (ZIP64 allows u64::MAX per entry), saturate, don't
             // wrap/panic.
             bytes = bytes.saturating_add(e.size);
             files += 1;

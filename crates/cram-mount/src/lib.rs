@@ -1,5 +1,5 @@
 //! Cram archive **mount** via Windows Projected File System (ProjFS): present a `.cram` (or any
-//! Cram-readable archive that offers random access) as a **virtual folder** — browse the tree and
+//! Cram-readable archive that offers random access) as a **virtual folder**, browse the tree and
 //! open files on demand, with content materialized lazily via `RandomAccessReader::read_range`, no
 //! up-front extraction.
 //!
@@ -30,7 +30,7 @@ mod projfs_api;
 
 pub mod cli;
 
-/// Whether this machine can mount at all — i.e. whether the optional Windows feature `Client-ProjFS`
+/// Whether this machine can mount at all, i.e. whether the optional Windows feature `Client-ProjFS`
 /// is enabled. Callers that show a mount affordance should check this first and explain
 /// [`UNAVAILABLE_HINT`] instead of offering an action that cannot work.
 #[cfg(windows)]
@@ -67,7 +67,7 @@ impl Mount {
     }
 }
 
-/// Mount `archive` (any random-access format — `.cram` or ZIP) as a virtual folder at `root`. The
+/// Mount `archive` (any random-access format, `.cram` or ZIP) as a virtual folder at `root`. The
 /// format is sniffed from the file; a sequential-only container (tar/7z/rar/raw) is rejected with
 /// `ArchiveError::UnsupportedFormat`. `root` is created if absent and must be empty. Returns a
 /// [`Mount`] guard; the folder stays live until it is dropped.
@@ -122,7 +122,7 @@ pub(crate) struct EntryInfo {
 /// is case-insensitive, so `SRC` and `src` must resolve to the same directory node; we key `tree`
 /// and `lookup` by the folded form while `Child.name` keeps the original case for display. Folding
 /// consistently is what makes case-variant ancestor dirs (`src/a` + `SRC/b`) merge into one node
-/// holding both files instead of orphaning one — the mount serves ProjFS's enumerated names, which
+/// holding both files instead of orphaning one, the mount serves ProjFS's enumerated names, which
 /// we fold the same way on the way back in (`path_of`), so both sides always agree.
 #[cfg(any(windows, test))]
 pub(crate) fn fold(s: &str) -> String {
@@ -139,7 +139,7 @@ impl DirModel {
         for (index, e) in reader.entries().iter().enumerate() {
             // Project the SANITIZED path, not the raw archive name: `safe()` carries the reserved-
             // device mangling (`NUL` → `_NUL`) that extraction applies. Serving the raw name would
-            // let a mounted entry called `NUL`/`CON` bind the Win32 device — opens hit the null/
+            // let a mounted entry called `NUL`/`CON` bind the Win32 device, opens hit the null/
             // console device before ever reaching ProjFS, so the entry's real content is unreachable
             // and a copy silently produces an empty file.
             let path = e.path.safe().to_string_lossy().replace('\\', "/");
@@ -153,7 +153,7 @@ impl DirModel {
             // keeping the first occurrence, so enumeration shows the first entry's name+size. If the
             // lookup were last-wins (plain `insert`), a case-variant collision (`File.txt` +
             // `file.txt`) or a duplicate name would enumerate the first entry but serve the LAST
-            // entry's size and bytes — a name/content mismatch. `or_insert` makes placeholder info
+            // entry's size and bytes, a name/content mismatch. `or_insert` makes placeholder info
             // and file data resolve to the SAME entry the directory enumerated; the shadowed
             // duplicate is simply not independently addressable through the (case-insensitive) mount.
             lookup.entry(fold(&path)).or_insert(EntryInfo {
@@ -176,8 +176,8 @@ impl DirModel {
         // directory, full stop. A malformed archive can hold both a file `foo` and entries under
         // `foo/…`; without this, the outcome would depend on entry order (file-with-orphaned-children
         // vs directory-that-lookup-calls-a-file), and enumeration (`Child.is_dir`) could disagree with
-        // placeholder info (`lookup`). Here the directory always wins — its children stay reachable,
-        // the colliding file is shadowed — and both maps are forced to agree, independent of order.
+        // placeholder info (`lookup`). Here the directory always wins, its children stay reachable,
+        // the colliding file is shadowed, and both maps are forced to agree, independent of order.
         let dir_keys: Vec<String> = tree.keys().filter(|k| !k.is_empty()).cloned().collect();
         for d in &dir_keys {
             lookup.insert(
@@ -247,7 +247,7 @@ fn ensure_ancestors(
         lookup.entry(fold(cur)).or_insert(EntryInfo {
             is_dir: true,
             size: 0,
-            index: usize::MAX, // synthesized dir — no backing entry
+            index: usize::MAX, // synthesized dir; no backing entry
         });
         let (parent, leaf) = match cur.rsplit_once('/') {
             Some((p, l)) => (p, l),
@@ -270,7 +270,7 @@ mod tests {
     use cram_core::writer::CreateOptions;
     use std::fs;
 
-    /// A minimal `RandomAccessReader` over a fixed entry list — lets `DirModel::build` be tested
+    /// A minimal `RandomAccessReader` over a fixed entry list, lets `DirModel::build` be tested
     /// against synthetic archives that a real filesystem can't produce (e.g. two directories whose
     /// names differ only in case). Only `entries()` is exercised by the model.
     struct MockReader {
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn case_variant_ancestor_dirs_merge_without_data_loss() {
         // Two files whose only ancestor differs solely in case ("src" vs "SRC"). Windows is
-        // case-insensitive, so they must merge into ONE folder holding BOTH files — neither may
+        // case-insensitive, so they must merge into ONE folder holding BOTH files; neither may
         // vanish. Guards against: keying the tree by the unfolded name, which holds "src" and "SRC"
         // as two separate keys while the parent enumerates only the first, leaving the other file
         // orphaned.
@@ -331,10 +331,10 @@ mod tests {
     fn case_variant_files_serve_consistent_name_size_and_content() {
         // Two files whose full paths differ only in case ("File.txt" vs "file.txt"). Windows is
         // case-insensitive, so the mount exposes ONE file. Enumeration keeps the first entry
-        // (first-wins dedup in the tree), so the lookup — which drives placeholder size and file
-        // data — must resolve to the SAME first entry. Guards against: a last-wins lookup (a plain
+        // (first-wins dedup in the tree), so the lookup; which drives placeholder size and file
+        // data, must resolve to the SAME first entry. Guards against: a last-wins lookup (a plain
         // `insert`), under which the directory shows "File.txt" @ 10 bytes while opening it serves
-        // "file.txt"'s 20 bytes and reports size 20 — a name/content/size mismatch. Both size and
+        // "file.txt"'s 20 bytes and reports size 20, a name/content/size mismatch. Both size and
         // the served index must be the first entry's.
         let reader = MockReader {
             entries: vec![file_entry(0, "File.txt", 10), file_entry(1, "file.txt", 20)],
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn file_and_dir_at_same_path_resolve_to_directory_either_order() {
         // A malformed archive holding both a file `foo` and a child `foo/bar`. The path has
-        // children, so it must be a directory (children reachable, colliding file shadowed) — and
+        // children, so it must be a directory (children reachable, colliding file shadowed); and
         // this must hold regardless of which entry comes first, with enumeration and lookup agreeing.
         for entries in [
             vec![file_entry(0, "foo", 5), file_entry(1, "foo/bar", 7)],
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn reserved_device_names_are_projected_mangled() {
         // An archive entry literally named `NUL` (legal in Unix-authored archives) must be served
-        // under its mangled `_NUL` name — projecting the raw name binds the Win32 null device and
+        // under its mangled `_NUL` name, projecting the raw name binds the Win32 null device and
         // the content becomes unreachable through the mount.
         let reader = MockReader {
             entries: vec![file_entry(0, "NUL", 4), file_entry(1, "docs/CON.txt", 7)],

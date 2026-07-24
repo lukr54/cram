@@ -1,10 +1,10 @@
 # Contributing to Cram
 
 Thanks for looking. Cram is a small, opinionated codebase: a thin spine, dumb format backends, one
-smart engine. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first — it is the map, and the
+smart engine. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first, it is the map, and the
 module-level `//!` comments in each file are the streets.
 
-**Found a security problem? Do not open a public issue** — see [`SECURITY.md`](SECURITY.md).
+**Found a security problem? Do not open a public issue**, see [`SECURITY.md`](SECURITY.md).
 
 **Be respectful.** Participation in this project is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
@@ -19,8 +19,8 @@ authoritative toolchain setup; the short form:
 cargo build --release
 ```
 
-At the workspace root that builds every member — the engine, the CLI, the sidecar and mount
-libraries, the standalone decoder, and the vendored `rdm-core` download engine — with default
+At the workspace root that builds every member, the engine, the CLI, the sidecar and mount
+libraries, the standalone decoder, and the vendored `rdm-core` download engine; with default
 features. For just the two binaries you actually run:
 
 ```sh
@@ -42,7 +42,7 @@ Optional features are opt-in so the base build always compiles:
 
 | Feature | Effect |
 |---|---|
-| `zstd-c` | full-range zstd encoder (C libzstd). **The shipped binary is built with this** — it is not a pure-Rust build. |
+| `zstd-c` | full-range zstd encoder (C libzstd). **The shipped binary is built with this**, it is not a pure-Rust build. |
 | `download` | `cram dl` segmented downloader. Opens no listening socket. |
 
 There is also a `libdeflate` feature, which `cram --version` lists. It only adds the C libdeflate
@@ -55,7 +55,7 @@ The release CLI is built as:
 cargo build --release -p cram-cli --features download,zstd-c --bin cram
 ```
 
-`cram --version` prints which of these are compiled in — worth checking before you report a bug,
+`cram --version` prints which of these are compiled in, worth checking before you report a bug,
 since a `zstd-c` build writes different `.cram` bytes than the pure-Rust default.
 
 ### Mounting
@@ -68,7 +68,7 @@ default:
 Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 ```
 
-Nothing else in Cram needs it — the DLL is bound lazily at run time, so the binaries start fine
+Nothing else in Cram needs it, the DLL is bound lazily at run time, so the binaries start fine
 without the feature and every other command works.
 
 ---
@@ -95,15 +95,15 @@ $env:CRAM_FUZZ_ITERS = 20000; cargo test -p cram-core --test fuzz_parsers
 
 A parser change without a test that feeds it the malformed input you fixed is not finished.
 
-If you change a performance claim in the docs, the number must come from a run anyone can repeat —
+If you change a performance claim in the docs, the number must come from a run anyone can repeat; 
 **never a number you did not watch get produced.**
 
 ---
 
 ## Code style
 
-- `cargo fmt --all` — default rustfmt, no custom config. Run it before you push.
-- `cargo clippy --workspace --all-targets -- -D warnings` — this is what CI runs, and it must come
+- `cargo fmt --all`, default rustfmt, no custom config. Run it before you push.
+- `cargo clippy --workspace --all-targets -- -D warnings`, this is what CI runs, and it must come
   back clean. If a lint is genuinely wrong, `#[allow]` it *with a comment saying why*.
 - **Every file gets a module doc comment** (`//! …`) explaining what that piece is and why it exists.
   This codebase leans hard on them; a new file without one will be asked for one.
@@ -127,7 +127,7 @@ If you change a performance claim in the docs, the number must come from a run a
   replacement, or bypassing `EntryPath::from_raw` in a new backend. Entry names go through the one
   guard, always.
 - **A change to the frozen `.cram` v1 layout.** Any layout change bumps the version byte and updates
-  [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md) normatively — it does not quietly redefine v1.
+  [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md) normatively, it does not quietly redefine v1.
 - **Marketing voice in the docs.** Understated and verifiable beats impressive and unbacked.
 
 ---

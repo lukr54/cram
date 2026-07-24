@@ -19,10 +19,10 @@ Licensed under **MIT OR Apache-2.0**.
 | | ZIP | 7z | tar(.\*) | ISO 9660 | RAR | `.cram` |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | List / extract | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Create | ✅ | ✅ | ✅ | — | — ✱ | ✅ |
+| Create | ✅ | ✅ | ✅ |, |; ✱ | ✅ |
 | Test (integrity) † | CRC-32 / AES auth | CRC-32 if stored | decode | decode | decode | decode |
 | Mount as a folder ‡ | on-demand | ≤ 2 GiB RAM | ≤ 2 GiB RAM | on-demand | ≤ 2 GiB RAM | on-demand |
-| Encryption | AES-256 | AES-256 | — | — | read | AES-256-GCM |
+| Encryption | AES-256 | AES-256 |, |; | read | AES-256-GCM |
 
 `tar(.*)` covers plain tar plus gzip, xz, zstd, bzip2, lz4 and brotli. A **bare single-stream
 compressed file** (`foo.gz`, `foo.xz`, `foo.zst`, `foo.bz2`, `foo.lz4`, `foo.br`) is read as a
@@ -33,14 +33,14 @@ in-RAM path as 7z/tar/RAR.
 RAR compressor. Cram reads RAR only.
 
 † **`cram t` does not mean the same thing for every format.** *CRC-32*: the checksum stored in the
-container is recomputed over the decoded bytes and compared — real content integrity. ZIP stores one
+container is recomputed over the decoded bytes and compared, real content integrity. ZIP stores one
 for every entry except a WinZip AES entry written in the **AE-2** form, which deliberately stores no
 CRC because the AES authentication code already covers the data; those entries are checked against
 that authentication code instead, which fails if any byte of the entry changed. In 7z the CRC field
 is optional, so an entry carrying none falls back to the *decode* check. *decode*: Cram recomputes no
 checksum of its own, so the check is "every entry decodes cleanly and its decoded length matches its
 declared size", plus whatever the underlying decoder rejects. For `.cram`, encrypted packs are
-additionally authenticated by their AES-GCM tag and compressed packs by their codec framing — an
+additionally authenticated by their AES-GCM tag and compressed packs by their codec framing, an
 unencrypted *stored* pack has neither. So `cram t` catches truncation, structural damage and broken
 codec streams on every format, but a **silent in-file bit flip** is guaranteed to be caught only for
 ZIP, for 7z entries that carry a stored CRC, and for compressed or encrypted `.cram`. See
@@ -57,10 +57,10 @@ The ProjFS DLL is bound lazily, so every other command works without the feature
 content is read out of the archive as a file is opened, with no up-front extraction. *≤ 2 GiB RAM*:
 7z, tar, RAR and bare compressed streams have no random-access seam, so mounting one **decodes the
 whole archive into memory up front** and refuses anything whose total uncompressed size exceeds
-2 GiB — extract those instead.
+2 GiB, extract those instead.
 
 A mount is **read-only**. You can browse it and open files from it, but nothing is ever written back
-into the archive, and unmounting removes the mount directory — so a file you edit and save inside it
+into the archive, and unmounting removes the mount directory, so a file you edit and save inside it
 is discarded, not stored. Copy what you need out of the mount, or use `cram x`.
 
 Signing (`.cramsig`) and Reed-Solomon recovery (`.cramrec`) are sidecars computed over a file's bytes
@@ -71,7 +71,7 @@ and work on **any file**, not just Cram's own formats. The self-extracting `.exe
 
 ## Install
 
-Prebuilt Windows x86-64 binaries — `cram.exe` and `cram-extract.exe` — are attached to the releases
+Prebuilt Windows x86-64 binaries, `cram.exe` and `cram-extract.exe`, are attached to the releases
 at <https://github.com/lukr54/cram/releases>. They are **not code-signed**, so SmartScreen will warn
 on first run (see [Limitations](#limitations)).
 
@@ -88,7 +88,7 @@ Prefer to read before you pipe to a shell? Download [`install.sh`](install.sh), 
 The tarball is also attached to each release if you'd rather place the binary yourself. Archive
 **mount** (`cram mount`) is Windows-only (it uses ProjFS); every other verb works identically.
 
-The macOS binaries are **not signed or notarised**, so a download is quarantined by Gatekeeper —
+The macOS binaries are **not signed or notarised**, so a download is quarantined by Gatekeeper; 
 `install.sh` clears that flag on the file it just fetched, and building from source avoids it
 entirely. Drive detection there goes through `diskutil`, which matters because it is what decides
 between one sequential reader and several parallel ones: getting it wrong on an external spinning
@@ -106,14 +106,14 @@ cargo build --release -p cram-cli -p cram-extract
 
 That produces, in `target/release/`:
 
-- **`cram.exe`** — the CLI.
-- **`cram-extract.exe`** — a standalone `.cram` decoder and the self-extractor stub. Keep it beside
+- **`cram.exe`**, the CLI.
+- **`cram-extract.exe`**, a standalone `.cram` decoder and the self-extractor stub. Keep it beside
   `cram.exe`; `cram make-sfx` shells out to it and fails without it.
 
 Deploying either binary also needs `libwinpthread-1.dll` alongside it (it lives on the mingw PATH
 during development).
 
-On **Linux**, the toolchain is just a system C/C++ compiler (`build-essential` — g++ builds the UnRAR
+On **Linux**, the toolchain is just a system C/C++ compiler (`build-essential`; g++ builds the UnRAR
 dependency) and a stable Rust toolchain; there is no mingw and no bundled DLL. Build the same way:
 
 ```sh
@@ -194,26 +194,26 @@ cram --version                                    version + which optional featu
 ### Photos: ~23% smaller, and still byte-for-byte the same files
 
 Creating a `.cram` losslessly recompresses JPEGs. A photo's data is already entropy-coded, which is
-why zip and 7z gain essentially nothing on a photo library — measured on a real folder of 34 camera
+why zip and 7z gain essentially nothing on a photo library, measured on a real folder of 34 camera
 JPEGs, ZIP and 7z both came out *fractionally larger* than the originals, and `tar.xz` managed 2.7%.
 The same folder in a `.cram` is **23.6% smaller**.
 
 Nothing is traded away for it. The JPEG's entropy coding is redone with a stronger coder, and
-extraction reconstructs the **original file byte-for-byte** — same bytes, same EXIF, same checksum.
+extraction reconstructs the **original file byte-for-byte**, same bytes, same EXIF, same checksum.
 It is not "visually lossless"; it is the file you put in. Every candidate is verified to round-trip
 *before* it is stored, and anything that fails verification is stored untouched, so the worst case is
 that a file simply isn't shrunk.
 
 It is on by default; `cram a --no-recompress` turns it off. Archives that use it declare format v2
 (see [docs/CRAM_FORMAT.md](docs/CRAM_FORMAT.md)), which older readers refuse outright rather than
-misread — and the standalone `cram-extract` recovery tool reverses it too, so a photo archive stays
+misread, and the standalone `cram-extract` recovery tool reverses it too, so a photo archive stays
 recoverable with the small independent decoder.
 
 ### Finding duplicates across drives
 
 `cram dedup` answers a different question from the rest of the tool: not "how do I pack this up" but
 "how much of this pile is the same file twice". It is aimed at the case where a large collection has
-accreted over years and drives — the same photo under a dozen random names, in folders nobody
+accreted over years and drives, the same photo under a dozen random names, in folders nobody
 remembers copying.
 
 ```sh
@@ -227,11 +227,11 @@ It is built to stay cheap on collections far too large to hash end to end. Three
 a file whose **size** is unique in the whole set cannot have a byte-identical twin and is never read
 at all; same-size files are separated by a **partial hash** of their first and last 64 KiB; only what
 survives both is read in full and confirmed with **BLAKE3**. On a real pile the vast majority of bytes
-are never touched — the run prints how much it actually had to read. Reads are also scheduled per
+are never touched, the run prints how much it actually had to read. Reads are also scheduled per
 drive: every volume is worked at once, but with one sequential reader on a spinning disk and several
 on an SSD, because parallel reads make an HDD slower rather than faster.
 
-`--similar` additionally finds images that *look* the same without being byte-identical — a resized
+`--similar` additionally finds images that *look* the same without being byte-identical, a resized
 copy, a re-save at lower quality, the version a messaging app recompressed. These are reported
 **separately and are never counted as reclaimable space**, because a perceptual hash cannot tell a
 redundant re-encode from two genuinely different frames of a burst. Treat them as a shortlist to look
@@ -252,8 +252,8 @@ cram dedup D:\photos E:\backup --link --quarantine D:\dupes --apply
 ```
 
 `--link` replaces a duplicate with a **hard link** to the copy being kept. Every filename and folder
-stays exactly where it was — for a photo collection the structure often *is* the meaning, so nothing
-disappears from view — while the redundant copies stop taking up room. Its one caveat: linked paths
+stays exactly where it was, for a photo collection the structure often *is* the meaning, so nothing
+disappears from view, while the redundant copies stop taking up room. Its one caveat: linked paths
 are one file, so an editor that rewrites a photo *in place* changes it under every name; tools that
 save a new file (almost all of them) are unaffected.
 
@@ -265,7 +265,7 @@ rest.
 
 `--keep shortest|oldest|first` chooses which copy survives (default: copy-looking names like
 `x (2).jpg` lose, then the shortest path wins). The keeper is printed for every action in the
-preview — worth reading before `--apply`, since no rule can know which folder *you* consider the
+preview, worth reading before `--apply`, since no rule can know which folder *you* consider the
 canonical one.
 
 Whatever the plan says, each pair is **re-hashed at the moment of action** and skipped if it no longer
@@ -277,14 +277,14 @@ Extraction is best-effort. A damaged entry does not abort the job: intact entrie
 each failure is printed by entry name, and **the process exits non-zero**. `cram t` behaves the same
 way: it reports how many entries were bad and exits non-zero.
 
-A clean exit code means every entry Cram listed came out — written, or skipped under `--skip` as
-already correct — and that each one's decoded length matched the length its container declared. Two
+A clean exit code means every entry Cram listed came out, written, or skipped under `--skip` as
+already correct, and that each one's decoded length matched the length its container declared. Two
 things sit outside that guarantee, and a script should know both:
 
 - A **bare single-stream compressed file** (`foo.gz`, `foo.xz`, …) declares no uncompressed length,
   so there is no length to check against; the check is that the stream decoded cleanly.
-- An entry whose stored name cannot be represented safely on Windows — a `..` component, a `:` or a
-  NUL byte in any component, or a path thousands of components deep — is **refused**: it is not
+- An entry whose stored name cannot be represented safely on Windows, a `..` component, a `:` or a
+  NUL byte in any component, or a path thousands of components deep; is **refused**: it is not
   listed, not tested and not extracted, and that on its own does not make the exit code non-zero.
   Archives written on other platforms can legitimately carry such names, so if it matters that
   nothing was left behind, compare `cram l` against the source.
@@ -299,7 +299,7 @@ abnormally, the command reports it as an error and the shell it was launched fro
 These describe how Cram works, not a measured comparison against anything else. This repository
 contains no benchmark harness, so nothing here is a performance claim.
 
-- **Parallel extraction** on the formats with a random-access seam — ZIP, ISO and `.cram` — where
+- **Parallel extraction** on the formats with a random-access seam, ZIP, ISO and `.cram`, where
   entries can be decoded independently. Sequential formats (7z, tar, RAR, bare streams) stream
   front-to-back through the same write machinery.
 - **`.cram`** applies content-defined chunking, then global BLAKE3-keyed dedup across every input in
@@ -308,7 +308,7 @@ contains no benchmark harness, so nothing here is a performance claim.
   AES-256-GCM. Unencrypted `.cram` output is byte-for-byte reproducible; encrypted output is
   deliberately not (a fresh random salt per archive).
 - The format is **frozen at v1** and specified normatively in
-  [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md) — that document, not the code, is the contract. The
+  [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md), that document, not the code, is the contract. The
   decoder in [`crates/cram-extract`](crates/cram-extract) is an independent implementation of the
   same spec.
 
@@ -322,7 +322,7 @@ contains no benchmark harness, so nothing here is a performance claim.
   structural damage *are* caught. ISO and RAR are in the same position: Cram computes no checksum of
   its own for either, so the verdict is a clean decode plus a declared-size match, plus whatever the
   underlying decoder rejects. For guaranteed content integrity, use ZIP, 7z, or compressed/encrypted
-  `.cram`, or pair any archive with `cram sign` or `cram rec` — both cover the whole file.
+  `.cram`, or pair any archive with `cram sign` or `cram rec`; both cover the whole file.
 - **Mount needs an optional Windows feature.** `Client-ProjFS` is off by default and must be enabled
   from an elevated PowerShell (see ‡ above); a restart may be required. Every other command works
   without it.
@@ -336,9 +336,9 @@ contains no benchmark harness, so nothing here is a performance claim.
 - **`cram conv` cannot read a `.cram` entry larger than 512 MiB.** Conversion walks the source entry
   by entry and holds one whole entry in memory, so a `.cram` containing a single file above that
   limit fails to convert ("entry too large to buffer in memory") even though `cram x` extracts the
-  same archive fine — extraction streams each entry to disk instead. Extract it and re-archive to
+  same archive fine, extraction streams each entry to disk instead. Extract it and re-archive to
   move such a file into another container.
-- **RAR is read-only** and always will be — see ✱ above.
+- **RAR is read-only** and always will be, see ✱ above.
 - **Symlinks and other special files are skipped on create.** Classic-container creation covers
   regular files and directories.
 - **Timestamps:** extraction restores a file's modification time when the source container records
@@ -370,7 +370,7 @@ together; every source file carries a module-level doc comment for the local det
 ## Security
 
 Cram parses untrusted input. To report a vulnerability, follow
-[SECURITY.md](SECURITY.md) — please do not open a public issue for one.
+[SECURITY.md](SECURITY.md), please do not open a public issue for one.
 
 ## License
 
@@ -378,6 +378,6 @@ Dual-licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT)
 Unless you state otherwise, any contribution you submit for inclusion shall be dual-licensed as
 above, with no additional terms.
 
-Cram links and redistributes third-party components — the UnRAR C++ engine, the MinGW winpthreads
-runtime, and its Rust dependency graph — each under its own licence. See
+Cram links and redistributes third-party components, the UnRAR C++ engine, the MinGW winpthreads
+runtime, and its Rust dependency graph; each under its own licence. See
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

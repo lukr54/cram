@@ -1,10 +1,10 @@
-//! Streaming extraction — extract entries from a growing [`ByteSource`] as its bytes arrive
+//! Streaming extraction, extract entries from a growing [`ByteSource`] as its bytes arrive
 //! (**extract-while-download**).
 //!
 //! Two container families stream front-to-back:
-//! * **tar-family** (`.tar`/`.tar.gz`/`.tar.xz`/…) — a header-then-data sequence; the decoder consumes
+//! * **tar-family** (`.tar`/`.tar.gz`/`.tar.xz`/…), a header-then-data sequence; the decoder consumes
 //!   the growing prefix and yields each entry the moment its bytes land.
-//! * **zip** — physically a run of *local file header + data* records, so we read them sequentially via
+//! * **zip**, physically a run of *local file header + data* records, so we read them sequentially via
 //!   `zip::read::read_zipfile_from_stream` (no central directory needed). This covers STORE + DEFLATE
 //!   and zip64 (large game files). Two zip shapes can't be streamed and are reported as
 //!   [`ArchiveError::StreamUnsupported`] so the caller extracts them normally once fully downloaded:
@@ -12,7 +12,7 @@
 //!   **encrypted** entries (the streaming reader has no password seam). Real repack zips written to a
 //!   file by 7-Zip/WinRAR carry their sizes in the local header, so they stream.
 //!
-//! 7z/rar still need the whole file (header structures / solid blocks) — download to completion first.
+//! 7z/rar still need the whole file (header structures / solid blocks), download to completion first.
 //!
 //! Mechanically this is the sequential write loop over a blocking [`SourceReader`]: when the parser
 //! reaches the download frontier, the reader blocks until the watermark advances. Path safety,
@@ -43,7 +43,7 @@ pub fn is_streamable(fmt: Format) -> bool {
 
 /// Extract `source` (a growing download) of format `fmt` into `dest`, entry by entry as bytes
 /// arrive. `fmt` comes from the caller (typically sniffed from the download URL/name). Errors if
-/// `fmt` isn't stream-extractable — the caller should await completion and use the normal engine.
+/// `fmt` isn't stream-extractable, the caller should await completion and use the normal engine.
 pub fn extract_stream(
     source: Arc<dyn ByteSource>,
     fmt: Format,
@@ -86,7 +86,7 @@ fn extract_tar_stream(
         let mut te = item.map_err(|e| ArchiveError::Backend(format!("tar: {e}")))?;
         let et = te.header().entry_type();
         // Same rule as the tar backend: links/devices/FIFOs/sparse members have no extractable
-        // byte stream — writing them as plain files would materialize empty/garbage stand-ins.
+        // byte stream, writing them as plain files would materialize empty/garbage stand-ins.
         if !et.is_dir() && !matches!(et, tar::EntryType::Regular | tar::EntryType::Continuous) {
             continue;
         }
@@ -154,7 +154,7 @@ fn extract_tar_stream(
             Ok(n)
         }) {
             // tar headers carry an authoritative size. A body that ends short means the archive was
-            // truncated — on a growing download that is the common case, and counting it as
+            // truncated, on a growing download that is the common case, and counting it as
             // `extracted` would report a partial tree as a complete one.
             Ok(n) if n != entry.size => {
                 drop(writer);
@@ -187,11 +187,11 @@ fn extract_tar_stream(
 }
 
 /// Zip streaming: read consecutive *local file header + data* records straight off the growing prefix
-/// with `zip::read::read_zipfile_from_stream` — no central directory required. Per-entry compression
+/// with `zip::read::read_zipfile_from_stream`, no central directory required. Per-entry compression
 /// (STORE/DEFLATE) and zip64 sizes are handled by the `zip` crate.
 ///
-/// If the very first record can't be parsed for streaming — a data-descriptor zip (sizes in a trailing
-/// record, not the local header) or an encrypted zip — nothing is written and we return
+/// If the very first record can't be parsed for streaming, a data-descriptor zip (sizes in a trailing
+/// record, not the local header) or an encrypted zip; nothing is written and we return
 /// [`ArchiveError::StreamUnsupported`] so the caller extracts the completed file normally. The
 /// data-descriptor / encryption flags are archive-wide in practice, so this is decided on entry #1
 /// (before any wasted work), not midway.
@@ -313,7 +313,7 @@ mod tests {
     use std::sync::{Condvar, Mutex};
     use std::thread;
 
-    /// A ByteSource whose prefix a test thread reveals incrementally — a stand-in for a download.
+    /// A ByteSource whose prefix a test thread reveals incrementally, a stand-in for a download.
     struct GrowingSource {
         data: Vec<u8>,
         state: Mutex<(u64, bool)>, // (revealed, finished)
@@ -369,7 +369,7 @@ mod tests {
         }
     }
 
-    /// Build an in-memory `.zip` with its sizes in the local headers (STORE + DEFLATE entries) —
+    /// Build an in-memory `.zip` with its sizes in the local headers (STORE + DEFLATE entries),
     /// i.e. a stream-shaped zip, the way 7-Zip/WinRAR write one to a file. Writing to a seekable
     /// `Cursor` is what makes the writer backpatch sizes into the local headers (no data descriptors).
     fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {

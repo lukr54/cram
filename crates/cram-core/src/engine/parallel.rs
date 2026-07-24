@@ -18,7 +18,7 @@ use crate::model::Entry;
 use crate::progress::ProgressSink;
 use crate::reader::RandomAccessReader;
 
-/// 8 MiB write blocks — sized to keep the write stream saturated.
+/// 8 MiB write blocks, sized to keep the write stream saturated.
 const WRITE_BUF: usize = 8 * 1024 * 1024;
 
 /// Extract every file entry of `ra` under `dest` across `workers` threads. Per-entry failures are
@@ -47,9 +47,9 @@ pub fn run(
         }
     }
 
-    // Deduplicate by DESTINATION path before scheduling. Two entries can map to one on-disk file —
+    // Deduplicate by DESTINATION path before scheduling. Two entries can map to one on-disk file,
     // literal duplicate names (legal in ZIP), case-variants (`A.txt`/`a.txt` on case-insensitive
-    // NTFS), Win32 trailing-dot/space normalization, or device-name mangling collisions — and two
+    // NTFS), Win32 trailing-dot/space normalization, or device-name mangling collisions, and two
     // workers writing the same file interleave their 8 MiB blocks into silent corruption (each
     // passes its own size check, so the report says clean), while a failing worker's remove_file
     // deletes its sibling's finished output. Schedule only the LAST occurrence per folded path
@@ -111,7 +111,7 @@ pub fn run(
             }
             // Isolate each entry: a panic inside a decoder (e.g. a malformed or pathological
             // compressed stream) is caught and recorded as a failed entry rather than unwinding the
-            // whole extraction — one bad entry in a big archive can't take down the rest or crash the
+            // whole extraction, one bad entry in a big archive can't take down the rest or crash the
             // host process (which matters for the GUI, which extracts in-process).
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 extract_one(ra, dest, i, &entries[i], skip_existing, sink)
@@ -139,7 +139,7 @@ pub fn run(
     }
 
     let mut r = report.into_inner().unwrap();
-    // Shadowed duplicates were not written (their later twin owns the destination) — surface them
+    // Shadowed duplicates were not written (their later twin owns the destination), surface them
     // as skipped, never as extracted.
     r.skipped += shadowed;
     r.cancelled = sink.is_cancelled();
@@ -192,7 +192,7 @@ fn extract_one(
     }) {
         // A body stream that ends EARLY without erroring must not pass as a success. A crafted ZIP
         // can declare a 10 GiB entry, supply 5 bytes whose CRC matches, and the decoder returns
-        // Ok(0) at EOF — we would write a 5-byte file and report a clean extraction. Compare what
+        // Ok(0) at EOF, we would write a 5-byte file and report a clean extraction. Compare what
         // actually decoded against what the header promised.
         Ok(n) if n != entry.size => {
             drop(writer);
@@ -228,7 +228,7 @@ mod dest_race_tests {
     use std::sync::Arc;
 
     /// Case-variant names (`A.txt` / `a.txt`) resolve to ONE file on NTFS, so only the LAST entry
-    /// may be scheduled — guarding against two workers racing the same destination and interleaving
+    /// may be scheduled, guarding against two workers racing the same destination and interleaving
     /// their write blocks into silent corruption. On a case-sensitive filesystem (Linux) the two are
     /// distinct files, so both are written and nothing is shadowed; the assertions below check the
     /// behaviour that matches the target filesystem, since `dest_key` folds accordingly.
@@ -277,7 +277,7 @@ mod dest_race_tests {
         #[cfg(not(windows))]
         {
             // Case-sensitive filesystem: the two names are distinct files, so both are written and
-            // nothing is shadowed — each keeps its own content.
+            // nothing is shadowed, each keeps its own content.
             assert_eq!(
                 report.extracted, 2,
                 "both case-distinct entries are written"

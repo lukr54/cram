@@ -1,12 +1,12 @@
-//! The codec layer — the byte transform for whole-stream codecs, plus the [`plan`] glue.
+//! The codec layer, the byte transform for whole-stream codecs, plus the [`plan`] glue.
 //!
 //! Cram has THREE distinct "codec" notions that must not be conflated:
-//! - [`crate::format::Codec`] — the whole-stream *wrapper* (`.tar.gz`, `foo.xz`). Describes layout.
-//! - [`crate::hw::Codec`] — the *planning* cost class `derive_plan` reasons about (worker counts).
-//! - this module — the concrete decompression ([`decode_stream`]), and [`plan`] mapping between the
+//! - [`crate::format::Codec`], the whole-stream *wrapper* (`.tar.gz`, `foo.xz`). Describes layout.
+//! - [`crate::hw::Codec`], the *planning* cost class `derive_plan` reasons about (worker counts).
+//! - this module, the concrete decompression ([`decode_stream`]), and [`plan`] mapping between the
 //!   first two.
 //!
-//! ZIP and 7z do **not** go through [`decode_stream`] — they decode per-entry via their own backend
+//! ZIP and 7z do **not** go through [`decode_stream`], they decode per-entry via their own backend
 //! (`zip` / `sevenz-rust2`) from the method stored in each entry's metadata. This path serves the
 //! whole-stream `Raw`/`Tar` containers (`.gz`, `.xz`, `.zst`, `.bz2`, `.lz4`, `.br`). All pure-Rust.
 
@@ -43,7 +43,7 @@ fn read_full_or_eof(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 
 /// The byte source under a run of zstd frames, with a tiny (≤4 byte) push-back so a frame magic we
 /// read to inspect can be handed back to `ruzstd` intact. **One** instance is threaded through every
-/// frame (see [`next_zstd_frame`]), so a many-frame stream stays O(1) in reader-wrapper depth — a
+/// frame (see [`next_zstd_frame`]), so a many-frame stream stays O(1) in reader-wrapper depth; a
 /// per-frame `Chain`/wrapper would nest one level per frame and blow the stack on a hostile stream.
 struct FramedSource {
     inner: Box<dyn Read + Send>,
@@ -96,7 +96,7 @@ impl Read for FramedSource {
 /// Advance `src` past any *skippable* frames and build a decoder for the next data frame, or return
 /// `Ok(None)` at clean EOF. `ruzstd`'s `StreamingDecoder::new` *errors* on a skippable magic (and
 /// consumes the reader on error), so we parse frame magics ourselves and only hand real data frames
-/// to it — otherwise a leading skippable frame would fail a valid stream and an interleaved one would
+/// to it, otherwise a leading skippable frame would fail a valid stream and an interleaved one would
 /// be mistaken for EOF, silently dropping every following data frame.
 fn next_zstd_frame(mut src: FramedSource) -> io::Result<Option<ZstdDec>> {
     loop {
@@ -106,7 +106,7 @@ fn next_zstd_frame(mut src: FramedSource) -> io::Result<Option<ZstdDec>> {
         let m = u32::from_le_bytes(magic);
         if (ZSTD_SKIP_MIN..=ZSTD_SKIP_MAX).contains(&m) {
             // Skippable frame: a 4-byte LE size, then that many bytes to discard. `io::copy`
-            // returns Ok on a short source, so the count must be checked — otherwise a stream
+            // returns Ok on a short source, so the count must be checked; otherwise a stream
             // truncated inside a skippable frame reads as a clean EOF and silently drops every
             // byte that should have followed the frame.
             let mut size = [0u8; 4];
@@ -129,8 +129,8 @@ fn next_zstd_frame(mut src: FramedSource) -> io::Result<Option<ZstdDec>> {
     }
 }
 
-/// zstd multi-frame reader. `ruzstd`'s `StreamingDecoder` decodes only ONE frame, but the format —
-/// and `cat a.zst b.zst`, and `pzstd` — allows concatenated frames, optionally interleaved with
+/// zstd multi-frame reader. `ruzstd`'s `StreamingDecoder` decodes only ONE frame, but the format;
+/// and `cat a.zst b.zst`, and `pzstd`; allows concatenated frames, optionally interleaved with
 /// skippable frames. When the current frame is exhausted we advance to the next data frame via
 /// [`next_zstd_frame`] (skipping skippable frames); when none follows, we're at EOF. Safe because
 /// zstd frames are self-delimiting: the block decoder consumes exactly the frame's bytes, leaving the
@@ -142,7 +142,7 @@ struct MultiFrameZstd {
 impl Read for MultiFrameZstd {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Guard the empty-buffer case: a decoder returning 0 is our "frame drained" signal, but an
-        // empty `buf` also yields 0 — without this we'd spuriously advance/consume frames.
+        // empty `buf` also yields 0, without this we'd spuriously advance/consume frames.
         if buf.is_empty() {
             return Ok(0);
         }
@@ -163,7 +163,7 @@ impl Read for MultiFrameZstd {
     }
 }
 
-/// Wrap a byte source in the decoder for a whole-stream codec, returning a **`Send`** reader — used
+/// Wrap a byte source in the decoder for a whole-stream codec, returning a **`Send`** reader; used
 /// by the tar/raw sequential paths, which stream the decoded bytes (and, for tar, hand the reader to
 /// a worker thread). All backends are pure-Rust, and each decodes **every** concatenated member/
 /// stream/frame (not just the first) so `cat`-joined and parallel-tool outputs never truncate.
@@ -173,7 +173,7 @@ pub fn decode_stream(
 ) -> Result<Box<dyn Read + Send>> {
     Ok(match codec {
         StreamCodec::None => inner,
-        // MultiGzDecoder (not GzDecoder) so concatenated gzip *members* are all decoded — a gzip
+        // MultiGzDecoder (not GzDecoder) so concatenated gzip *members* are all decoded, a gzip
         // file is a series of members (RFC 1952), and `cat a.gz b.gz`, bgzip/BGZF, and rotated
         // logs all produce them; the single-member decoder silently stops after the first.
         StreamCodec::Gzip => Box::new(flate2::read::MultiGzDecoder::new(inner)),
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn bzip2_multistream_decodes_all_members() {
-        // pbzip2/lbzip2 + Wikipedia dumps concatenate independent bzip2 streams — all must decode.
+        // pbzip2/lbzip2 + Wikipedia dumps concatenate independent bzip2 streams, all must decode.
         let bz = |d: &[u8]| {
             let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
             e.write_all(d).unwrap();
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn zstd_multiframe_decodes_all_frames() {
-        // `cat a.zst b.zst` / pzstd produce concatenated frames — all must decode.
+        // `cat a.zst b.zst` / pzstd produce concatenated frames, all must decode.
         use ruzstd::encoding::{compress_to_vec, CompressionLevel};
         let (a, b) = (
             b"first zstd frame ".repeat(80),

@@ -1,10 +1,10 @@
-//! The write side of the engine — one [`ArchiveWriter`] every *creatable* container implements
-//! (ZIP, 7z, tar-family, `.cram` — never RAR: creating RAR is forbidden by the UnRAR license, and
+//! The write side of the engine, one [`ArchiveWriter`] every *creatable* container implements
+//! (ZIP, 7z, tar-family, `.cram`, never RAR: creating RAR is forbidden by the UnRAR license, and
 //! [`Format::is_writable`](crate::format::Format::is_writable) already returns false for it).
 //!
 //! The trait is **incremental** (`add_file` / `add_dir` … `finish`) rather than one batch call, so
 //! the engine can feed entries as it walks the source tree, a dedup writer can chunk each body as
-//! it arrives, and progress flows naturally. Creation knobs — level, codec, encryption, threads —
+//! it arrives, and progress flows naturally. Creation knobs, level, codec, encryption, threads;
 //! are fixed for the whole archive and passed once at construction (`formats::create`), captured in
 //! [`CreateOptions`]; the writer holds the [`EncryptSpec`] and pulls no password lazily (the user
 //! supplied it when they chose to encrypt).
@@ -70,7 +70,7 @@ pub struct CreateOptions {
     /// Losslessly recompress JPEGs when writing `.cram` (**on by default**).
     ///
     /// A JPEG's entropy coding is redone with a stronger coder and the original file is reconstructed
-    /// byte-for-byte on extract — worth ~23% on real photos, where zip and 7z manage ~0% because the
+    /// byte-for-byte on extract, worth ~23% on real photos, where zip and 7z manage ~0% because the
     /// data is already entropy-coded. Every candidate is verified to round-trip before it is stored,
     /// and anything that fails is kept verbatim, so turning this off only costs space. Ignored by
     /// containers other than `.cram`.
@@ -90,7 +90,7 @@ impl Default for CreateOptions {
     }
 }
 
-/// Outcome of a creation job — carries the ratio inputs and any dedup win the GUI/CLI reports.
+/// Outcome of a creation job, carries the ratio inputs and any dedup win the GUI/CLI reports.
 #[derive(Debug, Clone, Default)]
 pub struct CreateReport {
     pub entries: u64,

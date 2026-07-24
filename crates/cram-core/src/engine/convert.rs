@@ -1,5 +1,5 @@
 //! Convert one archive into another format: read the source front-to-back and stream each entry into
-//! a destination `ArchiveWriter`. This is the **interop escape hatch** — a `.cram` (or any format we
+//! a destination `ArchiveWriter`. This is the **interop escape hatch**, a `.cram` (or any format we
 //! can read) can be re-exported to a portable classic container, so adopting `.cram` is never a
 //! one-way door. It reuses the exact reader/writer spine every backend already implements, so every
 //! readable source × every writable destination composes for free.
@@ -48,7 +48,7 @@ struct ConvBody<'a> {
 
 impl ConvBody<'_> {
     /// Consume this entry's remaining chunks so the channel is left on a message boundary. Needed
-    /// when a writer backend stops reading early — otherwise the next `recv` sees a stray `Chunk`
+    /// when a writer backend stops reading early, otherwise the next `recv` sees a stray `Chunk`
     /// and the whole stream desyncs.
     fn drain(&mut self) -> Result<()> {
         while !self.done {
@@ -84,7 +84,7 @@ impl Read for ConvBody<'_> {
                     return Err(io::Error::other("convert stream desync"));
                 }
                 // A channel closed MID-ENTRY means the reader died. This must be an error, never a
-                // clean EOF — otherwise the destination silently records a truncated entry as good.
+                // clean EOF, otherwise the destination silently records a truncated entry as good.
                 Err(_) => {
                     self.done = true;
                     return Err(io::Error::other("source ended mid-entry"));
@@ -121,7 +121,7 @@ fn read_side(
         }
 
         if !meta_final {
-            // Unknown size — a raw single-stream source (.gz/.xz/.bz2/.zst/.lz4/.br) reports
+            // Unknown size, a raw single-stream source (.gz/.xz/.bz2/.zst/.lz4/.br) reports
             // `size = 0` and defers the real length (reader.rs contract). A size-trusting
             // destination would truncate (tar's fixed header) or abort past 4 GiB (ZIP64), so
             // buffer to learn the true length, then write exactly that.
@@ -131,7 +131,7 @@ fn read_side(
                 .read_to_end(&mut buf)?;
             if buf.len() as u64 > MAX_BUFFERED {
                 return Err(ArchiveError::Backend(format!(
-                    "source stream exceeds {} MiB with no declared size — extract it first, then archive",
+                    "source stream exceeds {} MiB with no declared size, extract it first, then archive",
                     MAX_BUFFERED / (1024 * 1024)
                 )));
             }
@@ -164,8 +164,8 @@ fn read_side(
             }
             if sink.is_cancelled() {
                 // Cancelled MID-BODY. Returning here deliberately skips the `FileEnd` below: sending
-                // it would tell the writer this entry ended normally, and the backends believe it —
-                // tar zero-pads to the declared header size, zip records the short length — so a
+                // it would tell the writer this entry ended normally, and the backends believe it;
+                // tar zero-pads to the declared header size, zip records the short length, so a
                 // half-streamed entry would be sealed as complete and the job reported Ok. Bailing
                 // without the terminator makes `ConvBody` see a mid-entry disconnect and fail.
                 return Err(ArchiveError::Cancelled);
@@ -184,7 +184,7 @@ fn read_side(
     Ok(())
 }
 
-/// Writing half: drain the channel into the destination. Runs on the spawned thread — legal because
+/// Writing half: drain the channel into the destination. Runs on the spawned thread, legal because
 /// [`ArchiveWriter`] is `Send`.
 fn write_side(
     mut writer: Box<dyn ArchiveWriter>,
@@ -226,8 +226,8 @@ fn write_side(
 /// per-entry compression signal seeds the store-vs-compress hint (there is no disk file to probe).
 ///
 /// **Pipelined:** reading/decoding and writing/compressing run on two threads joined by a bounded
-/// channel. Done serially they alternate — the drive idles while we decode and the CPU idles while we
-/// write — so on a same-disk convert the two stages overlap instead of summing.
+/// channel. Done serially they alternate, the drive idles while we decode and the CPU idles while we
+/// write, so on a same-disk convert the two stages overlap instead of summing.
 pub fn convert(
     src: &Path,
     src_fmt: Format,
@@ -361,7 +361,7 @@ mod tests {
 
     /// Guards against: a mid-body cancel sealing a truncated entry as complete. Breaking out of the
     /// chunk loop and still sending `FileEnd` tells the writer the entry ended normally, and the
-    /// backends believe it — tar zero-pads to the declared size, zip records the short length — so
+    /// backends believe it, tar zero-pads to the declared size, zip records the short length; so
     /// `convert` would return Ok for a partial archive. A cancelled convert must be an error, not a
     /// silent partial.
     #[test]

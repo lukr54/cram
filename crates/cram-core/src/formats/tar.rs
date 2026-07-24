@@ -1,15 +1,15 @@
-//! tar backend — a `.tar` (optionally wrapped in a whole-stream codec: `.tar.gz`, `.tar.xz`, …).
+//! tar backend, a `.tar` (optionally wrapped in a whole-stream codec: `.tar.gz`, `.tar.xz`, …).
 //!
 //! tar is a pure front-to-back stream and the `tar` crate's entry iterator borrows its archive, so
 //! it can't be stored across `next_entry` calls without self-reference. The clean, safe fix for a
 //! one-pass source is a **worker thread**: it owns the archive+iterator entirely, reads each entry,
-//! and hands `(metadata, bytes)` over a bounded channel — natural backpressure, no self-ref, no
+//! and hands `(metadata, bytes)` over a bounded channel; natural backpressure, no self-ref, no
 //! unsafe. Listing (`entries`) uses a separate header-only pass so the file tree is known up front.
 //!
-//! Limitation (noted): a compressed tar is decoded twice for extraction — once for the metadata
+//! Limitation (noted): a compressed tar is decoded twice for extraction, once for the metadata
 //! pass, once by the worker. tar isn't the hot path (ZIP is); a single-pass optimization can come
 //! later. Each entry's body is **streamed** over the channel in bounded chunks (never buffered whole
-//! — a hostile header size / compression bomb would otherwise OOM the worker), with backpressure so
+//!, a hostile header size / compression bomb would otherwise OOM the worker), with backpressure so
 //! only ~1 chunk is in flight.
 
 use std::fs::File;
@@ -73,7 +73,7 @@ fn cram_entry(raw: &str, is_dir: bool, size: u64, modified: Option<SystemTime>) 
 }
 
 /// A tar header's mtime as a [`SystemTime`]. A `0` mtime is tar's convention for "no timestamp" (it's
-/// also what our own writer emits for timestamp-less members), so it maps to `None` — extraction then
+/// also what our own writer emits for timestamp-less members), so it maps to `None`; extraction then
 /// leaves the file's current time rather than stamping it 1970.
 ///
 /// The seconds field is attacker-controlled; `UNIX_EPOCH + Duration` panics on overflow, so a value
@@ -90,7 +90,7 @@ fn header_mtime(header: &tar::Header) -> Option<SystemTime> {
 
 /// Is this a member Cram can materialize on disk? Regular (and contiguous) files and directories
 /// only. Links (hard/sym), device nodes, FIFOs and GNU sparse members carry no extractable byte
-/// stream — writing them as plain files would silently produce empty/garbage stand-ins, so they are
+/// stream, writing them as plain files would silently produce empty/garbage stand-ins, so they are
 /// excluded from BOTH the listing and the extraction pass (the two stay consistent).
 fn materializable(et: tar::EntryType) -> bool {
     et.is_dir() || matches!(et, tar::EntryType::Regular | tar::EntryType::Continuous)
@@ -111,7 +111,7 @@ fn scan_with_cap(path: &Path, fmt: Format, cap: u64) -> Result<Vec<Entry>> {
     for item in archive.entries()? {
         let entry = item?;
         if !materializable(entry.header().entry_type()) {
-            continue; // link/special member — not listed, not extracted
+            continue; // link/special member, not listed, not extracted
         }
         let raw = entry.path()?.to_string_lossy().into_owned();
         // Charge this member against the budget BEFORE retaining it, so a header stream describing
@@ -121,7 +121,7 @@ fn scan_with_cap(path: &Path, fmt: Format, cap: u64) -> Result<Vec<Entry>> {
             .saturating_add(PER_ENTRY_OVERHEAD);
         if meta > cap {
             return Err(ArchiveError::Backend(format!(
-                "tar lists more than {} MiB of entry metadata — too large to buffer; extract it instead",
+                "tar lists more than {} MiB of entry metadata, too large to buffer; extract it instead",
                 cap / (1024 * 1024)
             )));
         }
@@ -154,7 +154,7 @@ fn worker(reader: Box<dyn Read + Send>, tx: SyncSender<TarMsg>) {
             }
         };
         if !materializable(entry.header().entry_type()) {
-            continue; // link/special member — mirror `scan`: neither listed nor written
+            continue; // link/special member, mirror `scan`: neither listed nor written
         }
         let raw = match entry.path() {
             Ok(p) => p.to_string_lossy().into_owned(),
@@ -174,7 +174,7 @@ fn worker(reader: Box<dyn Read + Send>, tx: SyncSender<TarMsg>) {
         if tx.send(TarMsg::FileStart(cram)).is_err() {
             return;
         }
-        // Stream the body in bounded chunks — the entry reader is capped to the (untrusted) header
+        // Stream the body in bounded chunks, the entry reader is capped to the (untrusted) header
         // size, so buffering it whole would let a crafted size / bomb OOM the process.
         let mut buf = vec![0u8; STREAM_CHUNK];
         loop {
@@ -200,7 +200,7 @@ fn worker(reader: Box<dyn Read + Send>, tx: SyncSender<TarMsg>) {
 
 /// Streams one file entry's body from the worker channel, one chunk at a time. On drop it drains any
 /// unread chunks up to `FileEnd`, so an entry the engine abandons early (e.g. on a write error, where
-/// the sequential path does *not* drain) still leaves the channel aligned to the next entry — the
+/// the sequential path does *not* drain) still leaves the channel aligned to the next entry, the
 /// "drain before the next `next_entry`" invariant stays local to this backend.
 struct TarBody<'a> {
     rx: &'a Receiver<TarMsg>,
@@ -334,7 +334,7 @@ mod link_entry_tests {
     use crate::secret::NoPassword;
 
     /// A tar holding a regular file, a symlink and a hardlink must list and extract ONLY the
-    /// regular file — link entries have no byte stream, and materializing them as empty files was
+    /// regular file, link entries have no byte stream, and materializing them as empty files was
     /// silent data corruption (an "extracted" file with none of its content).
     #[test]
     fn link_entries_are_neither_listed_nor_written() {

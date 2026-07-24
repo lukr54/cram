@@ -1,4 +1,4 @@
-//! Typed error + result model — replaces the old `Result<_, String>` / `Vec<(String,String)>` /
+//! Typed error + result model, replaces the old `Result<_, String>` / `Vec<(String,String)>` /
 //! magic `"cancelled"` string. `Cancelled` is a first-class variant so the extract loop never
 //! string-compares to detect cancellation.
 
@@ -36,7 +36,7 @@ pub enum ArchiveError {
     Cancelled,
 
     /// The content can't be extracted while it's still downloading (front-to-back streaming isn't
-    /// possible for it — e.g. a zip whose entry sizes live in trailing data descriptors, an encrypted
+    /// possible for it, e.g. a zip whose entry sizes live in trailing data descriptors, an encrypted
     /// zip, or 7z/rar). NOT a failure: the caller should await the full download and extract normally.
     #[error("not stream-extractable; extract after the download completes")]
     StreamUnsupported,
@@ -49,7 +49,7 @@ pub enum ArchiveError {
     Backend(String),
 }
 
-/// "Keep going, collect failures" extraction result — every backend funnels into this.
+/// "Keep going, collect failures" extraction result; every backend funnels into this.
 #[derive(Debug, Default)]
 pub struct Report {
     /// Files written.

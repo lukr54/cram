@@ -1,7 +1,7 @@
-//! The sequential extraction path — one entry at a time via [`ArchiveReader::next_entry`]. Used for
+//! The sequential extraction path, one entry at a time via [`ArchiveReader::next_entry`]. Used for
 //! non-random-access formats (RAR, tar, raw single-stream, solid 7z): the reader yields each entry
 //! as a stream, and the engine owns path resolution, directory creation, progress and cancellation
-//! — the same write machinery the parallel path uses, so every backend inherits it.
+//!, the same write machinery the parallel path uses, so every backend inherits it.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -18,7 +18,7 @@ const WRITE_BUF: usize = 8 * 1024 * 1024;
 /// Extract every entry of `reader` under `dest`, streaming front-to-back. Per-entry failures are
 /// collected into the [`Report`] (non-fatal); cancellation stops before the next entry. When
 /// `skip_existing` is set, an entry whose destination already matches (size + CRC) is not written
-/// (the stream is still decoded by the backend, but the disk write — the wall — is skipped).
+/// (the stream is still decoded by the backend, but the disk write; the wall; is skipped).
 pub fn run(
     reader: &mut dyn ArchiveReader,
     dest: &Path,
@@ -45,7 +45,7 @@ pub fn run(
             Err(e @ (ArchiveError::PasswordRequired | ArchiveError::WrongPassword)) => {
                 return Err(e)
             }
-            // The stream could not advance — a damaged header, a truncated archive, a volume that
+            // The stream could not advance, a damaged header, a truncated archive, a volume that
             // ends early. Everything already extracted is on disk and correct, so keep it and stop
             // here instead of failing the whole job and reporting nothing. `Report::is_ok()` is
             // false while `failed` is non-empty, so this can never be mistaken for a clean run.
@@ -75,7 +75,7 @@ pub fn run(
         sink.on_entry_start(&entry);
 
         // Parent-dir creation and file open are non-fatal per entry (matches the parallel path): a
-        // single bad name — e.g. a Linux-authored entry that's invalid on Windows — records one
+        // single bad name, e.g. a Linux-authored entry that's invalid on Windows, records one
         // failure and continues rather than aborting the whole job. Drain the (already-buffered)
         // body first so the reader stays in sync for the next entry.
         if let Some(parent) = outpath.parent() {
