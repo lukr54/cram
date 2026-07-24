@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Cram archive mount — browse/open a .cram as a virtual folder via Windows ProjFS (no full extract)"
+description = "Cram archive mount, browse/open a .cram as a virtual folder via Windows ProjFS (no full extract)"
 
 # Lib-only: the CLI (`cli::main`) is driven by the unified `cram` binary (crates/cram-cli) under the
 # `mount` verb. The former standalone `cram-mount` bin was folded into it.
@@ -22,7 +22,7 @@ getrandom = "0.2" # random GUID for the virtualization-instance id
 # MIT/Apache ProjFS type defs (avoids the GPL `windows-projfs` crate). We take the TYPES from here
 # but bind the FUNCTIONS ourselves at run time (see src/projfs_api.rs): ProjectedFSLib.dll ships with
 # the optional `Client-ProjFS` feature, which is off by default, and a load-time import of a missing
-# DLL stops the whole process from starting — over a feature only `mount` uses.
+# DLL stops the whole process from starting, over a feature only `mount` uses.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Storage_ProjectedFileSystem",

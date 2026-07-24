@@ -8,7 +8,7 @@ publish.workspace = true
 description = "Reed-Solomon recovery sidecar for any file (incl. .cram): create parity, then repair corruption/truncation"
 
 # A recovery sidecar is computed OVER the archive's bytes and stored in a separate `.cramrec` file, so
-# it adds no coupling to — and never changes — the frozen `.cram` v1 format (or any other file). Create
+# it adds no coupling to, and never changes, the frozen `.cram` v1 format (or any other file). Create
 # parity up front; if the original later suffers bit-rot or truncation, repair reconstructs it.
 #
 # Lib-only: the CLI (`cli::main`) is driven by the unified `cram` binary (crates/cram-cli) under the
@@ -18,7 +18,7 @@ name = "cram_recovery"
 path = "src/lib.rs"
 
 [dependencies]
-# Pure-Rust Reed-Solomon erasure coding (default features only — the `simd-accel` feature needs a C
+# Pure-Rust Reed-Solomon erasure coding (default features only, the `simd-accel` feature needs a C
 # toolchain/nightly and is intentionally OFF, keeping the build mingw-clean).
 reed-solomon-erasure = "6"
 blake3 = "1" # per-shard integrity hashes, so repair knows WHICH shards are corrupt

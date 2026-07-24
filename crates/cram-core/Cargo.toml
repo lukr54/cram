@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Cram archive manager — core engine (adaptive parallelism, hardware auto-detect, codecs)"
+description = "Cram archive manager, core engine (adaptive parallelism, hardware auto-detect, codecs)"
 
 [lib]
 name = "cram_core"
@@ -26,8 +26,8 @@ zeroize = "1"                                                           # wipe p
 filetime = "0.2"                                                        # restore entry mtimes on extract (pure Rust; correct dir handling on Windows)
 crc32fast = "1"                                                         # CRC32 for `cram test` integrity verification (pure Rust)
 time = "0.3"                                                            # ZIP DOS-datetime <-> SystemTime (already compiled via zip's `time` feature)
-# ZIP read (spine) — pure-Rust features only (no C bzip2/zstd) to stay mingw-clean.
-# NOTE: use `deflate-flate2` (flate2's default miniz_oxide backend), NOT the `deflate` meta-feature —
+# ZIP read (spine), pure-Rust features only (no C bzip2/zstd) to stay mingw-clean.
+# NOTE: use `deflate-flate2` (flate2's default miniz_oxide backend), NOT the `deflate` meta-feature, 
 # that meta pulls `deflate-flate2-zlib-rs`, and zlib-rs 0.6.6 has an integer-overflow panic in inflate
 # that crashes on real-world DEFLATE streams (e.g. large game-repack .zip payloads). miniz_oxide is the
 # heavily-fuzzed pure-Rust inflate and decodes them correctly.
@@ -36,7 +36,7 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2", "
 # mingw link flags in ../../.cargo/config.toml.
 unrar = "0.5"
 tar = "0.4"                                                            # tar container (pure Rust)
-# 7z read+write — pure-Rust codecs only (mingw-clean). LZMA/LZMA2 read is always available; `compress`
+# 7z read+write, pure-Rust codecs only (mingw-clean). LZMA/LZMA2 read is always available; `compress`
 # enables the LZMA2 *encoder* for 7z create. Omit `zstd` (C lib) and `brotli` (heavy, rare in 7z).
 # `deflate` is deliberately OFF: sevenz-rust2 hard-pins flate2's `zlib-rs` backend, which would drag the
 # whole build's DEFLATE (incl. the ZIP spine above) onto buggy zlib-rs 0.6.6. DEFLATE inside a .7z is
@@ -49,34 +49,34 @@ sevenz-rust2 = { version = "0.21.3", default-features = false, features = [
     "lz4",
     "util",
 ] }
-# Niche whole-stream decoders for `.zst`/`.bz2`/`.lz4`/`.br` (+ their `.tar.*`) — all pure Rust:
+# Niche whole-stream decoders for `.zst`/`.bz2`/`.lz4`/`.br` (+ their `.tar.*`), all pure Rust:
 ruzstd = "0.8"       # zstd DECODE (pure Rust; a C zstd *encoder* is a later feature-gated add)
-bzip2 = "0.6"        # bzip2 — default backend is pure-Rust libbz2-rs-sys (no C bzip2-sys)
+bzip2 = "0.6"        # bzip2, default backend is pure-Rust libbz2-rs-sys (no C bzip2-sys)
 lz4_flex = "0.13"    # lz4 frame decode (pure Rust); pinned to dedupe with sevenz-rust2's copy
 brotli = "8"         # brotli decode (pure Rust)
 
 # --- the native `.cram` content-defined-dedup format ---
 # Lossless JPEG recompression (Lepton, the technique Dropbox ran at scale; this is the pure-Rust
 # port). A JPEG's entropy coding is re-done with a stronger arithmetic coder, and the ORIGINAL FILE
-# is reconstructed byte-for-byte — measured at ~23% on real camera/phone photos, where zip and 7z
+# is reconstructed byte-for-byte, measured at ~23% on real camera/phone photos, where zip and 7z
 # both achieve 0%. Pure Rust, so it can also live in the standalone `cram-extract` recovery reader,
 # which must be able to reverse anything the writer does.
 lepton_jpeg = "0.5"
 fastcdc = "3"        # FastCDC v2020 content-defined chunking (pure Rust)
 blake3 = "1"         # chunk content hashing for dedup (pure Rust)
-# `.cram` encryption — all pure-Rust RustCrypto, mingw-clean:
+# `.cram` encryption, all pure-Rust RustCrypto, mingw-clean:
 aes-gcm = "0.10"     # AES-256-GCM per-pack AEAD
 argon2 = "0.5"       # Argon2id password → key derivation
 getrandom = "0.2"    # OS CSPRNG for salts + nonces (BCryptGenRandom on Windows)
 
 # --- opt-in C backends (feature-gated; default OFF, pure-Rust build stays the norm) ---
-# zstd (C) as a fast `.cram` pack codec — ruzstd only encodes at Fastest; the C lib gives full levels.
+# zstd (C) as a fast `.cram` pack codec, ruzstd only encodes at Fastest; the C lib gives full levels.
 zstd = { version = "0.13", optional = true }
-# libdeflate (C) — a faster DEFLATE inflate/deflate backend than miniz_oxide.
+# libdeflate (C), a faster DEFLATE inflate/deflate backend than miniz_oxide.
 libdeflater = { version = "1", optional = true }
 # Image decoding for `cram dedup --similar` (perceptual hashing). Pure Rust and mingw-clean; the codec
 # list is explicit so the default build doesn't drag in the whole format zoo. HEIC/HEIF and camera RAW
-# are absent because decoding them needs a C library — those files are still covered by exact-duplicate
+# are absent because decoding them needs a C library, those files are still covered by exact-duplicate
 # detection, which never decodes anything.
 image = { version = "0.25", optional = true, default-features = false, features = [
     "jpeg",
@@ -98,7 +98,7 @@ rdm-core = { path = "../rdm-core", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 # Mirror discovery (Metalink) builds a client and calls `rdm_core::discover`. Pinned to reqwest 0.12
 # so the `Client` type unifies with rdm-core's (same crate in the graph). The TLS backend is chosen
-# per-OS in the `[target.…]` tables below — SChannel on Windows, rustls on Unix — matching rdm-core.
+# per-OS in the `[target.…]` tables below, SChannel on Windows, rustls on Unix, matching rdm-core.
 # Verify a finished download against a Metalink SHA-256 (pure Rust, mingw-clean).
 sha2 = { version = "0.10", optional = true }
 
@@ -108,8 +108,8 @@ sha2 = { version = "0.10", optional = true }
 libc = "0.2"
 
 # reqwest's TLS backend, split per-OS (features are additive across the graph, so the backend must be
-# pinned here rather than left to defaults): SChannel via `native-tls` on Windows — no C crypto, as
-# before — and pure-Rust `rustls` with bundled roots on Unix, so a Linux binary needs no system
+# pinned here rather than left to defaults): SChannel via `native-tls` on Windows, no C crypto, as
+# before, and pure-Rust `rustls` with bundled roots on Unix, so a Linux binary needs no system
 # OpenSSL and stays portable across distros. Only pulled in by the opt-in `download` feature.
 [target.'cfg(windows)'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["stream", "http2", "charset", "native-tls"], optional = true }

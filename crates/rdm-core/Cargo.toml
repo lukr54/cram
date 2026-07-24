@@ -9,7 +9,7 @@ description = "Segmented, resumable, multi-source download engine (library, no G
 
 # Shared with the sibling `rdm` project, where this engine originated. It lives INSIDE this repo
 # rather than being referenced by a path outside it: an out-of-tree `path = "../../../rdm/..."`
-# dependency makes a fresh `git clone` unbuildable — Cargo loads a path dependency's manifest during
+# dependency makes a fresh `git clone` unbuildable, Cargo loads a path dependency's manifest during
 # workspace resolution even when that dependency is optional and its feature is off, so a missing
 # sibling checkout breaks EVERY crate in the workspace, not just the one that uses it.
 
@@ -26,8 +26,8 @@ serde_json = "1"
 roxmltree = "0.20"                                      # tiny pure-Rust read-only XML parser for Metalink (.meta4/.metalink) discovery
 
 # reqwest's TLS backend, pinned per-OS (features are additive across the whole dependency graph, so
-# leaving this to defaults would force native-tls everywhere): SChannel via `native-tls` on Windows —
-# no C crypto — and pure-Rust `rustls` with bundled roots on Unix, so a Linux build needs no system
+# leaving this to defaults would force native-tls everywhere): SChannel via `native-tls` on Windows, 
+# no C crypto, and pure-Rust `rustls` with bundled roots on Unix, so a Linux build needs no system
 # OpenSSL. `http2`/`charset` mirror reqwest's own defaults so nothing regresses versus the old line.
 [target.'cfg(windows)'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["stream", "http2", "charset", "native-tls"] }
