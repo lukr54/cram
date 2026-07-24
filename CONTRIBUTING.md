@@ -6,6 +6,8 @@ module-level `//!` comments in each file are the streets.
 
 **Found a security problem? Do not open a public issue** — see [`SECURITY.md`](SECURITY.md).
 
+**Be respectful.** Participation in this project is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ---
 
 ## Building
