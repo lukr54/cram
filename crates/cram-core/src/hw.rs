@@ -148,7 +148,9 @@ mod unix_platform {
     use super::Bus;
     use std::path::Path;
 
-    /// (total, available) physical RAM in bytes from /proc/meminfo; (0, 0) if unreadable.
+    /// (total, available) physical RAM in bytes; (0, 0) when it can't be measured, which every caller
+    /// already treats as "unknown" rather than "none".
+    #[cfg(target_os = "linux")]
     pub(super) fn memory() -> (u64, u64) {
         match std::fs::read_to_string("/proc/meminfo") {
             Ok(t) => super::parse_meminfo(&t),
@@ -156,8 +158,63 @@ mod unix_platform {
         }
     }
 
+    /// macOS has no `/proc`; the equivalents are sysctls.
+    ///
+    /// `available` is free pages only, which **under**-reports on macOS because the kernel keeps most
+    /// of RAM as cache that it would happily evict. That is the safe direction: the figure only caps
+    /// the worker pool, so guessing low costs a little parallelism while guessing high risks
+    /// over-committing memory. It is a real measurement rather than an invented headroom number.
+    #[cfg(target_os = "macos")]
+    pub(super) fn memory() -> (u64, u64) {
+        let total = sysctl_u64(c"hw.memsize").unwrap_or(0);
+        let page = sysctl_u64(c"hw.pagesize").unwrap_or(4096);
+        let free = sysctl_u32(c"vm.page_free_count").unwrap_or(0) as u64;
+        (total, free.saturating_mul(page))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn memory() -> (u64, u64) {
+        (0, 0)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+        let mut v: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: `v`/`len` are a correctly sized destination for a scalar sysctl; a non-zero return
+        // leaves them untouched and yields None.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut v as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(v)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
+        let mut v: u32 = 0;
+        let mut len = std::mem::size_of::<u32>();
+        // SAFETY: as above, for a 32-bit scalar.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut v as *mut u32 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(v)
+    }
+
     /// The whole-disk device backing `path`, packed major:minor into a u32. Two paths on the same
     /// physical disk return the same value (all `topology`/`detect` rely on); empty on any failure.
+    #[cfg(target_os = "linux")]
     pub fn physical_drives_for_path(path: &str) -> Vec<u32> {
         match backing_disk(Path::new(path)) {
             Some((id, _)) => vec![id],
@@ -165,8 +222,31 @@ mod unix_platform {
         }
     }
 
+    /// macOS: the filesystem's device id identifies the volume, which is what the scheduler actually
+    /// groups by. Resolving further to a *physical* disk would need IOKit; the practical cost is only
+    /// that two partitions of one disk are treated as two, which at worst reads them concurrently.
+    ///
+    /// This also primes the media cache, because the mount point needed to ask `diskutil` about the
+    /// drive is in hand right here.
+    #[cfg(target_os = "macos")]
+    pub fn physical_drives_for_path(path: &str) -> Vec<u32> {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return Vec::new();
+        };
+        let id = meta.dev() as u32;
+        prime_media_cache(id, Path::new(path));
+        vec![id]
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn physical_drives_for_path(_path: &str) -> Vec<u32> {
+        Vec::new()
+    }
+
     /// `Some(true)` = spinning disk (seek penalty); `Some(false)` = SSD; `None` = unknown. Read from
     /// /sys/block/<disk>/queue/rotational.
+    #[cfg(target_os = "linux")]
     pub(super) fn drive_seek_penalty(id: u32) -> Option<bool> {
         let name = disk_name_for_id(id)?;
         let rot = std::fs::read_to_string(format!("/sys/block/{name}/queue/rotational")).ok()?;
@@ -178,6 +258,7 @@ mod unix_platform {
     }
 
     /// Bus class inferred from the kernel device name — enough to seed the write-ceiling prior.
+    #[cfg(target_os = "linux")]
     pub(super) fn drive_bus_type(id: u32) -> Bus {
         match disk_name_for_id(id) {
             Some(n) if n.starts_with("nvme") => Bus::Nvme,
@@ -185,6 +266,116 @@ mod unix_platform {
             Some(_) => Bus::Other,
             None => Bus::Unknown,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn drive_seek_penalty(id: u32) -> Option<bool> {
+        media_of(id).and_then(|m| m.0)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn drive_bus_type(id: u32) -> Bus {
+        media_of(id).map(|m| m.1).unwrap_or(Bus::Unknown)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn drive_seek_penalty(_id: u32) -> Option<bool> {
+        None
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn drive_bus_type(_id: u32) -> Bus {
+        Bus::Unknown
+    }
+
+    // ---- macOS media detection -------------------------------------------------------------------
+    //
+    // Whether a drive is spinning decides between one sequential reader and several parallel ones, and
+    // getting it wrong on an external USB hard disk means seek thrash — precisely the case a big photo
+    // collection lives on. macOS answers it through IOKit, which `diskutil` already wraps, so this
+    // shells out **once per volume** and caches the result rather than binding IOKit. Any failure
+    // leaves the entry unknown and the caller falls back to today's defaults.
+
+    #[cfg(target_os = "macos")]
+    type Media = (Option<bool>, Bus);
+
+    #[cfg(target_os = "macos")]
+    fn media_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u32, Media>> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Media>>> =
+            std::sync::OnceLock::new();
+        CACHE.get_or_init(Default::default)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn media_of(id: u32) -> Option<Media> {
+        media_cache().lock().ok()?.get(&id).copied()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prime_media_cache(id: u32, path: &Path) {
+        if media_cache()
+            .lock()
+            .map(|c| c.contains_key(&id))
+            .unwrap_or(true)
+        {
+            return; // already known (or the lock is poisoned — then just skip detection)
+        }
+        let media = mount_point(path)
+            .and_then(|mp| query_diskutil(&mp))
+            .unwrap_or((None, Bus::Unknown));
+        if let Ok(mut c) = media_cache().lock() {
+            c.insert(id, media);
+        }
+    }
+
+    /// The mount point containing `path`, via `statfs` — `diskutil` accepts a mount point but not an
+    /// arbitrary file inside it.
+    #[cfg(target_os = "macos")]
+    fn mount_point(path: &Path) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid zeroed statfs; read only after a success (0) return.
+        if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let raw = st.f_mntonname;
+        let bytes: Vec<u8> = raw
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as u8)
+            .collect();
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            bytes,
+        )))
+    }
+
+    /// Ask `diskutil` about a mount point and pull the two facts the planner needs out of its plist.
+    /// Scanned as text rather than parsed as XML: the two keys are unambiguous, and a whole plist
+    /// parser would be a dependency for six lines of work.
+    #[cfg(target_os = "macos")]
+    fn query_diskutil(mount: &Path) -> Option<Media> {
+        let out = std::process::Command::new("diskutil")
+            .arg("info")
+            .arg("-plist")
+            .arg(mount)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        // `SolidState` is absent on some devices (notably disk images) — absent stays unknown.
+        let ssd = super::plist_bool(&text, "SolidState");
+        let bus = match super::plist_string(&text, "BusProtocol").as_deref() {
+            Some("PCI-Express") | Some("PCI") | Some("Apple Fabric") => Bus::Nvme,
+            Some("SATA") | Some("SAS") => Bus::Sata,
+            Some("USB") => Bus::Usb,
+            Some(_) => Bus::Other,
+            None => Bus::Unknown,
+        };
+        // A spinning disk reports SolidState=false; keep that as the seek-penalty answer.
+        Some((ssd.map(|is_ssd| !is_ssd), bus))
     }
 
     /// Free space (MiB) available to a non-root user on the filesystem holding `dir`, via statvfs.
@@ -200,10 +391,11 @@ mod unix_platform {
         Some(bytes / (1024 * 1024))
     }
 
-    // ---- path -> backing whole-disk resolution via sysfs ----
+    // ---- path -> backing whole-disk resolution via sysfs (Linux) ----
 
     /// Resolve `path` to its backing whole disk: stat the path for its device number, find the sysfs
     /// block node, and climb from a partition to its parent disk. Returns (packed id, kernel name).
+    #[cfg(target_os = "linux")]
     fn backing_disk(path: &Path) -> Option<(u32, String)> {
         use std::os::unix::fs::MetadataExt;
         let dev = std::fs::metadata(path).ok()?.dev();
@@ -221,6 +413,7 @@ mod unix_platform {
     }
 
     /// Recover a disk's kernel name from a packed id by scanning /sys/block.
+    #[cfg(target_os = "linux")]
     fn disk_name_for_id(id: u32) -> Option<String> {
         for entry in std::fs::read_dir("/sys/block").ok()?.flatten() {
             if let Ok(dev) = std::fs::read_to_string(entry.path().join("dev")) {
@@ -232,17 +425,21 @@ mod unix_platform {
         None
     }
 
+    #[cfg(target_os = "linux")]
     fn pack(maj: u64, min: u64) -> u32 {
         (((maj & 0xfff) as u32) << 20) | ((min as u32) & 0x000f_ffff)
     }
+    #[cfg(target_os = "linux")]
     fn pack_dev(s: &str) -> Option<u32> {
         let (maj, min) = s.split_once(':')?;
         Some(pack(maj.parse().ok()?, min.parse().ok()?))
     }
     // glibc/musl dev_t major/minor encoding.
+    #[cfg(target_os = "linux")]
     fn major(dev: u64) -> u64 {
         ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfffu64)
     }
+    #[cfg(target_os = "linux")]
     fn minor(dev: u64) -> u64 {
         (dev & 0xff) | ((dev >> 12) & !0xffu64)
     }
@@ -252,6 +449,35 @@ mod unix_platform {
 use unix_platform::{drive_bus_type, drive_seek_penalty, memory};
 #[cfg(unix)]
 pub use unix_platform::{free_space_mib, physical_drives_for_path};
+
+/// Scan an Apple plist for `<key>NAME</key><true/>` → `Some(true)`, `<false/>` → `Some(false)`,
+/// absent → `None`.
+///
+/// Compiled everywhere (not just macOS) so this parsing — the error-prone part of the macOS drive
+/// probe, and the part that decides sequential-vs-parallel reads — is unit-tested on whatever machine
+/// the tests are run on, including ones that can never execute the macOS path.
+#[cfg(any(target_os = "macos", test))]
+fn plist_bool(text: &str, key: &str) -> Option<bool> {
+    let rest = text.split_once(&format!("<key>{key}</key>"))?.1;
+    let head = rest.trim_start();
+    if head.starts_with("<true/>") {
+        Some(true)
+    } else if head.starts_with("<false/>") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// `<key>NAME</key><string>VALUE</string>` → `Some(VALUE)`. See [`plist_bool`] for why this is not
+/// macOS-gated.
+#[cfg(any(target_os = "macos", test))]
+fn plist_string(text: &str, key: &str) -> Option<String> {
+    let rest = text.split_once(&format!("<key>{key}</key>"))?.1;
+    let open = rest.find("<string>")? + "<string>".len();
+    let close = rest[open..].find("</string>")? + open;
+    Some(rest[open..close].to_string())
+}
 
 /// Extract total/available physical RAM (bytes) from a `/proc/meminfo` body. Kept OS-agnostic (and
 /// compiled under `test`) so the parsing — the error-prone part — is unit-tested even on a host that
@@ -1094,12 +1320,26 @@ pub fn profile_path() -> Option<std::path::PathBuf> {
 
 /// Per-user profile location on Unix: `$XDG_CONFIG_HOME/cram/profile.toml`, falling back to
 /// `~/.config/cram/profile.toml` — the standard spot for a CLI tool's cached state.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn profile_path() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")))
+        .map(|base| base.join("cram").join("profile.toml"))
+}
+
+/// macOS keeps per-application state under `~/Library/Application Support`, not in an XDG directory.
+/// `XDG_CONFIG_HOME` is still honoured first for anyone who deliberately sets it.
+#[cfg(target_os = "macos")]
+pub fn profile_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| Path::new(&h).join("Library").join("Application Support"))
+        })
         .map(|base| base.join("cram").join("profile.toml"))
 }
 
@@ -1222,6 +1462,43 @@ fn profile_applies(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The macOS drive probe decides one sequential reader vs several parallel ones, and getting it
+    /// wrong on an external USB hard disk means seek thrash. The probe itself can only run on macOS,
+    /// but its parsing is pure string work and is checked here on every platform.
+    #[test]
+    fn diskutil_plist_yields_media_and_bus() {
+        // Shape of a real `diskutil info -plist` reply, trimmed to the two keys that are read.
+        let spinning_usb = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>BusProtocol</key><string>USB</string>
+  <key>DeviceIdentifier</key><string>disk4s2</string>
+  <key>SolidState</key><false/>
+  <key>VolumeName</key><string>Family Archive</string>
+</dict></plist>"#;
+        assert_eq!(plist_bool(spinning_usb, "SolidState"), Some(false));
+        assert_eq!(
+            plist_string(spinning_usb, "BusProtocol").as_deref(),
+            Some("USB")
+        );
+
+        let internal_ssd = r#"<plist><dict>
+  <key>BusProtocol</key><string>Apple Fabric</string>
+  <key>SolidState</key><true/>
+</dict></plist>"#;
+        assert_eq!(plist_bool(internal_ssd, "SolidState"), Some(true));
+        assert_eq!(
+            plist_string(internal_ssd, "BusProtocol").as_deref(),
+            Some("Apple Fabric")
+        );
+
+        // Absent keys must read as unknown, never as a confident wrong answer — a disk image reports
+        // no SolidState at all, and guessing "SSD" there would pick parallel reads on unknown media.
+        let no_media_key =
+            r#"<plist><dict><key>VolumeName</key><string>Backup</string></dict></plist>"#;
+        assert_eq!(plist_bool(no_media_key, "SolidState"), None);
+        assert_eq!(plist_string(no_media_key, "BusProtocol"), None);
+    }
 
     #[test]
     fn meminfo_parses_total_and_available() {

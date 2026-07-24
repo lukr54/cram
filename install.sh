@@ -20,10 +20,18 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # --- platform check -------------------------------------------------------------------------------
 os="$(uname -s)"
 arch="$(uname -m)"
-[ "$os" = "Linux" ] || err "this installer is for Linux; on Windows use the .zip from the Releases page."
-case "$arch" in
-  x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
-  *) err "no prebuilt binary for '$arch' yet. Build from source: https://github.com/$REPO#build-from-source" ;;
+case "$os" in
+  Linux)
+    case "$arch" in
+      x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
+      *) err "no prebuilt Linux binary for '$arch' yet. Build from source: https://github.com/$REPO#build-from-source" ;;
+    esac ;;
+  Darwin)
+    case "$arch" in
+      arm64|aarch64) target="aarch64-apple-darwin" ;;
+      *) err "no prebuilt macOS binary for '$arch' yet (Apple Silicon only). Build from source: https://github.com/$REPO#build-from-source" ;;
+    esac ;;
+  *) err "this installer is for Linux and macOS; on Windows use the .zip from the Releases page." ;;
 esac
 
 # --- pick a downloader ----------------------------------------------------------------------------
@@ -71,6 +79,14 @@ install -m 0755 "$src" "$INSTALL_DIR/$BIN" 2>/dev/null || { cp "$src" "$INSTALL_
 
 say ""
 say "Installed $BIN $tag -> $INSTALL_DIR/$BIN"
+
+# macOS quarantines anything downloaded, and Gatekeeper then refuses to run an unsigned binary. The
+# attribute is only a download marker, so clearing it on the file we just fetched is exactly what the
+# user would otherwise be told to do by hand. Nothing else on the system is touched.
+if [ "$os" = "Darwin" ] && have xattr; then
+  xattr -d com.apple.quarantine "$INSTALL_DIR/$BIN" 2>/dev/null || true
+fi
+
 "$INSTALL_DIR/$BIN" --version 2>/dev/null || true
 
 # --- PATH hint ------------------------------------------------------------------------------------

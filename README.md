@@ -75,9 +75,9 @@ Prebuilt Windows x86-64 binaries — `cram.exe` and `cram-extract.exe` — are a
 at <https://github.com/lukr54/cram/releases>. They are **not code-signed**, so SmartScreen will warn
 on first run (see [Limitations](#limitations)).
 
-### Linux
+### Linux and macOS
 
-The `cram` CLI runs on Linux x86-64. Install the latest release binary with:
+The `cram` CLI runs on Linux x86-64 and on Apple Silicon macOS. Install the latest release binary with:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/lukr54/cram/master/install.sh | sh
@@ -85,8 +85,14 @@ curl -fsSL https://raw.githubusercontent.com/lukr54/cram/master/install.sh | sh
 
 That drops `cram` into `~/.local/bin` (no root, no daemon, nothing else touched); re-run it to upgrade.
 Prefer to read before you pipe to a shell? Download [`install.sh`](install.sh), read it, then run it.
-The Linux tarball is also attached to each release if you'd rather place the binary yourself. Archive
-**mount** (`cram mount`) is Windows-only (it uses ProjFS); every other verb works identically on Linux.
+The tarball is also attached to each release if you'd rather place the binary yourself. Archive
+**mount** (`cram mount`) is Windows-only (it uses ProjFS); every other verb works identically.
+
+The macOS binaries are **not signed or notarised**, so a download is quarantined by Gatekeeper —
+`install.sh` clears that flag on the file it just fetched, and building from source avoids it
+entirely. Drive detection there goes through `diskutil`, which matters because it is what decides
+between one sequential reader and several parallel ones: getting it wrong on an external spinning
+disk (where a large collection usually lives) causes seek thrash rather than speed.
 
 ### Building from source
 
@@ -133,7 +139,7 @@ cargo build --release -p cram-cli --features zstd-c,download
 writes different `.cram` bytes than the pure-Rust default, so it is worth checking before comparing
 two archives.
 
-Run the tests with `cargo test`; that is 165 tests across the workspace (166 with `--features
+Run the tests with `cargo test`; that is 166 tests across the workspace (167 with `--features
 cram-cli/phash`, which adds the perceptual-hash test). `cargo fmt --all -- --check`
 and `cargo clippy --workspace --all-targets -- -D warnings` are clean. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
