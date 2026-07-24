@@ -78,11 +78,13 @@ impl Default for DedupOptions {
 }
 
 /// Filesystem identity of a file: two paths with the same [`FileId`] are the *same bytes on disk*
-/// (a hard link), not two copies. Reclaimable space must not count them twice.
+/// (a hard link), not two copies. Reclaimable space must not count them twice, or the tool would
+/// promise back space that is not there — and, worse, claim to have freed it a second time on a
+/// re-run over an already-linked collection.
 ///
-/// Unix-only for now: the equivalent Windows identity (volume serial + file index) is available only
-/// through `GetFileInformationByHandle`, so on Windows this is `None` and hard-linked paths are counted
-/// as separate copies — which can *overstate* reclaimable space but never causes a wrong grouping.
+/// On Unix this is `(dev, ino)` and comes free with the `stat` the walk already does. On Windows it is
+/// the volume serial plus 64-bit file index, which requires actually opening the file — so it is
+/// resolved lazily, only for files that turn out to be duplicates (see [`file_identity`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FileId {
     dev: u64,
@@ -225,6 +227,15 @@ pub fn scan(
         }
         let mut members: Vec<ScannedFile> = idxs.iter().map(|&i| files[i].clone()).collect();
         members.sort_by(|a, b| a.path.cmp(&b.path));
+        // Resolve identity for any member the walk could not supply it for (Windows, where it costs
+        // an open). Only duplicates need it, so this is a handful of files rather than the whole set —
+        // and without it, copies that are *already* hard-linked would be counted as reclaimable space
+        // that does not exist.
+        for m in &mut members {
+            if m.id.is_none() {
+                m.id = file_identity(&m.path);
+            }
+        }
         // Hard-linked members are one physical file; only extra *physical* copies are reclaimable.
         let reclaimable = (distinct_copies(&members).saturating_sub(1) as u64) * size;
         report.groups.push(DupeGroup {
@@ -334,8 +345,9 @@ fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
     })
 }
 
-/// Windows exposes file identity only via `GetFileInformationByHandle`; until that is bound, identity
-/// is unknown here and every path counts as its own copy (see [`FileId`]).
+/// Windows cannot answer this from a `Metadata` — it needs an open handle — so the walk leaves it
+/// unset and [`file_identity`] fills it in later for the few files that turn out to be duplicates.
+/// Paying an extra file open for every file in a multi-terabyte walk would cost far more than it saves.
 #[cfg(not(unix))]
 fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
     None
@@ -428,10 +440,167 @@ fn volume_key(f: &ScannedFile) -> String {
     if let Some(id) = f.id {
         return format!("dev:{}", id.dev);
     }
-    match f.path.components().next() {
+    volume_of(&f.path)
+}
+
+/// Volume identity for an arbitrary path, including one that does not exist yet (a quarantine
+/// directory about to be created) — in that case the nearest existing ancestor answers, since a new
+/// directory lands on the same filesystem as its parent.
+///
+/// Whether two paths share a volume decides whether a hard link between them is even possible, so this
+/// has to be right: on Unix it is the device number from `stat`, and on Windows the drive-letter prefix.
+pub(crate) fn volume_of(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut probe = Some(path);
+        while let Some(p) = probe {
+            if let Ok(m) = std::fs::metadata(p) {
+                return format!("dev:{}", m.dev());
+            }
+            probe = p.parent();
+        }
+    }
+    match path.components().next() {
         Some(std::path::Component::Prefix(p)) => p.as_os_str().to_string_lossy().to_uppercase(),
         _ => String::new(),
     }
+}
+
+/// Whether two existing paths are the *same bytes on disk* (one inode, two names). Acting on a pair
+/// that is already hard-linked would be pure churn — and would "reclaim" space that was never in use,
+/// reporting a saving that did not happen.
+pub(crate) fn same_physical_file(a: &Path, b: &Path) -> bool {
+    match (file_identity(a), file_identity(b)) {
+        (Some(x), Some(y)) => x == y,
+        // Unknown identity must never be treated as "same file" — that would skip a real duplicate.
+        _ => false,
+    }
+}
+
+/// Resolve a file's filesystem identity by path.
+///
+/// Unix reads it from `stat`. Windows has to open the file and ask
+/// `GetFileInformationByHandle`, so this is called only where the answer changes a decision (duplicate
+/// group members and reclaim actions), never for every file in the walk.
+pub(crate) fn file_identity(path: &Path) -> Option<FileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(FileId {
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        windows_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+// --- Windows file identity (volume serial + 64-bit file index) ---------------------------------
+//
+// Raw FFI rather than a crate dependency, matching how `hw.rs` binds the handful of Win32 calls this
+// engine needs. Every failure degrades to `None`, which is the safe direction: an unknown identity
+// means "assume they are different files", so a genuine duplicate is never skipped.
+
+#[cfg(windows)]
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateFileW(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        sec: *mut std::ffi::c_void,
+        disposition: u32,
+        flags: u32,
+        template: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn GetFileInformationByHandle(
+        h: *mut std::ffi::c_void,
+        info: *mut ByHandleFileInformation,
+    ) -> i32;
+    fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_identity(path: &Path) -> Option<FileId> {
+    use std::os::windows::ffi::OsStrExt;
+    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // read | write | delete
+    const OPEN_EXISTING: u32 = 3;
+    // Lets the handle open a directory as well as a file, and asks for no access rights at all —
+    // metadata only, so it cannot disturb anything else holding the file open.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the handle is closed on every path below.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle as isize == -1 {
+        return None;
+    }
+    let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    Some(FileId {
+        dev: u64::from(info.volume_serial_number),
+        ino: (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+    })
+}
+
+/// Plain BLAKE3 of a whole file, used to re-verify a pair immediately before anything destructive
+/// happens to it. Deliberately **not** the scan's partial/size-mixed digest: this answers only
+/// "are these two files identical *right now*", which is the question that must be re-asked after a
+/// scan that may have finished hours ago.
+pub(crate) fn hash_whole(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; READ_BUF];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// Concurrent readers to use on the drive backing `path`: one on a spinning disk (parallel reads make
@@ -803,6 +972,30 @@ mod tests {
         assert_eq!(rep.files_scanned, 6);
         assert_eq!(rep.bytes_hashed, 0, "no file should have been read");
         assert_eq!(rep.groups.len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn already_hardlinked_copies_reclaim_nothing() {
+        // Two names, one file. The group is still worth showing, but claiming space back from it
+        // would be a lie — and would make a second run of `--link --apply` report a saving it did not
+        // make. This is what makes the whole operation idempotent.
+        let dir = scratch("hardlink");
+        let blob = vec![0x4Du8; 300 * 1024];
+        let a = dir.join("a.bin");
+        write(&a, &blob);
+        if std::fs::hard_link(&a, dir.join("b.bin")).is_err() {
+            return; // filesystem without hard links: nothing to assert
+        }
+
+        let sink = Progress::new(0, 0);
+        let rep = scan(std::slice::from_ref(&dir), &DedupOptions::default(), &sink).unwrap();
+        let g: Vec<_> = rep.exact_groups().collect();
+        assert_eq!(g.len(), 1, "both names are found");
+        assert_eq!(g[0].files.len(), 2);
+        assert_eq!(g[0].reclaimable, 0, "one physical file frees nothing");
+        assert_eq!(rep.reclaimable(), 0);
+        assert_eq!(rep.redundant_files(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

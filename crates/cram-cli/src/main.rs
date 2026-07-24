@@ -239,7 +239,12 @@ fn usage() {
         "  mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)"
     );
     eprintln!("  dedup <folder|file…> [--similar] [--min-size <bytes>] [--json]");
-    eprintln!("       find duplicate files across folders/drives — reports only, changes nothing");
+    eprintln!("       find duplicate files across folders/drives — reports only by default");
+    eprintln!("       [--link] [--quarantine <dir>] [--keep shortest|oldest|first] [--apply]");
+    eprintln!(
+        "       reclaim space: --link hard-links copies (every path stays put), --quarantine"
+    );
+    eprintln!("       moves them aside. Previews unless --apply. Nothing is ever deleted.");
     eprintln!("  rec <create|verify|repair> <file> …   Reed-Solomon recovery sidecar");
     eprintln!("  sign <file> -k <keyfile> | verify <file> [--key <hex>] | keygen <keyfile>");
     eprintln!("  make-sfx <archive.cram> <out.exe>   build a self-extracting executable");
@@ -688,7 +693,10 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
                 && !a.starts_with("--")
                 && !matches!(
                     args.get(i.wrapping_sub(1)).map(|s| s.as_str()),
-                    Some("--min-size") | Some("--similar-distance")
+                    Some("--min-size")
+                        | Some("--similar-distance")
+                        | Some("--quarantine")
+                        | Some("--keep")
                 )
         })
         .map(|(_, a)| PathBuf::from(a))
@@ -830,8 +838,157 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
     if rep.cancelled {
         println!("\nScan was cancelled — the results above cover only what was scanned.");
     }
-    println!("\nNothing was changed: `dedup` only reports.");
     let _ = GroupKind::Exact; // keeps the import honest if the loops above are ever refactored
+
+    // ---- optional: reclaim the space --------------------------------------------------------
+    let want_link = args.iter().any(|a| a == "--link");
+    let quarantine = args
+        .iter()
+        .position(|a| a == "--quarantine")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    if !want_link && quarantine.is_none() {
+        println!("\nNothing was changed: `dedup` only reports.");
+        println!(
+            "To reclaim the space, re-run with --link (replace copies with hard links) and/or"
+        );
+        println!(
+            "--quarantine <dir> (move copies aside). Both preview first; --apply performs it."
+        );
+        return Ok(());
+    }
+    reclaim_phase(&rep, args, want_link, quarantine)
+}
+
+/// Plan — and, only with `--apply`, carry out — the space reclamation for a finished scan.
+fn reclaim_phase(
+    rep: &cram_core::engine::dedup::DedupReport,
+    args: &[String],
+    link: bool,
+    quarantine: Option<PathBuf>,
+) -> Result<()> {
+    use cram_core::engine::reclaim::{self, Action, KeepPolicy, ReclaimOptions};
+
+    let keep = match args
+        .iter()
+        .position(|a| a == "--keep")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+    {
+        Some("oldest") => KeepPolicy::Oldest,
+        Some("first") => KeepPolicy::First,
+        Some("shortest") | None => KeepPolicy::ShortestPath,
+        Some(other) => {
+            return Err(cram_core::error::ArchiveError::Backend(format!(
+                "unknown --keep policy '{other}' (use shortest, oldest, or first)"
+            )))
+        }
+    };
+    let opts = ReclaimOptions {
+        link,
+        quarantine,
+        keep,
+    };
+    let plan = reclaim::plan(rep, &opts);
+    reclaim::validate(&plan)?;
+
+    if plan.actions.is_empty() {
+        println!("\nNothing to reclaim: no eligible duplicate copies.");
+        for (path, why) in plan.skipped.iter().take(10) {
+            println!("  skipped {}: {}", path.display(), why);
+        }
+        return Ok(());
+    }
+
+    let apply = args.iter().any(|a| a == "--apply");
+    println!(
+        "\n{} — {} hard link(s), {} quarantine move(s), {} to reclaim.",
+        if apply {
+            "APPLYING"
+        } else {
+            "DRY RUN (nothing will change)"
+        },
+        plan.links(),
+        plan.quarantines(),
+        bytes_human(plan.bytes())
+    );
+    println!(
+        "Keeping: the {} copy of each set.",
+        match keep {
+            KeepPolicy::ShortestPath => "shortest-path",
+            KeepPolicy::Oldest => "oldest",
+            KeepPolicy::First => "first-by-name",
+        }
+    );
+
+    for a in plan.actions.iter().take(40) {
+        match a.action {
+            Action::Link => {
+                println!("\n  LINK  {}", a.victim.display());
+                println!("     -> hard link to {}", a.keeper.display());
+            }
+            Action::Quarantine => {
+                println!("\n  MOVE  {}", a.victim.display());
+                println!(
+                    "     -> {}",
+                    a.dest
+                        .as_ref()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
+        }
+    }
+    if plan.actions.len() > 40 {
+        println!("\n  … and {} more action(s).", plan.actions.len() - 40);
+    }
+    for (path, why) in plan.skipped.iter().take(10) {
+        println!("\n  SKIP  {}\n     ({})", path.display(), why);
+    }
+    if plan.skipped.len() > 10 {
+        println!("\n  … and {} more skipped.", plan.skipped.len() - 10);
+    }
+
+    if !apply {
+        println!("\nThis was a preview. Re-run with --apply to perform it.");
+        if plan.links() > 0 {
+            println!(
+                "Note: hard-linked copies become one file, so an editor that rewrites a photo \
+                 in place\nwould change it under every name. Tools that save a new file are unaffected."
+            );
+        }
+        return Ok(());
+    }
+
+    let prog = Arc::new(cram_core::progress::Progress::new(0, 0));
+    let done = reclaim::apply(&plan, prog.as_ref())?;
+    println!(
+        "\nDone: {} linked, {} quarantined, {} reclaimed.",
+        done.linked,
+        done.quarantined,
+        bytes_human(done.bytes_reclaimed)
+    );
+    if done.skipped_changed > 0 {
+        println!(
+            "{} file(s) had changed since the scan and were left untouched.",
+            done.skipped_changed
+        );
+    }
+    if !done.failed.is_empty() {
+        println!(
+            "{} action(s) failed (originals left intact):",
+            done.failed.len()
+        );
+        for (path, why) in done.failed.iter().take(20) {
+            println!("  {}: {}", path.display(), why);
+        }
+    }
+    if done.quarantined > 0 {
+        println!(
+            "\nQuarantined files were MOVED, not deleted — the space is freed only once you delete\n\
+             the quarantine folder yourself, after checking you are happy with it."
+        );
+    }
     Ok(())
 }
 

@@ -133,7 +133,7 @@ cargo build --release -p cram-cli --features zstd-c,download
 writes different `.cram` bytes than the pure-Rust default, so it is worth checking before comparing
 two archives.
 
-Run the tests with `cargo test`; that is 156 tests across the workspace (157 with `--features
+Run the tests with `cargo test`; that is 163 tests across the workspace (164 with `--features
 cram-cli/phash`, which adds the perceptual-hash test). `cargo fmt --all -- --check`
 and `cargo clippy --workspace --all-targets -- -D warnings` are clean. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -215,6 +215,37 @@ through by hand, not as a delete list. `--similar-distance` tunes how alike is a
 hash, default 8); it needs a build with the `phash` feature. HEIC/HEIF and camera RAW are not decoded
 for similarity (that needs a C library), though they are still covered by exact-duplicate detection,
 which never decodes anything.
+
+#### Reclaiming the space
+
+Two actions turn the report into free space. Both **preview by default** and do nothing until you add
+`--apply`, and neither ever deletes a file.
+
+```sh
+cram dedup D:\photos --link                       # preview
+cram dedup D:\photos --link --apply               # do it
+cram dedup D:\photos E:\backup --link --quarantine D:\dupes --apply
+```
+
+`--link` replaces a duplicate with a **hard link** to the copy being kept. Every filename and folder
+stays exactly where it was — for a photo collection the structure often *is* the meaning, so nothing
+disappears from view — while the redundant copies stop taking up room. Its one caveat: linked paths
+are one file, so an editor that rewrites a photo *in place* changes it under every name; tools that
+save a new file (almost all of them) are unaffected.
+
+`--quarantine <dir>` **moves** duplicates into a folder instead, rebuilding their original path
+underneath so it is obvious what came from where and putting one back is a plain move. Nothing is
+freed until you delete that folder yourself. Hard links cannot span filesystems, so copies on a
+different drive from the keeper need this; passing both flags links where it can and quarantines the
+rest.
+
+`--keep shortest|oldest|first` chooses which copy survives (default: copy-looking names like
+`x (2).jpg` lose, then the shortest path wins). The keeper is printed for every action in the
+preview — worth reading before `--apply`, since no rule can know which folder *you* consider the
+canonical one.
+
+Whatever the plan says, each pair is **re-hashed at the moment of action** and skipped if it no longer
+matches, so a plan made hours earlier can never act on a file that changed in the meantime.
 
 ### What a damaged archive does
 

@@ -56,6 +56,7 @@ pub mod net;
 
 pub use engine::dedup::{DedupOptions, DedupReport, DupeGroup, GroupKind, ScannedFile};
 pub use engine::estimate::{estimate_dedup, DedupEstimate};
+pub use engine::reclaim::{Action, KeepPolicy, Plan, ReclaimOptions, ReclaimReport};
 pub use engine::{extract, ExtractOptions};
 pub use error::{ArchiveError, Report, Result};
 pub use format::{Codec, Container, Format};

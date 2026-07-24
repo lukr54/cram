@@ -20,6 +20,7 @@ pub mod create;
 pub mod dedup;
 pub mod estimate;
 pub mod parallel;
+pub mod reclaim;
 pub mod sequential;
 pub mod skip;
 pub mod stream;
