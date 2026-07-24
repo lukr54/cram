@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master, main]
+    tags: ['v*']
   pull_request:
 
 env:
@@ -85,8 +86,8 @@ jobs:
               fail=1
             fi
           done
-          # A bare 64-hex-char string is what an ed25519 seed looks like, and the vendor seed is the
-          # one secret here whose leak cannot be undone. Matching on a nearby keyword was tried and is
+          # A bare 64-hex-char string is what a private signing seed looks like, and such a seed is the
+          # one secret whose leak cannot be undone. Matching on a nearby keyword was tried and is
           # weak in both directions -- it misses a constant whose name rustfmt wrapped onto the line
           # above, and it would wave through a real seed labelled `PUBKEY`. So known-safe values are
           # allowlisted BY VALUE, reviewably, in .github/secret-scan-allowlist.txt.
@@ -99,3 +100,58 @@ jobs:
             fail=1
           fi
           exit $fail
+
+  # Runs only on a pushed `v*` tag, after test + secret-scan pass. Packages the shipped binaries with
+  # the licence files and BOTH notice documents, so THIRD-PARTY-NOTICES.md's "installed alongside the
+  # binaries" claim is actually true for a release download. Like the rest of this file, it has never
+  # run — its first execution is the first tag push.
+  release:
+    name: package + publish release
+    needs: [test, secrets]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the bundled MinGW toolchain to PATH
+        shell: pwsh
+        run: |
+          $mingw = @('C:\mingw64\bin', 'C:\ProgramData\mingw64\mingw64\bin', 'C:\msys64\mingw64\bin') |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $mingw) { throw 'No MinGW toolchain found on this runner image' }
+          Add-Content -Path $env:GITHUB_PATH -Value $mingw -Encoding utf8
+
+      - name: Install the Rust GNU target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the shipped binaries
+        run: |
+          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-extract
+
+      - name: Stage the distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          rel=target/x86_64-pc-windows-gnu/release
+          dist="cram-${GITHUB_REF_NAME}-x86_64-pc-windows-gnu"
+          mkdir "$dist"
+          cp "$rel/cram.exe" "$rel/cram-extract.exe" "$dist"/
+          cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md README.md "$dist"/
+          # libwinpthread-1.dll must ship next to the exe (see THIRD-PARTY-NOTICES.md section 3).
+          cp "$(dirname "$(command -v gcc)")/libwinpthread-1.dll" "$dist"/
+          7z a "$dist.zip" "$dist" >/dev/null
+
+      - name: Publish the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Cram $GITHUB_REF_NAME" \
+            --generate-notes \
+            cram-*-x86_64-pc-windows-gnu.zip

@@ -7,6 +7,9 @@ version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lukr54/cram"
+# Cram ships as GitHub-release binaries, not crates.io packages (and the graph has path deps that
+# could not publish anyway). Crates opt in with `publish.workspace = true` to make that intent explicit.
+publish = false
 
 [profile.release]
 opt-level = 3

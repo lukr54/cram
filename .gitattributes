@@ -1,0 +1,20 @@
+# Normalise line endings. The repo is authored on Windows but must check out byte-identically
+# everywhere, and the POSIX-sh hooks under hooks/ must stay LF or they fail to exec on the Linux/macOS
+# CI runner ("bad interpreter"). `text=auto eol=lf` stores every text file as LF in the repo.
+* text=auto eol=lf
+
+# Be explicit for the file kinds this repo actually contains.
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.hbs   text eol=lf
+*.mjs   text eol=lf
+hooks/* text eol=lf
+
+# Anything Git detects as binary must never be line-ending-converted.
+*.png   binary
+*.ico   binary
+*.zip   binary
+*.rar   binary

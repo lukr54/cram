@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Reed-Solomon recovery sidecar for any file (incl. .cram): create parity, then repair corruption/truncation"
 
 # A recovery sidecar is computed OVER the archive's bytes and stored in a separate `.cramrec` file, so

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Cram archive manager — core engine (adaptive parallelism, hardware auto-detect, codecs)"
 
 [lib]
@@ -54,21 +55,21 @@ bzip2 = "0.6"        # bzip2 — default backend is pure-Rust libbz2-rs-sys (no 
 lz4_flex = "0.13"    # lz4 frame decode (pure Rust); pinned to dedupe with sevenz-rust2's copy
 brotli = "8"         # brotli decode (pure Rust)
 
-# --- the native `.cram` content-defined-dedup format (Phase 2b) ---
+# --- the native `.cram` content-defined-dedup format ---
 fastcdc = "3"        # FastCDC v2020 content-defined chunking (pure Rust)
 blake3 = "1"         # chunk content hashing for dedup (pure Rust)
-# `.cram` encryption (Phase 2b-B) — all pure-Rust RustCrypto, mingw-clean:
+# `.cram` encryption — all pure-Rust RustCrypto, mingw-clean:
 aes-gcm = "0.10"     # AES-256-GCM per-pack AEAD
 argon2 = "0.5"       # Argon2id password → key derivation
 getrandom = "0.2"    # OS CSPRNG for salts + nonces (BCryptGenRandom on Windows)
 
-# --- Phase 4a opt-in C backends (feature-gated; default OFF, pure-Rust build stays the norm) ---
+# --- opt-in C backends (feature-gated; default OFF, pure-Rust build stays the norm) ---
 # zstd (C) as a fast `.cram` pack codec — ruzstd only encodes at Fastest; the C lib gives full levels.
 zstd = { version = "0.13", optional = true }
 # libdeflate (C) — a faster DEFLATE inflate/deflate backend than miniz_oxide.
 libdeflater = { version = "1", optional = true }
 
-# --- extract-while-download (Feature 1b), behind the `download` feature ---
+# --- extract-while-download, behind the `download` feature ---
 # The rdm engine (segmented download + contiguous watermark) as a ByteSource. Opt-in (not a default)
 # so a plain cram build stays lean and skips the async/HTTP dependency tree. Note the feature gate
 # does NOT make the dependency free: Cargo loads a path dependency's manifest during workspace
@@ -87,6 +88,6 @@ sha2 = { version = "0.10", optional = true }
 [features]
 default = []
 download = ["dep:rdm-core", "dep:tokio", "dep:reqwest", "dep:sha2"]
-# Opt-in C backends (Phase 4a). Gated so the default build is 100% pure-Rust / always-builds.
+# Opt-in C backends. Gated so the default build is 100% pure-Rust / always-builds.
 zstd-c = ["dep:zstd"]
 libdeflate = ["dep:libdeflater"]

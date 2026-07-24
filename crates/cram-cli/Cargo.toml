@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Cram — the single `cram` command line: list/extract/create/test/convert/download/mount/rec/sign/verify/keygen/make-sfx"
 
 # The one unified operator binary. It owns argument parsing for the archive verbs (calling cram-core's

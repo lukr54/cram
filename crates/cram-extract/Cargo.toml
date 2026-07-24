@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Standalone minimal .cram extractor — an independent recovery reader with no dependency on cram-core"
 
 # A single self-contained binary: read a `.cram` (per docs/CRAM_FORMAT.md v1) and extract it. It shares
