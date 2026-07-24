@@ -133,7 +133,7 @@ cargo build --release -p cram-cli --features zstd-c,download
 writes different `.cram` bytes than the pure-Rust default, so it is worth checking before comparing
 two archives.
 
-Run the tests with `cargo test`; that is 163 tests across the workspace (164 with `--features
+Run the tests with `cargo test`; that is 165 tests across the workspace (166 with `--features
 cram-cli/phash`, which adds the perceptual-hash test). `cargo fmt --all -- --check`
 and `cargo clippy --workspace --all-targets -- -D warnings` are clean. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -184,6 +184,24 @@ cram --version                                    version + which optional featu
 - `--encrypt-names` (7z and `.cram` only) hides the file listing as well as the contents.
 - The format on create is chosen from the output extension (`.zip` / `.7z` / `.cram` /
   `.tar[.gz|.xz|.bz2|.lz4|.br|.zst]`).
+
+### Photos: ~23% smaller, and still byte-for-byte the same files
+
+Creating a `.cram` losslessly recompresses JPEGs. A photo's data is already entropy-coded, which is
+why zip and 7z gain essentially nothing on a photo library — measured on a real folder of 34 camera
+JPEGs, ZIP and 7z both came out *fractionally larger* than the originals, and `tar.xz` managed 2.7%.
+The same folder in a `.cram` is **23.6% smaller**.
+
+Nothing is traded away for it. The JPEG's entropy coding is redone with a stronger coder, and
+extraction reconstructs the **original file byte-for-byte** — same bytes, same EXIF, same checksum.
+It is not "visually lossless"; it is the file you put in. Every candidate is verified to round-trip
+*before* it is stored, and anything that fails verification is stored untouched, so the worst case is
+that a file simply isn't shrunk.
+
+It is on by default; `cram a --no-recompress` turns it off. Archives that use it declare format v2
+(see [docs/CRAM_FORMAT.md](docs/CRAM_FORMAT.md)), which older readers refuse outright rather than
+misread — and the standalone `cram-extract` recovery tool reverses it too, so a photo archive stays
+recoverable with the small independent decoder.
 
 ### Finding duplicates across drives
 

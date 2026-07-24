@@ -56,6 +56,12 @@ lz4_flex = "0.13"    # lz4 frame decode (pure Rust); pinned to dedupe with seven
 brotli = "8"         # brotli decode (pure Rust)
 
 # --- the native `.cram` content-defined-dedup format ---
+# Lossless JPEG recompression (Lepton, the technique Dropbox ran at scale; this is the pure-Rust
+# port). A JPEG's entropy coding is re-done with a stronger arithmetic coder, and the ORIGINAL FILE
+# is reconstructed byte-for-byte — measured at ~23% on real camera/phone photos, where zip and 7z
+# both achieve 0%. Pure Rust, so it can also live in the standalone `cram-extract` recovery reader,
+# which must be able to reverse anything the writer does.
+lepton_jpeg = "0.5"
 fastcdc = "3"        # FastCDC v2020 content-defined chunking (pure Rust)
 blake3 = "1"         # chunk content hashing for dedup (pure Rust)
 # `.cram` encryption — all pure-Rust RustCrypto, mingw-clean:

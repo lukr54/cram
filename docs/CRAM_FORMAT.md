@@ -49,7 +49,7 @@ fixed-size trailer first.
 | field    | type      | value                                             |
 |----------|-----------|---------------------------------------------------|
 | magic    | bytes(6)  | `43 52 41 4D 1B 01` = ASCII `CRAM` then `0x1B 0x01` |
-| version  | u8        | `0x01` for this specification                      |
+| version  | u8        | `0x01`, or `0x02` when any entry carries a transform (§6) |
 | flags    | u8        | bit 0 = **ENCRYPTED**; bits 1–7 reserved, **must be 0** |
 
 The same 6-byte magic appears again at the very end of the file (in the trailer), so the format is
@@ -58,7 +58,13 @@ recognizable from both ends.
 A reader **must**:
 
 - reject the file if the 6-byte magic does not match;
-- reject the file if `version != 0x01` (a newer archive is not assumed to be v1-compatible);
+- reject the file if `version` is neither `0x01` nor `0x02` (a newer archive is not assumed to be
+  backward-compatible);
+- treat `version` as selecting the `EntryMeta` shape: v2 records carry a trailing `transform` byte,
+  v1 records do not. A writer emits `0x02` **only** when it actually stored a transformed entry, so
+  archives that use no transform stay readable by v1-only readers. This is why the version gate
+  matters: a v1-only reader encountering a v2 archive refuses it outright rather than writing a
+  transformed stream to disk as though it were the original file;
 - reject the file if any reserved flag bit (`flags & 0xFE`) is set.
 
 ---
@@ -123,7 +129,22 @@ entry_table := entry_count:u32 then entry_count × EntryMeta
 EntryMeta   := is_dir:u8 | name_len:u32 | name:bytes(name_len)
              | size:u64 | mode:u32 | chunk_id_count:u32
              | chunk_ids:u32 × chunk_id_count
+             | transform:u8                                   (v2 archives only)
 ```
+
+**transform** (v2 only) — a reversible, *lossless* transform applied to the entry's bytes before
+chunking. A reader that cannot reverse a transform it encounters **must** reject the archive.
+
+| value | meaning |
+|-------|---------|
+| `0x00` | `NONE` — stored exactly as read. |
+| `0x01` | `LEPTON` — a JPEG stored as a Lepton stream; extraction reconstructs the original file byte-for-byte. |
+
+For a transformed entry, `size` is the **reconstructed** (original) length, so listings and extraction
+report the file the user actually gets. Consequently `size == Σ chunk length` does **not** hold for
+such entries (§9); the stored stream is smaller. A reader **must** instead verify that the
+reconstruction is exactly `size` bytes long, and **must** bound `size` against the stored length
+before trusting it in any budget calculation.
 
 **PackLoc** — one pack:
 - `file_offset` — absolute offset of the pack blob in the packs region.
@@ -290,3 +311,9 @@ Two caveats:
 
 - **v1** — initial frozen format: content-defined chunking + BLAKE3 dedup, solid packs
   (STORE/XZ/ZSTD), footer index, trailer, optional whole-archive AES-256-GCM with Argon2id.
+- **v2** — adds the per-entry `transform` byte (§6) and, with it, `LEPTON`: lossless JPEG
+  recompression. Photos are already entropy-coded, so a general-purpose compressor gains ~0% on them;
+  redoing that coding is worth ~23% while still reconstructing the original file byte-for-byte. The
+  writer emits v2 only when a transform was actually used, and verifies every candidate round-trips
+  before storing it — a file that fails to verify is stored untransformed. Everything else is
+  unchanged from v1.

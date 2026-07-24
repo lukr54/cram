@@ -225,6 +225,10 @@ fn usage() {
         "  a  <archive> <input...> [-p <pw>]   create [--store|--fast|--best] [--encrypt-names]"
     );
     eprintln!(
+        "       .cram losslessly recompresses JPEGs (~23%, exact originals restored on extract);"
+    );
+    eprintln!("       --no-recompress stores them as-is instead");
+    eprintln!(
         "  t  <archive> [-p <pw>]              test integrity (decode + checksums, no extract)"
     );
     eprintln!("  conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--best|--fast|--store]");
@@ -1182,6 +1186,8 @@ fn create(args: &[String]) -> Result<()> {
         codec: has(args, "--store").then_some(Codec::None),
         solid: false,
         threads: None,
+        // Lossless JPEG recompression is on unless explicitly turned off.
+        recompress_images: !has(args, "--no-recompress"),
     };
 
     let t0 = Instant::now();
@@ -1259,6 +1265,8 @@ fn convert_cmd(args: &[String]) -> Result<()> {
         codec: has(args, "--store").then_some(Codec::None),
         solid: false,
         threads: None,
+        // Lossless JPEG recompression is on unless explicitly turned off.
+        recompress_images: !has(args, "--no-recompress"),
     };
 
     let t0 = Instant::now();

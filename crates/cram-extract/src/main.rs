@@ -30,6 +30,18 @@ use argon2::{Algorithm, Argon2, Params, Version};
 // ---- format constants (docs/CRAM_FORMAT.md §2–§11) ----
 const MAGIC: &[u8; 6] = b"CRAM\x1b\x01";
 const VERSION: u8 = 1;
+/// Archives that contain a per-entry transform (see `XFORM_LEPTON`). The entry record then carries a
+/// trailing transform byte; everything else is identical to v1.
+const VERSION_XFORM: u8 = 2;
+/// Entry stored exactly as read.
+const XFORM_NONE: u8 = 0;
+/// Entry stored as a Lepton stream — the original JPEG is reconstructed byte-for-byte on the way out.
+/// This reader must be able to reverse anything the writer does, or a photo archive would not be
+/// recoverable with the very tool that exists to recover it.
+const XFORM_LEPTON: u8 = 1;
+/// Bounds a transformed entry's declared size against the stream actually stored (see the reference
+/// reader): stops a hostile index inflating the anti-amplification budget.
+const MAX_XFORM_EXPANSION: u64 = 64;
 const HEADER_LEN: u64 = 8;
 const TRAILER_LEN: u64 = 22;
 const CRYPTO_BLOCK_LEN: u64 = 28; // salt(16) + m/t/p (u32 each)
@@ -122,10 +134,12 @@ struct EntryMeta {
     is_dir: bool,
     size: u64,
     chunk_ids: Vec<u32>,
+    /// Reversible transform applied to the stored bytes (`XFORM_NONE` / `XFORM_LEPTON`).
+    transform: u8,
 }
 
 /// Parse the plaintext index (§6). Counts are never used to pre-size an allocation (§9.11).
-fn deserialize_index(buf: &[u8]) -> R<(Vec<PackLoc>, Vec<ChunkLoc>, Vec<EntryMeta>)> {
+fn deserialize_index(buf: &[u8], version: u8) -> R<(Vec<PackLoc>, Vec<ChunkLoc>, Vec<EntryMeta>)> {
     let mut c = Cur::new(buf);
     let np = c.u32()?;
     let mut packs = Vec::new();
@@ -160,12 +174,22 @@ fn deserialize_index(buf: &[u8]) -> R<(Vec<PackLoc>, Vec<ChunkLoc>, Vec<EntryMet
         for _ in 0..nci {
             chunk_ids.push(c.u32()?);
         }
+        let transform = if version >= VERSION_XFORM {
+            let t = c.u8()?;
+            if t != XFORM_NONE && t != XFORM_LEPTON {
+                return err(format!("unknown entry transform {t}"));
+            }
+            t
+        } else {
+            XFORM_NONE
+        };
         entries.push(EntryMeta {
             name,
             safe: PathBuf::new(), // filled in Archive::open after sanitization
             is_dir,
             size,
             chunk_ids,
+            transform,
         });
     }
     Ok((packs, chunks, entries))
@@ -375,8 +399,9 @@ impl Archive {
         if &head[..6] != MAGIC {
             return err("bad .cram header magic");
         }
-        if head[6] != VERSION {
-            return err(format!("unsupported .cram version {}", head[6]));
+        let version = head[6];
+        if version != VERSION && version != VERSION_XFORM {
+            return err(format!("unsupported .cram version {}", version));
         }
         if head[7] & !FLAG_ENCRYPTED != 0 {
             return err("unknown .cram header flags");
@@ -426,7 +451,7 @@ impl Archive {
             None => index_blob,
         };
 
-        let (packs, chunks, entries) = deserialize_index(&index_bytes)?;
+        let (packs, chunks, entries) = deserialize_index(&index_bytes, version)?;
 
         // Cross-reference validation (§9.5–§9.7).
         for p in &packs {
@@ -454,7 +479,13 @@ impl Archive {
                     .ok_or("entry references unknown chunk")?;
                 sum = sum.saturating_add(c.length as u64);
             }
-            if sum != e.size {
+            if e.transform != XFORM_NONE {
+                // A transformed entry stores a smaller stream than the file it reconstructs, so the
+                // equality cannot hold; the exact length is checked against the reconstruction below.
+                if sum == 0 || e.size > sum.saturating_mul(MAX_XFORM_EXPANSION) {
+                    return err("implausible size for a recompressed entry");
+                }
+            } else if sum != e.size {
                 return err("entry size does not match its chunk lengths");
             }
         }
@@ -521,6 +552,37 @@ impl Archive {
     /// Reconstruct one entry's body into `out`, metering decompression against the anti-bomb budget
     /// (cumulative across the whole run — see `Archive::decompressed`).
     fn write_entry(&mut self, idx: usize, out: &mut dyn Write) -> R<()> {
+        // A recompressed JPEG is reassembled in full and then reversed, because a Lepton stream is one
+        // arithmetic-coded unit and cannot be written out piecewise. The reconstructed length is
+        // checked against the size the index declared, so this tool either hands back the exact
+        // original file or says plainly that it could not.
+        if self.entries[idx].transform == XFORM_LEPTON {
+            let expected = self.entries[idx].size;
+            let mut stored = Vec::new();
+            self.write_raw(idx, &mut stored)?;
+            let feats = lepton_jpeg::EnabledFeatures::compat_lepton_vector_write();
+            let pool = lepton_jpeg::SingleThreadPool {};
+            let mut restored = Vec::new();
+            lepton_jpeg::decode_lepton(
+                &mut std::io::Cursor::new(&stored[..]),
+                &mut restored,
+                &feats,
+                &pool,
+            )
+            .map_err(|e| format!("could not reconstruct a recompressed JPEG: {e}"))?;
+            if restored.len() as u64 != expected {
+                return err(format!(
+                    "recompressed entry reconstructed to {} bytes, expected {expected}",
+                    restored.len()
+                ));
+            }
+            return out.write_all(&restored).map_err(io_err);
+        }
+        self.write_raw(idx, out)
+    }
+
+    /// Write an entry's stored bytes verbatim (no transform reversal).
+    fn write_raw(&mut self, idx: usize, out: &mut dyn Write) -> R<()> {
         let ids = std::mem::take(&mut self.entries[idx].chunk_ids);
         let budget = self.budget();
         let mut result = Ok(());
@@ -894,8 +956,8 @@ mod tests {
     #[test]
     fn deserialize_rejects_truncated_index() {
         // A bogus/short buffer must fail cleanly (Err), never panic or over-read.
-        assert!(deserialize_index(&[]).is_err());
-        assert!(deserialize_index(&[1, 0, 0, 0]).is_err()); // claims 1 pack, no bytes follow
+        assert!(deserialize_index(&[], VERSION).is_err());
+        assert!(deserialize_index(&[1, 0, 0, 0], VERSION).is_err()); // claims 1 pack, no bytes follow
     }
 
     #[test]
@@ -913,7 +975,7 @@ mod tests {
         for _ in 0..8000 {
             let len = (next() % 512) as usize;
             let buf: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
-            let _ = deserialize_index(&buf);
+            let _ = deserialize_index(&buf, VERSION);
         }
     }
 

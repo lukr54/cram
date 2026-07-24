@@ -50,7 +50,10 @@ pub enum Level {
 }
 
 /// Whole-archive creation settings, fixed at construction.
-#[derive(Debug, Clone, Default)]
+///
+/// `Default` is hand-written rather than derived because [`recompress_images`](Self::recompress_images)
+/// must default to **on**, which a derive cannot express for a `bool`.
+#[derive(Debug, Clone)]
 pub struct CreateOptions {
     pub level: Level,
     /// `None` = no encryption. `Some` carries the password + the two locked forks (ZIP cipher,
@@ -64,6 +67,27 @@ pub struct CreateOptions {
     pub solid: bool,
     /// Worker threads; `None` = derive from [`hw::derive_plan`](crate::hw).
     pub threads: Option<usize>,
+    /// Losslessly recompress JPEGs when writing `.cram` (**on by default**).
+    ///
+    /// A JPEG's entropy coding is redone with a stronger coder and the original file is reconstructed
+    /// byte-for-byte on extract — worth ~23% on real photos, where zip and 7z manage ~0% because the
+    /// data is already entropy-coded. Every candidate is verified to round-trip before it is stored,
+    /// and anything that fails is kept verbatim, so turning this off only costs space. Ignored by
+    /// containers other than `.cram`.
+    pub recompress_images: bool,
+}
+
+impl Default for CreateOptions {
+    fn default() -> Self {
+        Self {
+            level: Level::default(),
+            encrypt: None,
+            codec: None,
+            solid: false,
+            threads: None,
+            recompress_images: true,
+        }
+    }
 }
 
 /// Outcome of a creation job — carries the ratio inputs and any dedup win the GUI/CLI reports.

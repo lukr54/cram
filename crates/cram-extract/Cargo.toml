@@ -21,3 +21,7 @@ lzma-rust2 = { version = "0.16", default-features = false, features = ["xz", "st
 ruzstd = "0.8"    # zstd decode
 aes-gcm = "0.10"  # AES-256-GCM open (encrypted archives)
 argon2 = "0.5"    # Argon2id key derivation
+# Reverses the writer's lossless JPEG recompression. Pure Rust, so this crate keeps its "tiny,
+# auditable, always-builds" character — it must be able to undo anything the writer does, or a photo
+# archive would not be recoverable with the tool that exists precisely for that.
+lepton_jpeg = "0.5"

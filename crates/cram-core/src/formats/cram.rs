@@ -56,7 +56,27 @@ use crate::sniff::CRAM_MAGIC;
 use crate::writer::{ArchiveWriter, CreateOptions, CreateReport, Level, WriteHint};
 
 const VERSION: u8 = 1;
+/// Written in place of [`VERSION`] **only** when the archive actually contains a per-entry transform
+/// (see [`XFORM_LEPTON`]). Both this crate's reader and the standalone `cram-extract` reject a version
+/// they don't know, so an older build refuses such an archive outright instead of writing out the
+/// transformed bytes as if they were the file — a clean failure rather than silent corruption. An
+/// archive with no transformed entries stays v1 and older readers keep working.
+const VERSION_XFORM: u8 = 2;
+/// Offset of the version byte, patched at `finish` once it is known whether any transform was used.
+const VERSION_OFFSET: u64 = 6;
 const HEADER_LEN: u64 = 8; // magic(6) + version(1) + flags(1)
+
+/// Entry stored exactly as it was read.
+const XFORM_NONE: u8 = 0;
+/// Entry stored as a Lepton stream; extraction reconstructs the original JPEG byte-for-byte.
+const XFORM_LEPTON: u8 = 1;
+/// Files above this are never transformed: the recompressor needs the whole image in memory, and a
+/// huge mis-named file must not be able to balloon the writer's footprint.
+const MAX_XFORM_INPUT: u64 = 256 * 1024 * 1024;
+/// Largest ratio a stored transformed stream may claim to expand to. Real Lepton output is ~0.77× the
+/// JPEG, so this is enormously generous — it exists only to keep a hostile index from declaring a
+/// vast size to weaken the decompression-bomb budget.
+const MAX_XFORM_EXPANSION: u64 = 64;
 const TRAILER_LEN: u64 = 22; // index_offset(8) + index_len(8) + magic(6)
 
 /// `flags` byte bit 0 — the archive's packs + index are AES-256-GCM encrypted.
@@ -227,9 +247,52 @@ struct ChunkLoc {
 struct EntryMeta {
     name: String,
     is_dir: bool,
+    /// **Logical** size — the length of the file the user gets back. For a transformed entry this is
+    /// the original JPEG's length, not the length of the stored (smaller) stream, so listings and
+    /// extraction report what the user actually has.
     size: u64,
     mode: u32,
     chunk_ids: Vec<u32>,
+    /// Which reversible transform the stored bytes went through ([`XFORM_NONE`]/[`XFORM_LEPTON`]).
+    transform: u8,
+}
+
+/// Does this name look like a JPEG? Only a hint for *whether to try* — the recompressor validates the
+/// actual bytes and a mislabelled file simply falls back to being stored as-is.
+fn looks_like_jpeg(name: &str) -> bool {
+    let n = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(n.as_str(), "jpg" | "jpeg" | "jpe" | "jfif")
+}
+
+/// Losslessly recompress a JPEG, returning `None` if it can't be (not a JPEG, an unsupported
+/// variant, or the library declines).
+///
+/// Uses the verifying encoder, which decodes its own output and compares it to the input before
+/// returning. Nothing is ever stored transformed unless it has already been proven to reconstruct
+/// byte-for-byte — for irreplaceable photos, "probably reversible" is not good enough. Any failure is
+/// simply a `None` and the caller stores the original bytes.
+fn jpeg_recompress(data: &[u8]) -> Option<Vec<u8>> {
+    let feats = lepton_jpeg::EnabledFeatures::compat_lepton_vector_write();
+    let pool = lepton_jpeg::SingleThreadPool {};
+    match lepton_jpeg::encode_lepton_verify(data, &feats, &pool) {
+        // Only worth it if it actually got smaller.
+        Ok((out, _)) if out.len() < data.len() => Some(out),
+        _ => None,
+    }
+}
+
+/// Reverse [`jpeg_recompress`], reconstructing the original JPEG exactly.
+fn jpeg_restore(data: &[u8]) -> Result<Vec<u8>> {
+    let feats = lepton_jpeg::EnabledFeatures::compat_lepton_vector_write();
+    let pool = lepton_jpeg::SingleThreadPool {};
+    let mut out = Vec::with_capacity(data.len() * 2);
+    lepton_jpeg::decode_lepton(&mut Cursor::new(data), &mut out, &feats, &pool)
+        .map_err(|e| corrupt(&format!("could not reconstruct a recompressed JPEG: {e}")))?;
+    Ok(out)
 }
 
 /// Map the abstract [`Level`] onto the XZ 0–9 preset used for packs.
@@ -251,7 +314,14 @@ fn put_u64(b: &mut Vec<u8>, x: u64) {
     b.extend_from_slice(&x.to_le_bytes());
 }
 
-fn serialize_index(packs: &[PackLoc], chunks: &[ChunkLoc], entries: &[EntryMeta]) -> Vec<u8> {
+/// `version` selects the entry-record shape: v1 records carry no transform byte, so an archive that
+/// used no transforms serializes byte-identically to before and older readers still accept it.
+fn serialize_index(
+    packs: &[PackLoc],
+    chunks: &[ChunkLoc],
+    entries: &[EntryMeta],
+    version: u8,
+) -> Vec<u8> {
     let mut b = Vec::new();
     put_u32(&mut b, packs.len() as u32);
     for p in packs {
@@ -277,6 +347,9 @@ fn serialize_index(packs: &[PackLoc], chunks: &[ChunkLoc], entries: &[EntryMeta]
         put_u32(&mut b, e.chunk_ids.len() as u32);
         for &id in &e.chunk_ids {
             put_u32(&mut b, id);
+        }
+        if version >= VERSION_XFORM {
+            b.push(e.transform);
         }
     }
     b
@@ -320,7 +393,12 @@ fn corrupt(msg: &str) -> ArchiveError {
     ArchiveError::Corrupt(msg.to_string())
 }
 
-fn deserialize_index(buf: &[u8]) -> Result<(Vec<PackLoc>, Vec<ChunkLoc>, Vec<EntryMeta>)> {
+/// `version` must be the archive header's version byte: it selects the entry-record shape, so a v1
+/// index is read exactly as before and only a v2 index looks for the trailing transform byte.
+fn deserialize_index(
+    buf: &[u8],
+    version: u8,
+) -> Result<(Vec<PackLoc>, Vec<ChunkLoc>, Vec<EntryMeta>)> {
     let mut c = Cur::new(buf);
 
     // Counts come from untrusted bytes → never pre-allocate from them; push in a loop so a bogus
@@ -358,12 +436,24 @@ fn deserialize_index(buf: &[u8]) -> Result<(Vec<PackLoc>, Vec<ChunkLoc>, Vec<Ent
         for _ in 0..nci {
             chunk_ids.push(c.u32()?);
         }
+        let transform = if version >= VERSION_XFORM {
+            let t = c.u8()?;
+            // An unknown transform means bytes this build cannot reverse. Refusing here is the
+            // difference between a clear error and handing the caller a corrupt file.
+            if t != XFORM_NONE && t != XFORM_LEPTON {
+                return Err(corrupt(&format!("unknown entry transform {t}")));
+            }
+            t
+        } else {
+            XFORM_NONE
+        };
         entries.push(EntryMeta {
             name,
             is_dir,
             size,
             mode,
             chunk_ids,
+            transform,
         });
     }
     Ok((packs, chunks, entries))
@@ -395,6 +485,11 @@ pub struct CramArchiveWriter {
     in_bytes: u64,
     /// Bytes eliminated by dedup (chunks that matched an already-stored chunk).
     dedup_saved: u64,
+    /// Try lossless JPEG recompression on image entries (see [`jpeg_recompress`]).
+    recompress_images: bool,
+    /// Set once an entry is actually stored transformed; decides whether the header is patched to
+    /// [`VERSION_XFORM`] at `finish`, so archives that used no transform stay v1-readable.
+    used_transform: bool,
     /// `Some` when the archive is encrypted: packs and the index are AES-256-GCM sealed.
     crypter: Option<Crypter>,
     /// Id the currently-filling `pack_buf` will get (chunks reference this before the pack is written).
@@ -512,6 +607,8 @@ impl CramArchiveWriter {
             pack_buf: Vec::new(),
             in_bytes: 0,
             dedup_saved: 0,
+            recompress_images: opts.recompress_images,
+            used_transform: false,
             crypter,
             next_pack_id: 0,
             pending: Vec::new(),
@@ -523,6 +620,42 @@ impl CramArchiveWriter {
             use_zstd: cfg!(feature = "zstd-c") && !matches!(opts.level, Level::Best),
             start: Instant::now(),
         })
+    }
+
+    /// Chunk everything `src` yields into the dedup table and the current pack, returning the chunk
+    /// ids. Shared by the plain path and the recompressed path so both dedup identically — two
+    /// copies of one photo still collapse to a single stored copy.
+    fn chunk_stream(&mut self, src: &mut dyn Read) -> Result<Vec<u32>> {
+        let mut chunk_ids = Vec::new();
+        let chunker = StreamCDC::new(src, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX);
+        for chunk in chunker {
+            let chunk = chunk.map_err(|e| ArchiveError::Backend(format!("chunker: {e}")))?;
+            let data = chunk.data;
+            self.in_bytes += data.len() as u64;
+            let key = *blake3::hash(&data).as_bytes();
+            if let Some(&id) = self.seen.get(&key) {
+                self.dedup_saved += data.len() as u64;
+                chunk_ids.push(id);
+                continue;
+            }
+            let id = self.chunks.len() as u32;
+            let loc = ChunkLoc {
+                pack_id: self.next_pack_id,
+                offset: self.pack_buf.len() as u32,
+                length: data.len() as u32,
+            };
+            self.pack_buf.extend_from_slice(&data);
+            self.chunks.push(loc);
+            self.seen.insert(key, id);
+            chunk_ids.push(id);
+            if self.pack_buf.len() >= PACK_TARGET {
+                self.queue_pack();
+                if self.pending.len() >= self.batch {
+                    self.flush_batch()?;
+                }
+            }
+        }
+        Ok(chunk_ids)
     }
 
     fn write_out(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -574,6 +707,53 @@ impl CramArchiveWriter {
 
 impl ArchiveWriter for CramArchiveWriter {
     fn add_file(&mut self, entry: &Entry, body: &mut dyn Read, _hint: WriteHint) -> Result<()> {
+        let name = cram_name(entry);
+
+        // A JPEG is stored as a Lepton stream when that round-trips provably: zip and 7z get ~0% on
+        // photos because the data is already entropy-coded, whereas re-doing that coding is worth
+        // ~23% with the original file still reconstructable byte-for-byte. The whole image has to be
+        // in memory for this, so it is bounded — and anything that isn't really a JPEG, is too big,
+        // or fails to verify simply streams through unchanged.
+        if self.recompress_images && looks_like_jpeg(&name) {
+            let mut head = Vec::new();
+            body.take(MAX_XFORM_INPUT + 1).read_to_end(&mut head)?;
+            if head.len() as u64 <= MAX_XFORM_INPUT {
+                if let Some(encoded) = jpeg_recompress(&head) {
+                    let original_len = head.len() as u64;
+                    let chunk_ids = self.chunk_stream(&mut Cursor::new(&encoded))?;
+                    // Account the logical bytes, not the stored ones, so the report's ratio reflects
+                    // what the user actually put in.
+                    self.in_bytes += original_len.saturating_sub(encoded.len() as u64);
+                    self.entries.push(EntryMeta {
+                        name,
+                        is_dir: false,
+                        size: original_len, // what extraction will produce
+                        mode: entry.unix_mode.unwrap_or(0),
+                        chunk_ids,
+                        transform: XFORM_LEPTON,
+                    });
+                    self.used_transform = true;
+                    return Ok(());
+                }
+            }
+            // Not transformable: chunk what was already read, then the rest of the body.
+            let mut rest = Cursor::new(head).chain(body);
+            let chunk_ids = self.chunk_stream(&mut rest)?;
+            let size = chunk_ids
+                .iter()
+                .map(|&id| self.chunks[id as usize].length as u64)
+                .sum();
+            self.entries.push(EntryMeta {
+                name,
+                is_dir: false,
+                size,
+                mode: entry.unix_mode.unwrap_or(0),
+                chunk_ids,
+                transform: XFORM_NONE,
+            });
+            return Ok(());
+        }
+
         // Chunk the *live* body; the stored size is the actual bytes chunked (not the plan-time
         // `entry.size`), so a source file that changed since planning can never desync the archive.
         let mut chunk_ids = Vec::new();
@@ -613,6 +793,7 @@ impl ArchiveWriter for CramArchiveWriter {
             size,
             mode: entry.unix_mode.unwrap_or(0),
             chunk_ids,
+            transform: XFORM_NONE,
         });
         Ok(())
     }
@@ -624,6 +805,7 @@ impl ArchiveWriter for CramArchiveWriter {
             size: 0,
             mode: entry.unix_mode.unwrap_or(0),
             chunk_ids: Vec::new(),
+            transform: XFORM_NONE,
         });
         Ok(())
     }
@@ -633,7 +815,14 @@ impl ArchiveWriter for CramArchiveWriter {
         self.queue_pack();
         self.flush_batch()?;
         let index_offset = self.pos;
-        let index = serialize_index(&self.packs, &self.chunks, &self.entries);
+        // Only an archive that actually used a transform is written as v2; everything else stays v1
+        // and remains readable by older builds.
+        let version = if self.used_transform {
+            VERSION_XFORM
+        } else {
+            VERSION
+        };
+        let index = serialize_index(&self.packs, &self.chunks, &self.entries, version);
         // When encrypted, the index is sealed too — the listing needs the password, and the index's
         // own GCM tag doubles as the password verifier on open.
         let index = match &self.crypter {
@@ -649,6 +838,17 @@ impl ArchiveWriter for CramArchiveWriter {
         trailer.extend_from_slice(CRAM_MAGIC);
         self.write_out(&trailer)?;
         self.out.flush()?; // surface any deferred write error now
+
+        // The header went out before the first file, so only now is it known whether any entry was
+        // actually transformed. Patch the version byte in place: an older reader then refuses this
+        // archive outright rather than handing back Lepton streams as if they were JPEGs.
+        if self.used_transform {
+            use std::io::Seek;
+            let f = self.out.get_mut();
+            f.seek(SeekFrom::Start(VERSION_OFFSET))?;
+            f.write_all(&[VERSION_XFORM])?;
+            f.flush()?;
+        }
 
         // `pos` counted every byte written (header + packs + index + trailer) = the final size.
         Ok(CreateReport {
@@ -714,6 +914,8 @@ pub struct CramReader {
     entries: Vec<Entry>,
     /// Chunk-id list per entry, aligned to `entries`.
     entry_chunks: Vec<Vec<u32>>,
+    /// Per-entry transform to reverse on the way out (index-aligned with `entries`).
+    entry_transforms: Vec<u8>,
     /// `Some` when the archive is encrypted (packs are AES-256-GCM sealed).
     crypter: Option<Crypter>,
     /// Decompressed packs shared across concurrent `copy_entry` workers (kills re-decompression).
@@ -746,7 +948,11 @@ impl CramReader {
         if &head[..CRAM_MAGIC.len()] != CRAM_MAGIC {
             return Err(corrupt("bad .cram header magic"));
         }
-        if head[6] != VERSION {
+        // v1 and v2 differ only in the entry record's trailing transform byte. Anything else is a
+        // format this build cannot read, and refusing is what keeps an older reader from mistaking a
+        // transformed stream for the file itself.
+        let version = head[6];
+        if version != VERSION && version != VERSION_XFORM {
             return Err(corrupt("unsupported .cram version"));
         }
         if head[7] & !FLAG_ENCRYPTED != 0 {
@@ -836,7 +1042,7 @@ impl CramReader {
             (None, index_blob)
         };
 
-        let (packs, chunks, metas) = deserialize_index(&index_bytes)?;
+        let (packs, chunks, metas) = deserialize_index(&index_bytes, version)?;
 
         // Validate cross-references so extraction can index without bounds-panicking, and so a
         // hostile archive can't point a pack read outside the pack region or OOM the decompressor.
@@ -864,6 +1070,7 @@ impl CramReader {
         // Build the public entry list, dropping any unsafe names (keeps entries/entry_chunks aligned).
         let mut entries = Vec::new();
         let mut entry_chunks = Vec::new();
+        let mut entry_transforms = Vec::new();
         for m in metas {
             // Validate chunk-id bounds AND that the chunk lengths sum to the declared size. The
             // writer guarantees `size == Σ chunk.length` (it does `size += data.len()` and pushes an
@@ -877,8 +1084,19 @@ impl CramReader {
                     .ok_or_else(|| corrupt("entry references unknown chunk"))?;
                 sum = sum.saturating_add(c.length as u64);
             }
-            if sum != m.size {
-                return Err(corrupt("entry size does not match its chunk lengths"));
+            if m.transform == XFORM_NONE {
+                if sum != m.size {
+                    return Err(corrupt("entry size does not match its chunk lengths"));
+                }
+            } else {
+                // A transformed entry stores a *smaller* stream than the file it reconstructs, so the
+                // sizes deliberately differ and the equality above cannot apply. The declared size is
+                // still bounded here — otherwise a hostile index could claim an enormous one purely to
+                // inflate the anti-bomb budget below — and it is checked exactly against the
+                // reconstructed length at extraction time, which is the real guarantee.
+                if sum == 0 || m.size > sum.saturating_mul(MAX_XFORM_EXPANSION) {
+                    return Err(corrupt("implausible size for a recompressed entry"));
+                }
             }
             let Some(path) = EntryPath::from_raw(&m.name) else {
                 continue; // path-traversal / unsafe name → not listed, not extracted
@@ -900,6 +1118,7 @@ impl CramReader {
                 encrypted: false,
             });
             entry_chunks.push(m.chunk_ids);
+            entry_transforms.push(m.transform);
         }
 
         // Output-scaled anti-bomb budget: total decompression work ≤ RE_DECODE_FACTOR × the bytes we
@@ -920,6 +1139,7 @@ impl CramReader {
             chunks,
             entries,
             entry_chunks,
+            entry_transforms,
             crypter,
             pack_cache: Mutex::new(PackCache::new(PACK_CACHE_CAP)),
             budget,
@@ -1000,6 +1220,34 @@ impl CramReader {
     /// Reconstruct an entry's body (given its chunk-id list) into `out`, pulling each pack from the
     /// shared [`PackCache`] (decompressed once, reused across all workers) with a one-deep per-call
     /// front cache for consecutive same-pack chunks.
+    /// The transform recorded for an entry (`XFORM_NONE` when the index predates transforms).
+    fn transform_of(&self, index: usize) -> u8 {
+        self.entry_transforms
+            .get(index)
+            .copied()
+            .unwrap_or(XFORM_NONE)
+    }
+
+    /// Reassemble a transformed entry's stored stream and reverse the transform, yielding the exact
+    /// original file.
+    ///
+    /// The reconstructed length is checked against the size the index declared. That is the promise
+    /// this whole feature rests on — the bytes handed back are the bytes that went in — so it is
+    /// verified on the way out rather than assumed from the writer having verified on the way in.
+    fn restore_entry(&self, index: usize, chunk_ids: &[u32]) -> Result<Vec<u8>> {
+        let mut stored = Vec::new();
+        self.reconstruct(chunk_ids, &mut stored)?;
+        let restored = jpeg_restore(&stored)?;
+        let expected = self.entries.get(index).map(|e| e.size).unwrap_or(0);
+        if restored.len() as u64 != expected {
+            return Err(corrupt(&format!(
+                "recompressed entry reconstructed to {} bytes, expected {expected}",
+                restored.len()
+            )));
+        }
+        Ok(restored)
+    }
+
     fn reconstruct(&self, chunk_ids: &[u32], out: &mut dyn Write) -> Result<u64> {
         let mut file = File::open(&self.path)?;
         // One-deep per-call cache (an `Arc` into the shared cache) avoids re-locking the shared
@@ -1093,6 +1341,11 @@ impl RandomAccessReader for CramReader {
             .entry_chunks
             .get(index)
             .ok_or_else(|| corrupt("bad entry index"))?;
+        if self.transform_of(index) == XFORM_LEPTON {
+            let restored = self.restore_entry(index, ids)?;
+            out.write_all(&restored)?;
+            return Ok(restored.len() as u64);
+        }
         self.reconstruct(ids, out)
     }
 
@@ -1101,6 +1354,16 @@ impl RandomAccessReader for CramReader {
             .entry_chunks
             .get(index)
             .ok_or_else(|| corrupt("bad entry index"))?;
+        // A Lepton stream cannot be seeked into — the whole image is one arithmetic-coded unit — so a
+        // ranged read reconstructs the entry and slices the result. That keeps the ProjFS mount and
+        // every other random-access consumer working transparently on recompressed photos; the cost is
+        // whole-file work per range, which is acceptable for image-sized entries.
+        if self.transform_of(index) == XFORM_LEPTON {
+            let restored = self.restore_entry(index, ids)?;
+            let start = (off as usize).min(restored.len());
+            let stop = start.saturating_add(len as usize).min(restored.len());
+            return Ok(restored[start..stop].to_vec());
+        }
         let end = off.saturating_add(len);
         let mut out = Vec::new();
         let mut file = File::open(&self.path)?;
@@ -1206,7 +1469,7 @@ mod tests {
         f.extend_from_slice(&[VERSION, 0]);
         f.extend_from_slice(region);
         let index_offset = f.len() as u64;
-        let index = serialize_index(packs, chunks, entries);
+        let index = serialize_index(packs, chunks, entries, VERSION);
         f.extend_from_slice(&index);
         put_u64(&mut f, index_offset);
         put_u64(&mut f, index.len() as u64);
@@ -1262,6 +1525,7 @@ mod tests {
             chunks,
             entries: vec![],
             entry_chunks: vec![],
+            entry_transforms: vec![],
             crypter: None,
             pack_cache: Mutex::new(PackCache::new(PACK_CACHE_CAP)),
             budget,
@@ -1311,6 +1575,7 @@ mod tests {
                 size: 50,
                 mode: 0,
                 chunk_ids: vec![0],
+                transform: XFORM_NONE,
             },
             EntryMeta {
                 name: "b".into(),
@@ -1318,6 +1583,7 @@ mod tests {
                 size: 50,
                 mode: 0,
                 chunk_ids: vec![1],
+                transform: XFORM_NONE,
             },
             EntryMeta {
                 name: "c".into(),
@@ -1325,6 +1591,7 @@ mod tests {
                 size: 50,
                 mode: 0,
                 chunk_ids: vec![2],
+                transform: XFORM_NONE,
             },
         ];
         let f = assemble(&region, &packs, &chunks, &entries);
@@ -1384,9 +1651,10 @@ mod tests {
             size: 7,
             mode: 0o644,
             chunk_ids: vec![0, 0],
+            transform: XFORM_NONE,
         }];
-        let bytes = serialize_index(&packs, &chunks, &entries);
-        let (p, c, e) = deserialize_index(&bytes).unwrap();
+        let bytes = serialize_index(&packs, &chunks, &entries, VERSION);
+        let (p, c, e) = deserialize_index(&bytes, VERSION).unwrap();
         assert_eq!(p.len(), 1);
         assert_eq!(c[0].length, 7);
         assert_eq!(e[0].name, "dir/файл.bin");
@@ -1404,6 +1672,101 @@ mod tests {
         ));
     }
 
+    /// A small real photo-like JPEG. Generated, not sampled from anywhere, and committed so the
+    /// round-trip test always runs rather than depending on an image encoder being compiled in.
+    const SAMPLE_JPEG: &[u8] = include_bytes!("../../tests/data/sample.jpg");
+
+    /// The promise the whole feature rests on: a JPEG put into a `.cram` comes back **byte-for-byte**.
+    /// Anything less makes the space saving worthless, so this asserts the exact bytes, not just that
+    /// extraction succeeded.
+    #[test]
+    fn jpeg_recompression_round_trips_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("cram-jxform-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let jpg = dir.join("src/photo.jpg");
+        std::fs::write(&jpg, SAMPLE_JPEG).unwrap();
+        // A non-image alongside it, to prove mixed archives still work.
+        std::fs::write(dir.join("src/notes.txt"), b"plain text".repeat(50)).unwrap();
+
+        let archive = dir.join("out.cram");
+        crate::engine::create::create(
+            &archive,
+            Format::cram(crate::format::Codec::None),
+            &[dir.join("src")],
+            CreateOptions::default(), // recompression is ON by default
+            &crate::progress::NullSink,
+        )
+        .unwrap();
+
+        // The transform was actually used, so the header must have been patched to v2 — which is what
+        // makes an older reader refuse rather than emit Lepton bytes as if they were a JPEG.
+        let head = std::fs::read(&archive).unwrap();
+        assert_eq!(
+            head[6], VERSION_XFORM,
+            "an archive containing a transform must declare v2"
+        );
+
+        let reader = CramReader::open(&archive, np()).unwrap();
+        let listed = RandomAccessReader::entries(&reader);
+        let idx = listed
+            .iter()
+            .position(|e| e.name().ends_with("photo.jpg"))
+            .expect("photo is listed");
+        // The listed size is the ORIGINAL file's size, not the stored stream's.
+        assert_eq!(listed[idx].size, SAMPLE_JPEG.len() as u64);
+
+        let mut got = Vec::new();
+        reader.copy_entry(idx, &mut got).unwrap();
+        assert_eq!(got, SAMPLE_JPEG, "the exact original JPEG must come back");
+
+        // Random access (what the mount uses) must also see the reconstructed file.
+        let mid = reader.read_range(idx, 100, 64).unwrap();
+        assert_eq!(
+            mid,
+            &SAMPLE_JPEG[100..164],
+            "ranged read matches the original"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With recompression off, the same photo is stored verbatim and the archive stays v1 — so
+    /// disabling the feature really does opt out of the new format, not just the saving.
+    #[test]
+    fn recompression_can_be_disabled_and_then_stays_v1() {
+        let dir = std::env::temp_dir().join(format!("cram-jnox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/photo.jpg"), SAMPLE_JPEG).unwrap();
+
+        let archive = dir.join("out.cram");
+        crate::engine::create::create(
+            &archive,
+            Format::cram(crate::format::Codec::None),
+            &[dir.join("src")],
+            CreateOptions {
+                recompress_images: false,
+                ..Default::default()
+            },
+            &crate::progress::NullSink,
+        )
+        .unwrap();
+
+        let head = std::fs::read(&archive).unwrap();
+        assert_eq!(head[6], VERSION, "no transform used → still a v1 archive");
+
+        let reader = CramReader::open(&archive, np()).unwrap();
+        let idx = RandomAccessReader::entries(&reader)
+            .iter()
+            .position(|e| e.name().ends_with("photo.jpg"))
+            .unwrap();
+        let mut got = Vec::new();
+        reader.copy_entry(idx, &mut got).unwrap();
+        assert_eq!(got, SAMPLE_JPEG);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rejects_unknown_version_and_flags() {
         // Frozen-format forward guarantee: a newer version byte or an unknown (reserved) flag bit is
@@ -1415,8 +1778,10 @@ mod tests {
             "baseline opens"
         );
 
+        // v2 (transformed entries) is now also a version this build understands, so the "unknown
+        // version" case has to be one beyond it.
         let mut bad_ver = base.clone();
-        bad_ver[6] = VERSION + 1; // version byte
+        bad_ver[6] = VERSION_XFORM + 1;
         assert!(matches!(
             CramReader::open(&tmp(&bad_ver), np()),
             Err(ArchiveError::Corrupt(_))
@@ -1489,6 +1854,7 @@ mod tests {
             size: 500,
             mode: 0,
             chunk_ids: vec![0],
+            transform: XFORM_NONE,
         }];
         let f = assemble(&comp, &packs, &chunks, &entries);
         let reader =
@@ -1528,6 +1894,7 @@ mod tests {
             size: 500,
             mode: 0,
             chunk_ids: vec![0],
+            transform: XFORM_NONE,
         }];
         let f = assemble(&comp, &packs, &chunks, &entries);
         let reader = CramReader::open(&tmp(&f), np()).expect("open validates bounds, not contents");
@@ -1562,6 +1929,7 @@ mod tests {
             size: 999, // lie: the chunk list reconstructs only 40 bytes
             mode: 0,
             chunk_ids: vec![0],
+            transform: XFORM_NONE,
         }];
         let f = assemble(&real, &packs, &chunks, &entries);
         assert!(matches!(
@@ -1593,6 +1961,7 @@ mod tests {
             size: 30, // 3 × 10
             mode: 0,
             chunk_ids: vec![0, 0, 0],
+            transform: XFORM_NONE,
         }];
         let f = assemble(&real, &packs, &chunks, &entries);
         let reader = CramReader::open(&tmp(&f), np()).unwrap();
