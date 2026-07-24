@@ -1,0 +1,26 @@
+[package]
+name = "rdm-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Segmented, resumable, multi-source download engine (library, no GUI). Powers Cram's Downloads pane and the browser hand-off."
+
+# Shared with the sibling `rdm` project, where this engine originated. It lives INSIDE this repo
+# rather than being referenced by a path outside it: an out-of-tree `path = "../../../rdm/..."`
+# dependency makes a fresh `git clone` unbuildable — Cargo loads a path dependency's manifest during
+# workspace resolution even when that dependency is optional and its feature is off, so a missing
+# sibling checkout breaks EVERY crate in the workspace, not just the one that uses it.
+
+[lib]
+name = "rdm_core"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream"] }   # default TLS = SChannel on Windows (no C crypto)
+bytes = "1"                                             # reqwest's stream item type; carried to the writer thread
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+roxmltree = "0.20"                                      # tiny pure-Rust read-only XML parser for Metalink (.meta4/.metalink) discovery

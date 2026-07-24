@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# SECRETS — never commit these.
+#
+# Private keys (`*.key`, `*.cramkey`, `*.pem`, …) must never enter the working
+# tree — `.cramkey` files are archive-signing keys. A private key belongs OUTSIDE
+# the tree entirely; the rules below are a backstop, not the primary control.
+# ---------------------------------------------------------------------------
+*.key
+*.cramkey
+vendor.key
+*.pem
+*.pfx
+*.p12
+id_rsa*
+
+# Local env / deploy secrets.
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Node dependencies (125 MB, restore with `npm ci`).
+node_modules/
+
+# Rust build artifacts (35 GB).
+/target
+**/target/
+
+# Editor / backup files
+**/*.rs.bk
+*.swp
+*~
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local scratch / test output
+/bench/out/
+*.log
+
+# Cargo.lock is intentionally committed: this workspace ships binaries, so a locked,
+# reproducible dependency set is a feature, not noise.
+
+# Built add-on package — regenerate by zipping firefox-addon/ (identical contents).
+cram-addon.zip

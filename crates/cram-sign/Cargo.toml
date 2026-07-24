@@ -1,0 +1,23 @@
+[package]
+name = "cram-sign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Detached ed25519 signatures for any file (incl. .cram): prove authorship + integrity, not just that it decompresses"
+
+# A signature is a separate `.cramsig` file computed over the archive's bytes, so it adds no coupling to
+# — and never changes — the frozen `.cram` v1 format (or any other file). Neither 7-Zip nor WinRAR sign
+# archives; this lets a publisher vouch for exactly what a recipient downloaded.
+#
+# Lib-only: the CLI (`cli::main`) is driven by the unified `cram` binary (crates/cram-cli), which owns
+# the `sign` / `verify` / `keygen` verbs. The former standalone `cram-sign` bin was folded into it.
+[lib]
+name = "cram_sign"
+path = "src/lib.rs"
+
+[dependencies]
+# Pure-Rust ed25519 (curve25519-dalek) — no C, mingw-clean.
+ed25519-dalek = "2"
+blake3 = "1"        # hash the file once; the signature covers the hash
+getrandom = "0.2"   # OS CSPRNG for key generation (BCryptGenRandom on Windows)

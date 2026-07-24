@@ -1,0 +1,92 @@
+[package]
+name = "cram-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cram archive manager — core engine (adaptive parallelism, hardware auto-detect, codecs)"
+
+[lib]
+name = "cram_core"
+path = "src/lib.rs"
+
+# Runnable hardware auto-detect + calibration tool (internal; the unified `cram` CLI lives in cram-cli).
+[[bin]]
+name = "calibrate"
+path = "src/bin/calibrate.rs"
+
+[dependencies]
+rayon = "1.10"
+flate2 = "1.0"                                                          # DEFLATE (pure Rust)
+lzma-rust2 = { version = "0.16", features = ["encoder", "xz", "std"] }  # XZ/LZMA (pure Rust)
+num_cpus = "1.16"                                                       # physical core count
+thiserror = "2"                                                         # typed errors
+zeroize = "1"                                                           # wipe passwords from memory on drop (pure Rust)
+filetime = "0.2"                                                        # restore entry mtimes on extract (pure Rust; correct dir handling on Windows)
+crc32fast = "1"                                                         # CRC32 for `cram test` integrity verification (pure Rust)
+time = "0.3"                                                            # ZIP DOS-datetime <-> SystemTime (already compiled via zip's `time` feature)
+# ZIP read (spine) — pure-Rust features only (no C bzip2/zstd) to stay mingw-clean.
+# NOTE: use `deflate-flate2` (flate2's default miniz_oxide backend), NOT the `deflate` meta-feature —
+# that meta pulls `deflate-flate2-zlib-rs`, and zlib-rs 0.6.6 has an integer-overflow panic in inflate
+# that crashes on real-world DEFLATE streams (e.g. large game-repack .zip payloads). miniz_oxide is the
+# heavily-fuzzed pure-Rust inflate and decodes them correctly.
+zip = { version = "8", default-features = false, features = ["deflate-flate2", "aes-crypto", "time"] }
+# RAR read-only via the official UnRAR C++ engine (creating RAR is legally forbidden). Needs the
+# mingw link flags in ../../.cargo/config.toml.
+unrar = "0.5"
+tar = "0.4"                                                            # tar container (pure Rust)
+# 7z read+write — pure-Rust codecs only (mingw-clean). LZMA/LZMA2 read is always available; `compress`
+# enables the LZMA2 *encoder* for 7z create. Omit `zstd` (C lib) and `brotli` (heavy, rare in 7z).
+# `deflate` is deliberately OFF: sevenz-rust2 hard-pins flate2's `zlib-rs` backend, which would drag the
+# whole build's DEFLATE (incl. the ZIP spine above) onto buggy zlib-rs 0.6.6. DEFLATE inside a .7z is
+# rare (7z uses LZMA/LZMA2), so dropping it is worth keeping every DEFLATE path on miniz_oxide.
+sevenz-rust2 = { version = "0.21.3", default-features = false, features = [
+    "aes256",
+    "bzip2",
+    "compress",
+    "ppmd",
+    "lz4",
+    "util",
+] }
+# Niche whole-stream decoders for `.zst`/`.bz2`/`.lz4`/`.br` (+ their `.tar.*`) — all pure Rust:
+ruzstd = "0.8"       # zstd DECODE (pure Rust; a C zstd *encoder* is a later feature-gated add)
+bzip2 = "0.6"        # bzip2 — default backend is pure-Rust libbz2-rs-sys (no C bzip2-sys)
+lz4_flex = "0.13"    # lz4 frame decode (pure Rust); pinned to dedupe with sevenz-rust2's copy
+brotli = "8"         # brotli decode (pure Rust)
+
+# --- the native `.cram` content-defined-dedup format (Phase 2b) ---
+fastcdc = "3"        # FastCDC v2020 content-defined chunking (pure Rust)
+blake3 = "1"         # chunk content hashing for dedup (pure Rust)
+# `.cram` encryption (Phase 2b-B) — all pure-Rust RustCrypto, mingw-clean:
+aes-gcm = "0.10"     # AES-256-GCM per-pack AEAD
+argon2 = "0.5"       # Argon2id password → key derivation
+getrandom = "0.2"    # OS CSPRNG for salts + nonces (BCryptGenRandom on Windows)
+
+# --- Phase 4a opt-in C backends (feature-gated; default OFF, pure-Rust build stays the norm) ---
+# zstd (C) as a fast `.cram` pack codec — ruzstd only encodes at Fastest; the C lib gives full levels.
+zstd = { version = "0.13", optional = true }
+# libdeflate (C) — a faster DEFLATE inflate/deflate backend than miniz_oxide.
+libdeflater = { version = "1", optional = true }
+
+# --- extract-while-download (Feature 1b), behind the `download` feature ---
+# The rdm engine (segmented download + contiguous watermark) as a ByteSource. Opt-in (not a default)
+# so a plain cram build stays lean and skips the async/HTTP dependency tree. Note the feature gate
+# does NOT make the dependency free: Cargo loads a path dependency's manifest during workspace
+# resolution regardless of features, which is why this crate is vendored in-tree at crates/rdm-core
+# rather than referenced outside the repo. A client download opens no LISTENING socket, so this does
+# not carry the rdm-gui Defender concern (that was an unsigned GUI *listener*).
+rdm-core = { path = "../rdm-core", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+# Mirror discovery (Metalink) builds a client and calls `rdm_core::discover`. Pinned to reqwest 0.12
+# so the `Client` type unifies with rdm-core's (same crate in the graph); default TLS = SChannel on
+# Windows (no C crypto), matching rdm-core.
+reqwest = { version = "0.12", optional = true }
+# Verify a finished download against a Metalink SHA-256 (pure Rust, mingw-clean).
+sha2 = { version = "0.10", optional = true }
+
+[features]
+default = []
+download = ["dep:rdm-core", "dep:tokio", "dep:reqwest", "dep:sha2"]
+# Opt-in C backends (Phase 4a). Gated so the default build is 100% pure-Rust / always-builds.
+zstd-c = ["dep:zstd"]
+libdeflate = ["dep:libdeflater"]

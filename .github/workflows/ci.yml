@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Cram targets the GNU (mingw) toolchain: the UnRAR C++ dependency is built with g++, and
+  # .cargo/config.toml carries link flags that only apply to x86_64-pc-windows-gnu.
+  CARGO_BUILD_TARGET: x86_64-pc-windows-gnu
+
+jobs:
+  test:
+    name: build + test (windows-gnu)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the bundled MinGW toolchain to PATH
+        shell: pwsh
+        run: |
+          # The windows runner images ship mingw-w64; the linker must be reachable as x86_64-w64-mingw32-gcc.
+          $mingw = @('C:\mingw64\bin', 'C:\ProgramData\mingw64\mingw64\bin', 'C:\msys64\mingw64\bin') |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $mingw) { throw 'No MinGW toolchain found on this runner image' }
+          Add-Content -Path $env:GITHUB_PATH -Value $mingw -Encoding utf8
+          & "$mingw\gcc.exe" --version
+
+      - name: Install the Rust GNU target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      # The shipped configuration, which is not the default one: the CLI is released with the C zstd
+      # backend and the download feature on, and those code paths are otherwise never compiled here.
+      - name: Build the release configuration
+        run: |
+          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-extract
+
+      # The parsers eat untrusted input, so the fuzz smoke tests are part of the gate rather than
+      # something run by hand. They are bounded and fast; they are NOT a substitute for a real
+      # coverage-guided fuzzing campaign.
+      - name: Fuzz smoke tests
+        run: cargo test --workspace fuzz
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan the tree for credential-shaped strings
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Deliberately pattern-based and small: this catches the specific things that would be
+          # catastrophic to commit here (a private signing seed, plus payment- and email-provider API
+          # keys) rather than pretending to be a general-purpose scanner. `.gitignore` is a backstop,
+          # not the control — a pasted secret has no telltale file extension.
+          patterns=(
+            'BEGIN [A-Z ]*PRIVATE KEY'
+            'whsec_[A-Za-z0-9]{16,}'
+            'sk_(live|test)_[A-Za-z0-9]{16,}'
+            're_[A-Za-z0-9]{16,}'
+            'ghp_[A-Za-z0-9]{20,}'
+            'AKIA[0-9A-Z]{16}'
+          )
+          fail=0
+          for p in "${patterns[@]}"; do
+            if git grep -nIE "$p" -- . ':(exclude).github/workflows/ci.yml'; then
+              echo "::error::secret-shaped string matching /$p/ is committed"
+              fail=1
+            fi
+          done
+          # A bare 64-hex-char string is what an ed25519 seed looks like, and the vendor seed is the
+          # one secret here whose leak cannot be undone. Matching on a nearby keyword was tried and is
+          # weak in both directions -- it misses a constant whose name rustfmt wrapped onto the line
+          # above, and it would wave through a real seed labelled `PUBKEY`. So known-safe values are
+          # allowlisted BY VALUE, reviewably, in .github/secret-scan-allowlist.txt.
+          grep -oE '^[0-9a-fA-F]{64}$' .github/secret-scan-allowlist.txt > /tmp/approved-hex.txt || true
+          if git grep -nIE '\b[0-9a-fA-F]{64}\b' -- . \
+              ':(exclude)Cargo.lock' ':(exclude).github/secret-scan-allowlist.txt' \
+              ':(exclude).github/workflows/ci.yml' \
+            | { grep -viFf /tmp/approved-hex.txt || true; } | grep . ; then
+            echo "::error::unexplained 64-hex-character string committed. If it is safe to publish, add it to .github/secret-scan-allowlist.txt with a justification."
+            fail=1
+          fi
+          exit $fail

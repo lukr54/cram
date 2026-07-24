@@ -1,0 +1,66 @@
+#!/bin/sh
+# Cram pre-commit secret scan.
+#
+# A private signing seed pasted into a source file or a test has no `.key` extension for .gitignore to
+# match and no recognisable prefix for GitHub's push protection to catch, yet it is exactly the kind of
+# secret whose leak cannot be undone. This scans the STAGED CONTENT, which is the only thing that
+# actually ends up in history.
+#
+# Enable it (it is not automatic — git never runs hooks from a clone):
+#     git config core.hooksPath hooks
+#
+# Bypass, if you are certain: git commit --no-verify
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+fail=0
+report() {
+	echo "pre-commit: refusing to commit — $1" >&2
+	fail=1
+}
+
+for pat in \
+	'BEGIN [A-Z ]*PRIVATE KEY' \
+	'whsec_[A-Za-z0-9]\{16,\}' \
+	'sk_\(live\|test\)_[A-Za-z0-9]\{16,\}' \
+	're_[A-Za-z0-9]\{16,\}' \
+	'ghp_[A-Za-z0-9]\{20,\}' \
+	'AKIA[0-9A-Z]\{16\}'; do
+	if git diff --cached -U0 -- $staged | grep -q "^+.*$pat"; then
+		report "a staged line matches /$pat/"
+		git diff --cached -U0 -- $staged | grep -n "^+.*$pat" | head -3 >&2
+	fi
+done
+
+# A bare 64-hex-character string is the shape of an ed25519 seed. Values that are safe to publish are
+# listed BY VALUE in .github/secret-scan-allowlist.txt, each with a written justification — matching
+# on a nearby keyword instead would both miss constants whose name wrapped onto the previous line and
+# happily accept a real seed labelled `PUBKEY`.
+#
+# Cargo.lock is excluded BY PATH, not by line content: its `checksum = "…"` lines are 64 hex
+# characters each, and filtering on the words in a line never matches them (the filename appears only
+# in the diff header). Getting that wrong makes every fresh checkout fail this check for no reason.
+hexfiles=$(printf '%s\n' "$staged" | grep -vE '(^|/)(Cargo\.lock|secret-scan-allowlist\.txt)$' || true)
+if [ -n "$hexfiles" ]; then
+	APPROVED=$(mktemp)
+	grep -oE '^[0-9a-fA-F]{64}$' .github/secret-scan-allowlist.txt > "$APPROVED" 2>/dev/null || true
+	if git diff --cached -U0 -- $hexfiles \
+		| grep '^+' \
+		| { grep -viFf "$APPROVED" || true; } \
+		| grep -qE '\b[0-9a-fA-F]{64}\b'; then
+		report "a staged line contains an unexplained 64-hex-character string (an ed25519 seed looks exactly like this). If it is safe to publish, add it to .github/secret-scan-allowlist.txt with a reason."
+	fi
+	rm -f "$APPROVED"
+fi
+
+# The private key must never be inside the tree at all, whatever it is called.
+if echo "$staged" | grep -qiE '(^|/)(vendor\.key|.*\.cramkey|.*\.pem|.*\.pfx|.*\.p12)$'; then
+	report "a private-key file is staged"
+fi
+
+if [ "$fail" -ne 0 ]; then
+	echo "pre-commit: if this is a false positive, re-run with --no-verify." >&2
+	exit 1
+fi
+exit 0

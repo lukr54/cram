@@ -1,0 +1,22 @@
+[package]
+name = "cram-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone minimal .cram extractor — an independent recovery reader with no dependency on cram-core"
+
+# A single self-contained binary: read a `.cram` (per docs/CRAM_FORMAT.md v1) and extract it. It shares
+# NO code with cram-core's writer/engine on purpose — it is an independent implementation of the frozen
+# format, so it both (a) proves the spec is implementable from the document alone and (b) gives users a
+# tiny, auditable tool that can recover their data even if the main Cram build is unavailable.
+[[bin]]
+name = "cram-extract"
+path = "src/main.rs"
+
+[dependencies]
+# Decode-only, all pure-Rust (mingw-clean). No writer/chunker/hash/rayon — a reader needs none of that.
+lzma-rust2 = { version = "0.16", default-features = false, features = ["xz", "std"] } # XZ decode
+ruzstd = "0.8"    # zstd decode
+aes-gcm = "0.10"  # AES-256-GCM open (encrypted archives)
+argon2 = "0.5"    # Argon2id key derivation

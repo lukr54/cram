@@ -1,0 +1,27 @@
+[package]
+name = "cram-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cram — the single `cram` command line: list/extract/create/test/convert/download/mount/rec/sign/verify/keygen/make-sfx"
+
+# The one unified operator binary. It owns argument parsing for the archive verbs (calling cram-core's
+# engine) and delegates the sidecar/mount tools to their crates' `cli::main`. The self-extractor stub
+# (`cram-extract`) stays a separate tiny binary on purpose — `make-sfx` shells out to it.
+[[bin]]
+name = "cram"
+path = "src/main.rs"
+
+[dependencies]
+cram-core = { path = "../cram-core" }
+cram-mount = { path = "../cram-mount" }
+cram-recovery = { path = "../cram-recovery" }
+cram-sign = { path = "../cram-sign" }
+
+[features]
+default = []
+# Forward the opt-in cram-core features so `cram` can be built with them.
+download = ["cram-core/download"]
+zstd-c = ["cram-core/zstd-c"]
+libdeflate = ["cram-core/libdeflate"]
