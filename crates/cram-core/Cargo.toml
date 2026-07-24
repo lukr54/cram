@@ -68,6 +68,18 @@ getrandom = "0.2"    # OS CSPRNG for salts + nonces (BCryptGenRandom on Windows)
 zstd = { version = "0.13", optional = true }
 # libdeflate (C) — a faster DEFLATE inflate/deflate backend than miniz_oxide.
 libdeflater = { version = "1", optional = true }
+# Image decoding for `cram dedup --similar` (perceptual hashing). Pure Rust and mingw-clean; the codec
+# list is explicit so the default build doesn't drag in the whole format zoo. HEIC/HEIF and camera RAW
+# are absent because decoding them needs a C library — those files are still covered by exact-duplicate
+# detection, which never decodes anything.
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "bmp",
+    "tiff",
+    "webp",
+] }
 
 # --- extract-while-download, behind the `download` feature ---
 # The rdm engine (segmented download + contiguous watermark) as a ByteSource. Opt-in (not a default)
@@ -104,3 +116,6 @@ download = ["dep:rdm-core", "dep:tokio", "dep:reqwest", "dep:sha2"]
 # Opt-in C backends. Gated so the default build is 100% pure-Rust / always-builds.
 zstd-c = ["dep:zstd"]
 libdeflate = ["dep:libdeflater"]
+# Perceptual image hashing for `cram dedup --similar`. Pure Rust, but a large dependency tree, so it is
+# opt-in for anyone embedding the engine; the shipped CLI enables it.
+phash = ["dep:image"]

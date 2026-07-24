@@ -8,6 +8,9 @@
 //! cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format
 //! cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>]   download (segmented, multi-mirror,
 //!                                              --discover / --auto / --sha256) [--features download]
+//! cram dedup <folder|file…> [--similar]        find duplicate files across folders/drives
+//!                                              (read-only report; --similar also flags
+//!                                              visually-alike images for human review)
 //! cram mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)
 //! cram rec <create|verify|repair> <file> …     Reed-Solomon recovery sidecar
 //! cram sign|verify|keygen …                    ed25519 signing
@@ -51,6 +54,7 @@ fn main() -> ExitCode {
                 ("zstd-c", cfg!(feature = "zstd-c")),
                 ("download", cfg!(feature = "download")),
                 ("libdeflate", cfg!(feature = "libdeflate")),
+                ("phash", cfg!(feature = "phash")),
             ]
             .iter()
             .filter(|(_, on)| *on)
@@ -205,6 +209,7 @@ fn run(args: &[String]) -> Result<()> {
         Some("t") | Some("test") => test_cmd(args),
         Some("conv") | Some("convert") => convert_cmd(args),
         Some("dl") | Some("download") => download_cmd(args),
+        Some("dedup") | Some("dupes") => dedup_cmd(args),
         _ => {
             usage();
             Ok(())
@@ -233,6 +238,8 @@ fn usage() {
     eprintln!(
         "  mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)"
     );
+    eprintln!("  dedup <folder|file…> [--similar] [--min-size <bytes>] [--json]");
+    eprintln!("       find duplicate files across folders/drives — reports only, changes nothing");
     eprintln!("  rec <create|verify|repair> <file> …   Reed-Solomon recovery sidecar");
     eprintln!("  sign <file> -k <keyfile> | verify <file> [--key <hex>] | keygen <keyfile>");
     eprintln!("  make-sfx <archive.cram> <out.exe>   build a self-extracting executable");
@@ -662,6 +669,253 @@ fn test_cmd(args: &[String]) -> Result<()> {
             rep.failures.len()
         )))
     }
+}
+
+// ---- dedup -----------------------------------------------------------------------------------
+
+/// `cram dedup <paths…>` — find duplicate files across folders and drives.
+///
+/// **Read-only.** It reports; it never deletes, moves, or links anything. That is deliberate for a
+/// first release over irreplaceable data: the scan has to earn trust before it is allowed to act.
+fn dedup_cmd(args: &[String]) -> Result<()> {
+    use cram_core::engine::dedup::{self, DedupOptions, GroupKind};
+
+    let roots: Vec<PathBuf> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            *i >= 2
+                && !a.starts_with("--")
+                && !matches!(
+                    args.get(i.wrapping_sub(1)).map(|s| s.as_str()),
+                    Some("--min-size") | Some("--similar-distance")
+                )
+        })
+        .map(|(_, a)| PathBuf::from(a))
+        .collect();
+    if roots.is_empty() {
+        eprintln!(
+            "usage: cram dedup <folder|file…> [--similar [--similar-distance <0-15>]] \
+             [--min-size <bytes>] [--json]"
+        );
+        return Err(cram_core::error::ArchiveError::Backend(
+            "no paths given".into(),
+        ));
+    }
+    let json = args.iter().any(|a| a == "--json");
+    let opts = DedupOptions {
+        min_size: args
+            .iter()
+            .position(|a| a == "--min-size")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1),
+        similar_images: args.iter().any(|a| a == "--similar"),
+        similar_distance: args
+            .iter()
+            .position(|a| a == "--similar-distance")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(dedup::similar::DEFAULT_DISTANCE),
+    };
+    if opts.similar_images && !cfg!(feature = "phash") {
+        eprintln!(
+            "cram: this build has no image support, so --similar can't run \
+             (rebuild with --features phash). Exact duplicates are unaffected."
+        );
+    }
+
+    // A scan can run for hours over a large pile, so report progress to stderr — which also keeps
+    // `--json` on stdout clean and pipeable.
+    let prog = Arc::new(cram_core::progress::Progress::new(0, 0));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Only animate for a human at a terminal: redirected to a file or a pipe, the carriage returns
+    // would be written literally and corrupt the output being captured.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let ticker = {
+        let (prog, done) = (prog.clone(), done.clone());
+        std::thread::spawn(move || {
+            while interactive && !done.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                eprint!("\r  scanning… {} read", bytes_human(prog.done_bytes()));
+            }
+        })
+    };
+
+    let t0 = Instant::now();
+    let result = dedup::scan(&roots, &opts, prog.as_ref());
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = ticker.join();
+    if interactive {
+        eprint!("\r{:60}\r", ""); // wipe the ticker line
+    }
+    let rep = result?;
+    let secs = t0.elapsed().as_secs_f64();
+
+    if json {
+        print_dedup_json(&rep);
+        return Ok(());
+    }
+
+    println!(
+        "Scanned {} files ({}) in {:.1}s — read {} to be certain.",
+        thousands(rep.files_scanned),
+        bytes_human(rep.bytes_scanned),
+        secs,
+        bytes_human(rep.bytes_hashed)
+    );
+    if rep.unreadable > 0 {
+        println!(
+            "{} file(s) could not be read and were skipped.",
+            rep.unreadable
+        );
+    }
+
+    let exact: Vec<_> = rep.exact_groups().collect();
+    if exact.is_empty() {
+        println!("\nNo byte-identical duplicates found.");
+    } else {
+        println!(
+            "\n{} duplicate set(s) · {} redundant cop(ies) · {} reclaimable",
+            thousands(exact.len() as u64),
+            thousands(rep.redundant_files()),
+            bytes_human(rep.reclaimable())
+        );
+        for g in exact.iter().take(50) {
+            println!(
+                "\n  {} reclaimable · {} copies × {}",
+                bytes_human(g.reclaimable),
+                g.files.len(),
+                bytes_human(g.files.first().map(|f| f.size).unwrap_or(0))
+            );
+            for f in &g.files {
+                println!("      {}", f.path.display());
+            }
+        }
+        if exact.len() > 50 {
+            println!(
+                "\n  … and {} more set(s). Use --json for the full list.",
+                exact.len() - 50
+            );
+        }
+    }
+
+    let similar: Vec<_> = rep.similar_groups().collect();
+    if !similar.is_empty() {
+        println!(
+            "\n{} set(s) of visually similar images — REVIEW BY HAND.",
+            thousands(similar.len() as u64)
+        );
+        println!(
+            "These are NOT byte-identical; they may be different shots. Nothing here is safe to"
+        );
+        println!("delete automatically, so no space is counted as reclaimable.");
+        for g in similar.iter().take(25) {
+            println!("\n  {} similar images", g.files.len());
+            for f in &g.files {
+                println!("      {} ({})", f.path.display(), bytes_human(f.size));
+            }
+        }
+        if similar.len() > 25 {
+            println!(
+                "\n  … and {} more set(s). Use --json for the full list.",
+                similar.len() - 25
+            );
+        }
+    }
+
+    if rep.cancelled {
+        println!("\nScan was cancelled — the results above cover only what was scanned.");
+    }
+    println!("\nNothing was changed: `dedup` only reports.");
+    let _ = GroupKind::Exact; // keeps the import honest if the loops above are ever refactored
+    Ok(())
+}
+
+/// Machine-readable report. Hand-rolled because cram-cli deliberately has no serde dependency.
+fn print_dedup_json(rep: &cram_core::engine::dedup::DedupReport) {
+    fn esc(s: &str) -> String {
+        let mut o = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            match c {
+                '"' => o.push_str("\\\""),
+                '\\' => o.push_str("\\\\"),
+                '\n' => o.push_str("\\n"),
+                '\r' => o.push_str("\\r"),
+                '\t' => o.push_str("\\t"),
+                c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                c => o.push(c),
+            }
+        }
+        o
+    }
+    println!("{{");
+    println!("  \"filesScanned\": {},", rep.files_scanned);
+    println!("  \"bytesScanned\": {},", rep.bytes_scanned);
+    println!("  \"bytesRead\": {},", rep.bytes_hashed);
+    println!("  \"unreadable\": {},", rep.unreadable);
+    println!("  \"reclaimableBytes\": {},", rep.reclaimable());
+    println!("  \"cancelled\": {},", rep.cancelled);
+    println!("  \"groups\": [");
+    for (gi, g) in rep.groups.iter().enumerate() {
+        let kind = match g.kind {
+            cram_core::engine::dedup::GroupKind::Exact => "exact",
+            cram_core::engine::dedup::GroupKind::Similar => "similar",
+        };
+        println!("    {{");
+        println!("      \"kind\": \"{kind}\",");
+        println!("      \"reclaimableBytes\": {},", g.reclaimable);
+        println!("      \"files\": [");
+        for (fi, f) in g.files.iter().enumerate() {
+            let comma = if fi + 1 == g.files.len() { "" } else { "," };
+            println!(
+                "        {{ \"path\": \"{}\", \"size\": {} }}{comma}",
+                esc(&f.path.to_string_lossy()),
+                f.size
+            );
+        }
+        println!("      ]");
+        println!(
+            "    }}{}",
+            if gi + 1 == rep.groups.len() { "" } else { "," }
+        );
+    }
+    println!("  ]");
+    println!("}}");
+}
+
+/// Byte count in the largest unit that keeps it readable.
+fn bytes_human(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else if v >= 100.0 {
+        format!("{:.0} {}", v, UNITS[u])
+    } else {
+        format!("{:.1} {}", v, UNITS[u])
+    }
+}
+
+/// Thousands separators, so a six-figure file count is readable at a glance.
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Positional inputs for `create` = every arg after the archive that isn't a flag or a flag value.

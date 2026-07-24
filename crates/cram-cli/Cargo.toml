@@ -26,3 +26,5 @@ default = []
 download = ["cram-core/download"]
 zstd-c = ["cram-core/zstd-c"]
 libdeflate = ["cram-core/libdeflate"]
+# Perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos.
+phash = ["cram-core/phash"]

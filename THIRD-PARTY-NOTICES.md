@@ -259,5 +259,5 @@ build (`about.toml` and `about.hbs` in this repo drive it):
 ```bash
 cargo install cargo-about --locked --features cli
 cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
-  -m crates/cram-cli/Cargo.toml --features "download zstd-c"
+  -m crates/cram-cli/Cargo.toml --features "download zstd-c phash"
 ```

@@ -123,6 +123,7 @@ Optional features are opt-in, so the base build always compiles on a bare mingw 
 | `zstd-c` | full-range zstd encoder (C libzstd), and the default `.cram` pack codec once enabled. Without it, `.cram` packs use pure-Rust XZ. |
 | `download` | enables the `cram dl` segmented downloader. It is a client and opens no listening socket. |
 | `libdeflate` | a faster DEFLATE backend (C libdeflate). |
+| `phash` | perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos. Pure Rust, but a large dependency tree, hence opt-in. |
 
 ```sh
 cargo build --release -p cram-cli --features zstd-c,download
@@ -132,7 +133,8 @@ cargo build --release -p cram-cli --features zstd-c,download
 writes different `.cram` bytes than the pure-Rust default, so it is worth checking before comparing
 two archives.
 
-Run the tests with `cargo test`; that is 149 tests across the workspace. `cargo fmt --all -- --check`
+Run the tests with `cargo test`; that is 156 tests across the workspace (157 with `--features
+cram-cli/phash`, which adds the perceptual-hash test). `cargo fmt --all -- --check`
 and `cargo clippy --workspace --all-targets -- -D warnings` are clean. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -162,6 +164,9 @@ cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <
                                                   one file. --discover finds mirrors, --auto ramps
                                                   connections, --sha256 <hex> verifies. Needs a
                                                   build with the `download` feature.
+cram dedup <folder|file…> [--similar]             find duplicate files across folders and drives
+           [--similar-distance <0-15>]            (read-only report). --similar also flags
+           [--min-size <bytes>] [--json]          visually-alike images for human review.
 cram mount [--selftest] [-p <pw>] <archive> <dir> mount as a virtual folder (ProjFS)
 cram rec <create|verify|repair> <file> …          Reed-Solomon recovery sidecar (.cramrec)
 cram sign <file> -k <keyfile>                     write a detached ed25519 signature (.cramsig)
@@ -179,6 +184,37 @@ cram --version                                    version + which optional featu
 - `--encrypt-names` (7z and `.cram` only) hides the file listing as well as the contents.
 - The format on create is chosen from the output extension (`.zip` / `.7z` / `.cram` /
   `.tar[.gz|.xz|.bz2|.lz4|.br|.zst]`).
+
+### Finding duplicates across drives
+
+`cram dedup` answers a different question from the rest of the tool: not "how do I pack this up" but
+"how much of this pile is the same file twice". It is aimed at the case where a large collection has
+accreted over years and drives — the same photo under a dozen random names, in folders nobody
+remembers copying.
+
+```sh
+cram dedup D:\photos E:\backup F:\old-drive
+```
+
+**It only reports.** Nothing is deleted, moved, or linked. The output is duplicate sets, largest
+saving first, and the total space you would get back by keeping one copy of each.
+
+It is built to stay cheap on collections far too large to hash end to end. Three gates run in order:
+a file whose **size** is unique in the whole set cannot have a byte-identical twin and is never read
+at all; same-size files are separated by a **partial hash** of their first and last 64 KiB; only what
+survives both is read in full and confirmed with **BLAKE3**. On a real pile the vast majority of bytes
+are never touched — the run prints how much it actually had to read. Reads are also scheduled per
+drive: every volume is worked at once, but with one sequential reader on a spinning disk and several
+on an SSD, because parallel reads make an HDD slower rather than faster.
+
+`--similar` additionally finds images that *look* the same without being byte-identical — a resized
+copy, a re-save at lower quality, the version a messaging app recompressed. These are reported
+**separately and are never counted as reclaimable space**, because a perceptual hash cannot tell a
+redundant re-encode from two genuinely different frames of a burst. Treat them as a shortlist to look
+through by hand, not as a delete list. `--similar-distance` tunes how alike is alike (0 = identical
+hash, default 8); it needs a build with the `phash` feature. HEIC/HEIF and camera RAW are not decoded
+for similarity (that needs a C library), though they are still covered by exact-duplicate detection,
+which never decodes anything.
 
 ### What a damaged archive does
 

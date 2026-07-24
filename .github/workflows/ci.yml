@@ -47,7 +47,7 @@ jobs:
       # backend and the download feature on, and those code paths are otherwise never compiled here.
       - name: Build the release configuration
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-cli --features download,zstd-c,phash
           cargo build --release -p cram-extract
 
       # The parsers eat untrusted input, so the fuzz smoke tests are part of the gate rather than
@@ -86,7 +86,7 @@ jobs:
       # resolves reqwest to rustls (no system OpenSSL), per the per-OS split in the crate manifests.
       - name: Build the release configuration
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-cli --features download,zstd-c,phash
           cargo build --release -p cram-extract
 
       - name: Fuzz smoke tests
@@ -166,7 +166,7 @@ jobs:
 
       - name: Build the shipped binaries
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-cli --features download,zstd-c,phash
           cargo build --release -p cram-extract
 
       - name: Stage the distributable
@@ -218,7 +218,7 @@ jobs:
 
       - name: Build the shipped binaries
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-cli --features download,zstd-c,phash
           cargo build --release -p cram-extract
 
       - name: Stage the distributable
