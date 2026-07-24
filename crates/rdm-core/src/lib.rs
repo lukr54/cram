@@ -17,9 +17,8 @@
 //!     lowest-index pending chunk so the frontier advances fast despite out-of-order writes.
 
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -34,6 +33,24 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Semaphore;
 
 pub type Err = Box<dyn std::error::Error + Send + Sync>;
+
+/// Positional write at an explicit offset without disturbing the file's implicit cursor. Windows
+/// exposes this as `seek_write` and Unix as `write_at` (the Windows call advances the cursor, the Unix
+/// one doesn't — but the writer thread always passes an explicit offset, so the two are equivalent).
+trait PositionalIo {
+    fn pwrite(&self, buf: &[u8], off: u64) -> std::io::Result<usize>;
+}
+
+impl PositionalIo for File {
+    #[cfg(windows)]
+    fn pwrite(&self, buf: &[u8], off: u64) -> std::io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_write(self, buf, off)
+    }
+    #[cfg(unix)]
+    fn pwrite(&self, buf: &[u8], off: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::write_at(self, buf, off)
+    }
+}
 
 pub mod discover;
 pub use discover::{discover, Discovered};
@@ -771,7 +788,7 @@ async fn run(
                     WriteMsg::Data { offset, bytes } => {
                         let mut w = 0usize;
                         while w < bytes.len() {
-                            match file.seek_write(&bytes[w..], offset + w as u64) {
+                            match file.pwrite(&bytes[w..], offset + w as u64) {
                                 Ok(0) => {
                                     result = Err("disk write returned 0 bytes".into());
                                     break;
@@ -1379,8 +1396,8 @@ mod net_tests {
                 .open(&out)
                 .unwrap();
             f.set_len(total).unwrap();
-            f.seek_write(&body(0, mib - 1), 0).unwrap();
-            f.seek_write(&body(2 * mib, 3 * mib - 1), 2 * mib).unwrap();
+            f.pwrite(&body(0, mib - 1), 0).unwrap();
+            f.pwrite(&body(2 * mib, 3 * mib - 1), 2 * mib).unwrap();
         }
         let snap = Sidecar {
             total,

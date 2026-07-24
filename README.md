@@ -75,6 +75,19 @@ Prebuilt Windows x86-64 binaries — `cram.exe` and `cram-extract.exe` — are a
 at <https://github.com/lukr54/cram/releases>. They are **not code-signed**, so SmartScreen will warn
 on first run (see [Limitations](#limitations)).
 
+### Linux
+
+The `cram` CLI runs on Linux x86-64. Install the latest release binary with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lukr54/cram/master/install.sh | sh
+```
+
+That drops `cram` into `~/.local/bin` (no root, no daemon, nothing else touched); re-run it to upgrade.
+Prefer to read before you pipe to a shell? Download [`install.sh`](install.sh), read it, then run it.
+The Linux tarball is also attached to each release if you'd rather place the binary yourself. Archive
+**mount** (`cram mount`) is Windows-only (it uses ProjFS); every other verb works identically on Linux.
+
 ### Building from source
 
 Cram targets **`x86_64-pc-windows-gnu`** (WinLibs mingw / GCC). No MSVC toolchain is used or
@@ -93,6 +106,15 @@ That produces, in `target/release/`:
 
 Deploying either binary also needs `libwinpthread-1.dll` alongside it (it lives on the mingw PATH
 during development).
+
+On **Linux**, the toolchain is just a system C/C++ compiler (`build-essential` — g++ builds the UnRAR
+dependency) and a stable Rust toolchain; there is no mingw and no bundled DLL. Build the same way:
+
+```sh
+cargo build --release -p cram-cli -p cram-extract
+```
+
+The downloader's TLS uses pure-Rust rustls on Linux, so the binary needs no system OpenSSL.
 
 Optional features are opt-in, so the base build always compiles on a bare mingw toolchain:
 

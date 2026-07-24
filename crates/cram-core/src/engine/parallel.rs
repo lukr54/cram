@@ -228,8 +228,10 @@ mod dest_race_tests {
     use std::sync::Arc;
 
     /// Case-variant names (`A.txt` / `a.txt`) resolve to ONE file on NTFS, so only the LAST entry
-    /// may be scheduled. Guards against: two workers racing the same destination and interleaving
-    /// their write blocks into silent corruption.
+    /// may be scheduled — guarding against two workers racing the same destination and interleaving
+    /// their write blocks into silent corruption. On a case-sensitive filesystem (Linux) the two are
+    /// distinct files, so both are written and nothing is shadowed; the assertions below check the
+    /// behaviour that matches the target filesystem, since `dest_key` folds accordingly.
     #[test]
     fn duplicate_destinations_are_deduped_last_wins() {
         use zip::write::SimpleFileOptions;
@@ -258,16 +260,35 @@ mod dest_race_tests {
         let report = run(ra, &out, 4, false, &NullSink).unwrap();
 
         assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
-        assert_eq!(report.extracted, 1, "only the winning duplicate is written");
-        assert_eq!(
-            report.skipped, 1,
-            "the shadowed duplicate is surfaced as skipped"
-        );
-        // Whatever the filesystem's case behavior, the LAST entry's content must be what's on disk.
-        let got = fs::read(out.join("a.txt"))
-            .or_else(|_| fs::read(out.join("A.txt")))
-            .unwrap();
-        assert_eq!(got, b"last-writer-wins");
+        #[cfg(windows)]
+        {
+            // NTFS is case-insensitive: `A.txt` and `a.txt` are ONE destination, so only the last
+            // survives and the shadowed entry is surfaced as skipped.
+            assert_eq!(report.extracted, 1, "only the winning duplicate is written");
+            assert_eq!(
+                report.skipped, 1,
+                "the shadowed duplicate is surfaced as skipped"
+            );
+            let got = fs::read(out.join("a.txt"))
+                .or_else(|_| fs::read(out.join("A.txt")))
+                .unwrap();
+            assert_eq!(got, b"last-writer-wins");
+        }
+        #[cfg(not(windows))]
+        {
+            // Case-sensitive filesystem: the two names are distinct files, so both are written and
+            // nothing is shadowed — each keeps its own content.
+            assert_eq!(
+                report.extracted, 2,
+                "both case-distinct entries are written"
+            );
+            assert_eq!(
+                report.skipped, 0,
+                "nothing is shadowed on a case-sensitive fs"
+            );
+            assert_eq!(fs::read(out.join("A.txt")).unwrap(), vec![b'A'; 300_000]);
+            assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"last-writer-wins");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

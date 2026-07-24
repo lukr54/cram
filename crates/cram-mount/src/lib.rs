@@ -11,10 +11,14 @@
 //! Uses the MIT/Apache `windows` crate's ProjFS bindings (no GPL `windows-projfs`); the binding
 //! links on the mingw toolchain. Non-Windows targets get a stub `mount` that errors.
 
+// The directory model below is consumed by the Windows ProjFS provider and by the unit tests; on a
+// non-Windows, non-test build it is intentionally absent, so its imports are gated the same way.
+#[cfg(any(windows, test))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use cram_core::error::Result;
+#[cfg(any(windows, test))]
 use cram_core::reader::RandomAccessReader;
 use cram_core::secret::PasswordProvider;
 use std::sync::Arc;
@@ -90,6 +94,7 @@ pub fn mount(_archive: &Path, _root: &Path, _pw: Arc<dyn PasswordProvider>) -> R
 /// Build the browsable directory model from a random-access reader's entry list: a per-directory
 /// child list (for enumeration) and a path→entry lookup (for placeholder info + file data). Shared
 /// by the real mount and unit tests. Paths use forward slashes, no leading/trailing slash.
+#[cfg(any(windows, test))]
 pub(crate) struct DirModel {
     /// dir path (e.g. "" for root, "src", "src/sub") → its immediate children.
     pub tree: HashMap<String, Vec<Child>>,
@@ -97,6 +102,7 @@ pub(crate) struct DirModel {
     pub lookup: HashMap<String, EntryInfo>,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone)]
 pub(crate) struct Child {
     pub name: String,
@@ -104,6 +110,7 @@ pub(crate) struct Child {
     pub size: u64,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy)]
 pub(crate) struct EntryInfo {
     pub is_dir: bool,
@@ -117,10 +124,12 @@ pub(crate) struct EntryInfo {
 /// consistently is what makes case-variant ancestor dirs (`src/a` + `SRC/b`) merge into one node
 /// holding both files instead of orphaning one — the mount serves ProjFS's enumerated names, which
 /// we fold the same way on the way back in (`path_of`), so both sides always agree.
+#[cfg(any(windows, test))]
 pub(crate) fn fold(s: &str) -> String {
     s.to_lowercase()
 }
 
+#[cfg(any(windows, test))]
 impl DirModel {
     pub(crate) fn build(reader: &dyn RandomAccessReader) -> Self {
         let mut tree: HashMap<String, Vec<Child>> = HashMap::new();
@@ -201,6 +210,7 @@ impl DirModel {
     }
 }
 
+#[cfg(any(windows, test))]
 fn add_child(
     tree: &mut HashMap<String, Vec<Child>>,
     parent: &str,
@@ -225,6 +235,7 @@ fn add_child(
 /// pathologically deep entry path in a hostile archive can't overflow the stack (recursion here
 /// would grow one frame per path component). Works on borrowed slices of `dir`, so no per-level
 /// allocation either. (`EntryPath::from_raw` also caps path depth, but this stays safe regardless.)
+#[cfg(any(windows, test))]
 fn ensure_ancestors(
     tree: &mut HashMap<String, Vec<Child>>,
     lookup: &mut HashMap<String, EntryInfo>,

@@ -110,7 +110,10 @@ mod tests {
         // Two identical files, each well above CHUNK_MAX so they split into several chunks.
         let blob = vec![0x5Au8; 700 * 1024];
         for name in ["a.bin", "b.bin"] {
-            File::create(dir.join(name)).unwrap().write_all(&blob).unwrap();
+            File::create(dir.join(name))
+                .unwrap()
+                .write_all(&blob)
+                .unwrap();
         }
 
         let sink = Progress::new(0, 0);
@@ -122,8 +125,16 @@ mod tests {
         // (allow one chunk of slack for content-defined boundary effects).
         let one = blob.len() as u64;
         let slack = CHUNK_MAX as u64;
-        assert!(est.unique_bytes <= one + slack, "unique {} should be ~one copy", est.unique_bytes);
-        assert!(est.saved() >= one - slack, "saved {} should be ~one copy", est.saved());
+        assert!(
+            est.unique_bytes <= one + slack,
+            "unique {} should be ~one copy",
+            est.unique_bytes
+        );
+        assert!(
+            est.saved() >= one - slack,
+            "saved {} should be ~one copy",
+            est.saved()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

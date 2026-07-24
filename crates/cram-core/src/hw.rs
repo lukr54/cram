@@ -10,13 +10,14 @@
 //!
 //! [`derive_plan`] combines them into a [`Plan`] (workers, writers, pipeline shape, buffers, …).
 
-use std::ffi::c_void;
 use std::io::{self, Write};
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
 use std::path::Path;
-use std::ptr;
 use std::time::Instant;
+
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::ptr;
 
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
@@ -24,10 +25,12 @@ use flate2::Compression;
 use lzma_rust2::{XzOptions, XzReader, XzWriter};
 
 // ===========================================================================================
-// Win32 FFI (raw kernel32 — no windows-crate feature-flag surface; every detection degrades
-// gracefully to a safe default on failure, so a wrong volume / missing permission never panics).
+// Hardware detection — platform layer. Windows uses raw kernel32 FFI; Unix reads /proc + /sys +
+// statvfs. Every probe degrades to a safe default on failure, so a wrong volume / missing
+// permission / absent sysfs never panics — detection is only advisory input to the parallel planner.
 // ===========================================================================================
 
+#[cfg(windows)]
 #[repr(C)]
 struct MemoryStatusEx {
     length: u32,
@@ -41,6 +44,7 @@ struct MemoryStatusEx {
     avail_ext_virtual: u64,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DiskExtent {
@@ -49,12 +53,14 @@ struct DiskExtent {
     extent_length: i64,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct VolumeDiskExtents {
     number_of_disk_extents: u32,
     extents: [DiskExtent; 16],
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct StoragePropertyQuery {
     property_id: u32,
@@ -62,6 +68,7 @@ struct StoragePropertyQuery {
     additional_parameters: [u8; 1],
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct DeviceSeekPenaltyDescriptor {
     version: u32,
@@ -69,15 +76,24 @@ struct DeviceSeekPenaltyDescriptor {
     incurs_seek_penalty: u8,
 }
 
+#[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x1;
+#[cfg(windows)]
 const FILE_SHARE_WRITE: u32 = 0x2;
+#[cfg(windows)]
 const OPEN_EXISTING: u32 = 3;
+#[cfg(windows)]
 const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
+#[cfg(windows)]
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002d_1400;
+#[cfg(windows)]
 const STORAGE_DEVICE_PROPERTY: u32 = 0;
+#[cfg(windows)]
 const STORAGE_SEEK_PENALTY_PROPERTY: u32 = 7;
+#[cfg(windows)]
 const PROPERTY_STANDARD_QUERY: u32 = 0;
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn GetDiskFreeSpaceExW(
@@ -90,35 +106,174 @@ extern "system" {
         name: *const u16,
         access: u32,
         share: u32,
-        sec: *mut c_void,
+        sec: *mut std::ffi::c_void,
         disposition: u32,
         flags: u32,
-        template: *mut c_void,
-    ) -> *mut c_void;
+        template: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
     fn DeviceIoControl(
-        h: *mut c_void,
+        h: *mut std::ffi::c_void,
         code: u32,
-        in_buf: *const c_void,
+        in_buf: *const std::ffi::c_void,
         in_size: u32,
-        out_buf: *mut c_void,
+        out_buf: *mut std::ffi::c_void,
         out_size: u32,
         returned: *mut u32,
-        overlapped: *mut c_void,
+        overlapped: *mut std::ffi::c_void,
     ) -> i32;
-    fn CloseHandle(h: *mut c_void) -> i32;
+    fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
     fn GetVolumePathNameW(name: *const u16, out: *mut u16, len: u32) -> i32;
     fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
-    fn FlushFileBuffers(h: *mut c_void) -> i32;
 }
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
     std::ffi::OsStr::new(s)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
 }
-fn is_bad(h: *mut c_void) -> bool {
+#[cfg(windows)]
+fn is_bad(h: *mut std::ffi::c_void) -> bool {
     h.is_null() || h as isize == -1
+}
+
+// -------------------------------------------------------------------------------------------
+// Unix (Linux-first) detection: RAM from /proc/meminfo, drive media/bus from /sys/block, free
+// space via statvfs. Absent sysfs (containers, non-Linux unix) yields safe "unknown" defaults.
+// -------------------------------------------------------------------------------------------
+#[cfg(unix)]
+mod unix_platform {
+    use super::Bus;
+    use std::path::Path;
+
+    /// (total, available) physical RAM in bytes from /proc/meminfo; (0, 0) if unreadable.
+    pub(super) fn memory() -> (u64, u64) {
+        match std::fs::read_to_string("/proc/meminfo") {
+            Ok(t) => super::parse_meminfo(&t),
+            Err(_) => (0, 0),
+        }
+    }
+
+    /// The whole-disk device backing `path`, packed major:minor into a u32. Two paths on the same
+    /// physical disk return the same value (all `topology`/`detect` rely on); empty on any failure.
+    pub fn physical_drives_for_path(path: &str) -> Vec<u32> {
+        match backing_disk(Path::new(path)) {
+            Some((id, _)) => vec![id],
+            None => Vec::new(),
+        }
+    }
+
+    /// `Some(true)` = spinning disk (seek penalty); `Some(false)` = SSD; `None` = unknown. Read from
+    /// /sys/block/<disk>/queue/rotational.
+    pub(super) fn drive_seek_penalty(id: u32) -> Option<bool> {
+        let name = disk_name_for_id(id)?;
+        let rot = std::fs::read_to_string(format!("/sys/block/{name}/queue/rotational")).ok()?;
+        match rot.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Bus class inferred from the kernel device name — enough to seed the write-ceiling prior.
+    pub(super) fn drive_bus_type(id: u32) -> Bus {
+        match disk_name_for_id(id) {
+            Some(n) if n.starts_with("nvme") => Bus::Nvme,
+            Some(n) if n.starts_with("sd") => Bus::Sata, // SATA/SAS/USB all surface as sdX
+            Some(_) => Bus::Other,
+            None => Bus::Unknown,
+        }
+    }
+
+    /// Free space (MiB) available to a non-root user on the filesystem holding `dir`, via statvfs.
+    pub fn free_space_mib(dir: &Path) -> Option<u64> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid zeroed statvfs; its fields are read only after a success (0) return.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let bytes = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+        Some(bytes / (1024 * 1024))
+    }
+
+    // ---- path -> backing whole-disk resolution via sysfs ----
+
+    /// Resolve `path` to its backing whole disk: stat the path for its device number, find the sysfs
+    /// block node, and climb from a partition to its parent disk. Returns (packed id, kernel name).
+    fn backing_disk(path: &Path) -> Option<(u32, String)> {
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(path).ok()?.dev();
+        let (maj, min) = (major(dev), minor(dev));
+        let mut cur = std::fs::canonicalize(format!("/sys/dev/block/{maj}:{min}")).ok()?;
+        if cur.join("partition").exists() {
+            cur = cur.parent()?.to_path_buf();
+        }
+        let name = cur.file_name()?.to_str()?.to_string();
+        let id = std::fs::read_to_string(cur.join("dev"))
+            .ok()
+            .and_then(|s| pack_dev(s.trim()))
+            .unwrap_or_else(|| pack(maj, min));
+        Some((id, name))
+    }
+
+    /// Recover a disk's kernel name from a packed id by scanning /sys/block.
+    fn disk_name_for_id(id: u32) -> Option<String> {
+        for entry in std::fs::read_dir("/sys/block").ok()?.flatten() {
+            if let Ok(dev) = std::fs::read_to_string(entry.path().join("dev")) {
+                if pack_dev(dev.trim()) == Some(id) {
+                    return entry.file_name().to_str().map(|s| s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn pack(maj: u64, min: u64) -> u32 {
+        (((maj & 0xfff) as u32) << 20) | ((min as u32) & 0x000f_ffff)
+    }
+    fn pack_dev(s: &str) -> Option<u32> {
+        let (maj, min) = s.split_once(':')?;
+        Some(pack(maj.parse().ok()?, min.parse().ok()?))
+    }
+    // glibc/musl dev_t major/minor encoding.
+    fn major(dev: u64) -> u64 {
+        ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfffu64)
+    }
+    fn minor(dev: u64) -> u64 {
+        (dev & 0xff) | ((dev >> 12) & !0xffu64)
+    }
+}
+
+#[cfg(unix)]
+use unix_platform::{drive_bus_type, drive_seek_penalty, memory};
+#[cfg(unix)]
+pub use unix_platform::{free_space_mib, physical_drives_for_path};
+
+/// Extract total/available physical RAM (bytes) from a `/proc/meminfo` body. Kept OS-agnostic (and
+/// compiled under `test`) so the parsing — the error-prone part — is unit-tested even on a host that
+/// has no `/proc`. The `MemAvailable` field is the kernel's own estimate of allocatable RAM.
+#[cfg(any(unix, test))]
+fn parse_meminfo(text: &str) -> (u64, u64) {
+    fn kib(v: &str) -> u64 {
+        v.split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .map(|k| k * 1024)
+            .unwrap_or(0)
+    }
+    let (mut total, mut avail) = (0u64, 0u64);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("MemTotal:") {
+            total = kib(v);
+        } else if let Some(v) = line.strip_prefix("MemAvailable:") {
+            avail = kib(v);
+        }
+    }
+    (total, avail)
 }
 
 // ===========================================================================================
@@ -209,6 +364,7 @@ impl HwProfile {
     }
 }
 
+#[cfg(windows)]
 fn memory() -> (u64, u64) {
     let mut ms: MemoryStatusEx = unsafe { std::mem::zeroed() };
     ms.length = std::mem::size_of::<MemoryStatusEx>() as u32;
@@ -221,6 +377,7 @@ fn memory() -> (u64, u64) {
 }
 
 /// PhysicalDrive numbers backing a filesystem path (handles spanned/striped volumes).
+#[cfg(windows)]
 pub fn physical_drives_for_path(path: &str) -> Vec<u32> {
     // path -> mount point (e.g. "C:\")
     let wp = wide(path);
@@ -281,6 +438,7 @@ fn drive_info(number: u32) -> DriveInfo {
 }
 
 /// `Some(true)` = incurs seek penalty (HDD); `Some(false)` = SSD; `None` = unknown.
+#[cfg(windows)]
 fn drive_seek_penalty(n: u32) -> Option<bool> {
     let dev = format!(r"\\.\PhysicalDrive{}", n);
     let wd = wide(&dev);
@@ -325,6 +483,7 @@ fn drive_seek_penalty(n: u32) -> Option<bool> {
     }
 }
 
+#[cfg(windows)]
 fn drive_bus_type(n: u32) -> Bus {
     let dev = format!(r"\\.\PhysicalDrive{}", n);
     let wd = wide(&dev);
@@ -829,7 +988,6 @@ pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
     let win_mib: usize = (cap_mib / 4).clamp(32, 512);
     let path = dir.join(".cram_writeprobe.tmp");
     let mut f = std::fs::File::create(&path)?;
-    let handle: *mut c_void = f.as_raw_handle();
     let block = vec![0xA5u8; 8 * MIB];
     let mut windows: Vec<f64> = Vec::new();
     let mut peak = 0.0f64;
@@ -849,7 +1007,7 @@ pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
             win_bytes += block.len();
             written_mib += 8;
             if win_bytes >= win_mib * MIB {
-                unsafe { FlushFileBuffers(handle) }; // force to media, not the OS cache
+                let _ = f.sync_data(); // force to media, not the OS cache
                 let secs = win_start.elapsed().as_secs_f64().max(1e-9);
                 let mibs = (win_bytes as f64 / MIB as f64) / secs;
                 windows.push(mibs);
@@ -872,7 +1030,7 @@ pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
         }
         Ok(())
     })();
-    unsafe { FlushFileBuffers(handle) };
+    let _ = f.sync_data();
     drop(f);
     let _ = std::fs::remove_file(&path);
     run?;
@@ -918,6 +1076,7 @@ pub fn measure_write_wall(dir: &Path, cap_mib: usize) -> io::Result<WriteWall> {
 
 /// Free space available to this user on the volume containing `dir`, in MiB. Used to refuse a write
 /// probe on a drive that can't spare the room — a calibration must never be what fills someone's disk.
+#[cfg(windows)]
 pub fn free_space_mib(dir: &Path) -> Option<u64> {
     let w = wide(dir.to_str()?);
     let mut free_to_caller: u64 = 0;
@@ -928,8 +1087,20 @@ pub fn free_space_mib(dir: &Path) -> Option<u64> {
     (ok != 0).then_some(free_to_caller / (1024 * 1024))
 }
 
+#[cfg(windows)]
 pub fn profile_path() -> Option<std::path::PathBuf> {
     std::env::var_os("APPDATA").map(|a| Path::new(&a).join("cram").join("profile.toml"))
+}
+
+/// Per-user profile location on Unix: `$XDG_CONFIG_HOME/cram/profile.toml`, falling back to
+/// `~/.config/cram/profile.toml` — the standard spot for a CLI tool's cached state.
+#[cfg(unix)]
+pub fn profile_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")))
+        .map(|base| base.join("cram").join("profile.toml"))
 }
 
 /// Bump when the profile's meaning changes, so an old file is re-measured instead of misread.
@@ -1051,6 +1222,17 @@ fn profile_applies(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meminfo_parses_total_and_available() {
+        // A realistic /proc/meminfo head: values in kB, whitespace-padded, other fields interleaved.
+        let sample = "MemTotal:       16384000 kB\nMemFree:          512000 kB\nMemAvailable:    8192000 kB\nBuffers:           40000 kB\n";
+        let (total, avail) = parse_meminfo(sample);
+        assert_eq!(total, 16_384_000 * 1024);
+        assert_eq!(avail, 8_192_000 * 1024);
+        // Missing fields degrade to 0, never a parse panic.
+        assert_eq!(parse_meminfo("Nonsense: xyz\n"), (0, 0));
+    }
 
     #[test]
     fn profile_parse_survives_comment_and_blank_lines() {

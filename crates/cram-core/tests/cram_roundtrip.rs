@@ -63,22 +63,39 @@ fn extract_and_check(archive: &Path, dir: &Path, sources: &[(String, Vec<u8>)]) 
 /// so a create that failed mid-stream destroyed the old archive.
 #[test]
 fn failed_create_preserves_preexisting_archive() {
-    use std::os::windows::fs::OpenOptionsExt;
     let dir = scratch("clobber");
     let sentinel = b"PRE-EXISTING ARCHIVE BYTES (sentinel)".to_vec();
     let dest = dir.join("out.zip");
     fs::write(&dest, &sentinel).unwrap();
 
-    // An input that exists at plan time but cannot be READ when streamed: opened with share_mode 0
-    // by another handle, `File::open` inside the create loop fails — after the writer is live.
+    // An input that exists at plan time but cannot be READ when the create loop streams it, so the
+    // failure lands AFTER the writer is live — the exact case the staging fix must survive.
     let locked_path = dir.join("locked.bin");
     fs::write(&locked_path, b"soon locked").unwrap();
-    let _lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(0)
-        .open(&locked_path)
-        .unwrap();
+
+    // Windows: hold it open with share_mode 0 so the loop's `File::open` is denied.
+    #[cfg(windows)]
+    let _lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&locked_path)
+            .unwrap()
+    };
+    // Unix: strip all read permission. Root ignores the mode bits, which would make the read succeed
+    // and the test meaningless — detect that by probing and skip rather than fail spuriously.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&locked_path).is_ok() {
+            eprintln!("skipping failed_create test: reads not denied (likely running as root)");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+    }
 
     let err = engine::create::create(
         &dest,

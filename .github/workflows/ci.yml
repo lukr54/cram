@@ -56,6 +56,42 @@ jobs:
       - name: Fuzz smoke tests
         run: cargo test --workspace fuzz
 
+  test-linux:
+    name: build + test (linux-gnu)
+    runs-on: ubuntu-latest
+    # Override the workflow-level Windows target: this job builds for the Linux host. The `.cargo`
+    # link flags are scoped to x86_64-pc-windows-gnu, so they don't apply here.
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      # g++ builds the UnRAR C++ dependency; build-essential is preinstalled on the runner image but
+      # pinned here so the job is self-describing and survives an image change.
+      - name: Install the C/C++ toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Install the Rust GNU target
+        run: rustup target add x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      # Same shipped configuration as Windows: download + C zstd on. On Linux the download stack
+      # resolves reqwest to rustls (no system OpenSSL), per the per-OS split in the crate manifests.
+      - name: Build the release configuration
+        run: |
+          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-extract
+
+      - name: Fuzz smoke tests
+        run: cargo test --workspace fuzz
+
   secrets:
     name: secret scan
     runs-on: ubuntu-latest
@@ -106,8 +142,8 @@ jobs:
   # binaries" claim is actually true for a release download. Like the rest of this file, it has never
   # run — its first execution is the first tag push.
   release:
-    name: package + publish release
-    needs: [test, secrets]
+    name: package + publish release (windows)
+    needs: [test, test-linux, secrets]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     permissions:
@@ -155,3 +191,48 @@ jobs:
             --title "Cram $GITHUB_REF_NAME" \
             --generate-notes \
             cram-*-x86_64-pc-windows-gnu.zip
+
+  # The Linux artifact for the same release. Built on the OLDEST supported runner (Ubuntu 22.04,
+  # glibc 2.35) so the binary also runs on newer distros — a binary built against a newer glibc would
+  # refuse to start on an older one. Runs after `release` so the GitHub release already exists to
+  # upload into, and writes the SHA256SUMS that install.sh verifies against.
+  release-linux:
+    name: package + publish release (linux)
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the C/C++ toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Install the Rust GNU target
+        run: rustup target add x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the shipped binaries
+        run: |
+          cargo build --release -p cram-cli --features download,zstd-c
+          cargo build --release -p cram-extract
+
+      - name: Stage the distributable
+        run: |
+          set -euo pipefail
+          rel=target/x86_64-unknown-linux-gnu/release
+          dist="cram-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          mkdir "$dist"
+          cp "$rel/cram" "$rel/cram-extract" "$dist"/
+          cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md README.md "$dist"/
+          tar -czf "$dist.tar.gz" "$dist"
+          sha256sum "$dist.tar.gz" > SHA256SUMS
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" cram-*-x86_64-unknown-linux-gnu.tar.gz SHA256SUMS --clobber

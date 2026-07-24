@@ -11,7 +11,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -20,6 +19,18 @@ use std::thread::{self, JoinHandle};
 use rdm_core::Progress;
 
 use crate::source::{ByteSource, SourceStatus};
+
+/// Positional read at an explicit offset, bridging the differently-named std traits: `seek_read` on
+/// Windows, `read_at` on Unix. Neither is relied on to move the file cursor here — every call passes
+/// an explicit offset.
+#[cfg(windows)]
+fn pread(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, off)
+}
+#[cfg(unix)]
+fn pread(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, off)
+}
 
 // Re-export the discovery type/predicate so callers (the CLI, a future GUI) reach them through
 // cram-core without also depending on rdm-core directly.
@@ -165,7 +176,7 @@ impl ByteSource for RdmSource {
             return Ok(0);
         }
         let want = ((avail - offset) as usize).min(buf.len());
-        self.file.seek_read(&mut buf[..want], offset)
+        pread(&self.file, &mut buf[..want], offset)
     }
 
     fn wait_until(&self, want: u64) -> SourceStatus {

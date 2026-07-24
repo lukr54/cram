@@ -19,9 +19,17 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["stream"] }   # default TLS = SChannel on Windows (no C crypto)
 bytes = "1"                                             # reqwest's stream item type; carried to the writer thread
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 roxmltree = "0.20"                                      # tiny pure-Rust read-only XML parser for Metalink (.meta4/.metalink) discovery
+
+# reqwest's TLS backend, pinned per-OS (features are additive across the whole dependency graph, so
+# leaving this to defaults would force native-tls everywhere): SChannel via `native-tls` on Windows —
+# no C crypto — and pure-Rust `rustls` with bundled roots on Unix, so a Linux build needs no system
+# OpenSSL. `http2`/`charset` mirror reqwest's own defaults so nothing regresses versus the old line.
+[target.'cfg(windows)'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["stream", "http2", "charset", "native-tls"] }
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["stream", "http2", "charset", "rustls-tls"] }
