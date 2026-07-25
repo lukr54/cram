@@ -451,9 +451,9 @@ pub use unix_platform::{free_space_mib, physical_drives_for_path};
 /// Scan an Apple plist for `<key>NAME</key><true/>` → `Some(true)`, `<false/>` → `Some(false)`,
 /// absent → `None`.
 ///
-/// Compiled everywhere (not just macOS) so this parsing, the error-prone part of the macOS drive
-/// probe, and the part that decides sequential-vs-parallel reads; is unit-tested on whatever machine
-/// the tests are run on, including ones that can never execute the macOS path.
+/// Compiled everywhere, not just on macOS, so that this parsing is unit-tested on whatever machine
+/// runs the tests, including ones that can never execute the macOS path. It is the error-prone part
+/// of the drive probe, and what it returns decides sequential-versus-parallel reads.
 #[cfg(any(target_os = "macos", test))]
 fn plist_bool(text: &str, key: &str) -> Option<bool> {
     let rest = text.split_once(&format!("<key>{key}</key>"))?.1;
@@ -477,10 +477,13 @@ fn plist_string(text: &str, key: &str) -> Option<String> {
     Some(rest[open..close].to_string())
 }
 
-/// Extract total/available physical RAM (bytes) from a `/proc/meminfo` body. Kept OS-agnostic (and
-/// compiled under `test`) so the parsing, the error-prone part; is unit-tested even on a host that
-/// has no `/proc`. The `MemAvailable` field is the kernel's own estimate of allocatable RAM.
-#[cfg(any(unix, test))]
+/// Extract total/available physical RAM (bytes) from a `/proc/meminfo` body. Compiled under `test`
+/// as well as on Linux so the parsing, which is the error-prone part, is unit-tested even on a host
+/// that has no `/proc`. The `MemAvailable` field is the kernel's own estimate of allocatable RAM.
+///
+/// Gated on `linux` rather than `unix`: macOS is a unix but reads its memory figures from sysctls,
+/// so a `unix` gate would compile this into the macOS build with no caller and trip `dead_code`.
+#[cfg(any(target_os = "linux", test))]
 fn parse_meminfo(text: &str) -> (u64, u64) {
     fn kib(v: &str) -> u64 {
         v.split_whitespace()

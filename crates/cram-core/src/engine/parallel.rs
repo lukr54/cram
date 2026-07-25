@@ -21,6 +21,28 @@ use crate::reader::RandomAccessReader;
 /// 8 MiB write blocks, sized to keep the write stream saturated.
 const WRITE_BUF: usize = 8 * 1024 * 1024;
 
+/// Does the filesystem holding `dir` treat two names differing only in case as the same file?
+///
+/// Worth a syscall rather than a `cfg!`, because this is a property of the filesystem and not of the
+/// OS: NTFS and a default APFS/HFS+ volume fold case, ext4 does not, and both Windows 10+ and APFS
+/// can flip the behaviour per-directory or per-volume. Guessing from the OS gets macOS wrong in the
+/// dangerous direction, since it would leave two entries scheduled onto one real file.
+///
+/// Write a probe file, then ask for the same name in flipped case: getting it back means the lookup
+/// ignored case. If the probe cannot run at all (read-only destination), fall back to the platform's
+/// usual default, which is the answer for the overwhelming majority of volumes on each OS.
+fn dest_is_case_insensitive(dir: &Path) -> bool {
+    let name = format!(".cram-case-probe-{}", std::process::id());
+    let lower = dir.join(&name);
+    let upper = dir.join(name.to_uppercase());
+    if fs::write(&lower, b"").is_err() {
+        return cfg!(any(windows, target_os = "macos"));
+    }
+    let insensitive = upper.exists();
+    let _ = fs::remove_file(&lower);
+    insensitive
+}
+
 /// Extract every file entry of `ra` under `dest` across `workers` threads. Per-entry failures are
 /// collected into the [`Report`] (non-fatal); cancellation stops scheduling new work. When
 /// `skip_existing` is set, an entry whose destination already matches (size + CRC) is skipped
@@ -56,8 +78,11 @@ pub fn run(
     // (sequential extraction's last-writer-wins) and count the shadowed ones as skipped.
     //
     // The fold must match the TARGET filesystem's own collision rule, or it wrongly drops a distinct
-    // file: on Windows/NTFS, case + trailing dots/spaces collide, so fold them; on a case-sensitive
-    // filesystem (Linux/macOS-hfsx) only a byte-identical path is the same file, so dedup exactly.
+    // file. Case folding is therefore decided by probing `dest` at runtime rather than by `cfg`:
+    // case-insensitivity belongs to the filesystem, not the OS, and a macOS volume is
+    // case-insensitive by default while ext4 is not. Trailing dots and spaces are separate: that is
+    // a Win32 path-normalization rule rather than a filesystem one, so it stays compile-gated.
+    let fold_case = dest_is_case_insensitive(dest);
     let dest_key = |e: &Entry| -> String {
         e.path
             .safe()
@@ -65,12 +90,13 @@ pub fn run(
             .map(|c| {
                 let s = c.as_os_str().to_string_lossy();
                 #[cfg(windows)]
-                {
-                    s.trim_end_matches([' ', '.']).to_lowercase()
-                }
+                let s = s.trim_end_matches([' ', '.']).to_string();
                 #[cfg(not(windows))]
-                {
-                    s.into_owned()
+                let s = s.into_owned();
+                if fold_case {
+                    s.to_lowercase()
+                } else {
+                    s
                 }
             })
             .collect::<Vec<_>>()
@@ -227,11 +253,14 @@ mod dest_race_tests {
     use crate::secret::NoPassword;
     use std::sync::Arc;
 
-    /// Case-variant names (`A.txt` / `a.txt`) resolve to ONE file on NTFS, so only the LAST entry
-    /// may be scheduled, guarding against two workers racing the same destination and interleaving
-    /// their write blocks into silent corruption. On a case-sensitive filesystem (Linux) the two are
-    /// distinct files, so both are written and nothing is shadowed; the assertions below check the
-    /// behaviour that matches the target filesystem, since `dest_key` folds accordingly.
+    /// Case-variant names (`A.txt` / `a.txt`) resolve to ONE file on a case-insensitive filesystem,
+    /// so only the LAST entry may be scheduled; that is what stops two workers racing the same
+    /// destination and interleaving their write blocks into silent corruption. Where the two names
+    /// are distinct files, both are written and nothing is shadowed.
+    ///
+    /// Which of those holds is decided by the filesystem under the temp directory, not by the OS, so
+    /// the test asks the same question the engine asks instead of branching on `cfg`. That keeps it
+    /// honest on a case-sensitive APFS volume and on a case-insensitive mount under Linux.
     #[test]
     fn duplicate_destinations_are_deduped_last_wins() {
         use zip::write::SimpleFileOptions;
@@ -260,10 +289,9 @@ mod dest_race_tests {
         let report = run(ra, &out, 4, false, &NullSink).unwrap();
 
         assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
-        #[cfg(windows)]
-        {
-            // NTFS is case-insensitive: `A.txt` and `a.txt` are ONE destination, so only the last
-            // survives and the shadowed entry is surfaced as skipped.
+        if dest_is_case_insensitive(&out) {
+            // `A.txt` and `a.txt` are ONE destination, so only the last survives and the shadowed
+            // entry is surfaced as skipped.
             assert_eq!(report.extracted, 1, "only the winning duplicate is written");
             assert_eq!(
                 report.skipped, 1,
@@ -273,11 +301,9 @@ mod dest_race_tests {
                 .or_else(|_| fs::read(out.join("A.txt")))
                 .unwrap();
             assert_eq!(got, b"last-writer-wins");
-        }
-        #[cfg(not(windows))]
-        {
-            // Case-sensitive filesystem: the two names are distinct files, so both are written and
-            // nothing is shadowed, each keeps its own content.
+        } else {
+            // The two names are distinct files, so both are written, nothing is shadowed, and each
+            // keeps its own content.
             assert_eq!(
                 report.extracted, 2,
                 "both case-distinct entries are written"
