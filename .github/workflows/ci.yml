@@ -96,7 +96,7 @@ jobs:
     name: build + test (macos, apple silicon)
     runs-on: macos-latest
     # macOS binaries can only be produced on Apple hardware, so this job is the *only* place the
-    # macOS code paths are compiled and run at all — treat a failure here as the first real signal,
+    # macOS code paths are compiled and run at all. Treat a failure here as the first real signal,
     # not a flake.
     env:
       CARGO_BUILD_TARGET: aarch64-apple-darwin
@@ -138,7 +138,7 @@ jobs:
           # Deliberately pattern-based and small: this catches the specific things that would be
           # catastrophic to commit here (a private signing seed, plus payment- and email-provider API
           # keys) rather than pretending to be a general-purpose scanner. `.gitignore` is a backstop,
-          # not the control — a pasted secret has no telltale file extension.
+          # not the control: a pasted secret has no telltale file extension.
           patterns=(
             'BEGIN [A-Z ]*PRIVATE KEY'
             'whsec_[A-Za-z0-9]{16,}'
@@ -171,8 +171,7 @@ jobs:
 
   # Runs only on a pushed `v*` tag, after test + secret-scan pass. Packages the shipped binaries with
   # the licence files and BOTH notice documents, so THIRD-PARTY-NOTICES.md's "installed alongside the
-  # binaries" claim is actually true for a release download. Like the rest of this file, it has never
-  # run — its first execution is the first tag push.
+  # binaries" claim is actually true for a release download.
   release:
     name: package + publish release (windows)
     needs: [test, test-linux, test-macos, secrets]
@@ -225,7 +224,7 @@ jobs:
             cram-*-x86_64-pc-windows-gnu.zip
 
   # The Linux artifact for the same release. Built on the OLDEST supported runner (Ubuntu 22.04,
-  # glibc 2.35) so the binary also runs on newer distros — a binary built against a newer glibc would
+  # glibc 2.35) so the binary also runs on newer distros; a binary built against a newer glibc would
   # refuse to start on an older one. Runs after `release` so the GitHub release already exists to
   # upload into, and writes the SHA256SUMS that install.sh verifies against.
   release-linux:

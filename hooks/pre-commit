@@ -6,7 +6,7 @@
 # secret whose leak cannot be undone. This scans the STAGED CONTENT, which is the only thing that
 # actually ends up in history.
 #
-# Enable it (it is not automatic — git never runs hooks from a clone):
+# Enable it (it is not automatic: git never runs hooks from a clone):
 #     git config core.hooksPath hooks
 #
 # Bypass, if you are certain: git commit --no-verify
@@ -16,7 +16,7 @@ staged=$(git diff --cached --name-only --diff-filter=ACM)
 
 fail=0
 report() {
-	echo "pre-commit: refusing to commit — $1" >&2
+	echo "pre-commit: refusing to commit - $1" >&2
 	fail=1
 }
 
@@ -34,7 +34,7 @@ for pat in \
 done
 
 # A bare 64-hex-character string is the shape of an ed25519 seed. Values that are safe to publish are
-# listed BY VALUE in .github/secret-scan-allowlist.txt, each with a written justification — matching
+# listed BY VALUE in .github/secret-scan-allowlist.txt, each with a written justification. Matching
 # on a nearby keyword instead would both miss constants whose name wrapped onto the previous line and
 # happily accept a real seed labelled `PUBKEY`.
 #

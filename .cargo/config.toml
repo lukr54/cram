@@ -1,13 +1,13 @@
 # The `unrar` crate compiles the UnRAR engine as C++, which drags in libstdc++, libgcc and
 # winpthread. On the windows-gnu toolchain that needs these link tweaks:
 #
-#   * `-static` — statically fold in libstdc++ and libgcc, so no libstdc++-6.dll /
-#     libgcc_s_seh-1.dll sit next to the exe. (winpthread stays dynamic — see below.)
-#   * `--allow-multiple-definition` — resolve the winpthread symbol clash (Rust's `libpthread.a`
+#   * `-static` statically folds in libstdc++ and libgcc, so no libstdc++-6.dll /
+#     libgcc_s_seh-1.dll sit next to the exe. (winpthread stays dynamic, see below.)
+#   * `--allow-multiple-definition` resolves the winpthread symbol clash (Rust's `libpthread.a`
 #     vs. the C++ side's pthread); the linker keeps the first definition. A side effect is that the
-#     *dynamic* winpthread wins, so the exe keeps a single `libwinpthread-1.dll` dependency — ship
+#     *dynamic* winpthread wins, so the exe keeps a single `libwinpthread-1.dll` dependency; ship
 #     that DLL alongside the exe on deploy (it also lives on PATH via the mingw toolchain).
-#   * `-ladvapi32` appended LAST — `-static` reorders the link line and drops the Win32
+#   * `-ladvapi32` appended LAST, because `-static` reorders the link line and drops the Win32
 #     registry/security/crypto imports the UnRAR C++ needs; link it explicitly after unrar_sys
 #     (GNU ld is single-pass).
 [target.x86_64-pc-windows-gnu]

@@ -1,4 +1,4 @@
-# cargo-about configuration — generates THIRD-PARTY-LICENSES.md, the full-text licence appendix that
+# cargo-about configuration: generates THIRD-PARTY-LICENSES.md, the full-text licence appendix that
 # ships beside cram.exe / cram-extract.exe. Every licence the resolved graph uses must appear in
 # `accepted`. Regenerate with the command recorded in THIRD-PARTY-NOTICES.md after any dependency change.
 accepted = [

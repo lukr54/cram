@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------
-# SECRETS — never commit these.
+# SECRETS. Never commit these.
 #
 # Private keys (`*.key`, `*.cramkey`, `*.pem`, …) must never enter the working
-# tree — `.cramkey` files are archive-signing keys. A private key belongs OUTSIDE
+# tree. `.cramkey` files are archive-signing keys. A private key belongs OUTSIDE
 # the tree entirely; the rules below are a backstop, not the primary control.
 # ---------------------------------------------------------------------------
 *.key
@@ -47,5 +47,5 @@ desktop.ini
 # Cargo.lock is intentionally committed: this workspace ships binaries, so a locked,
 # reproducible dependency set is a feature, not noise.
 
-# Built add-on package — regenerate by zipping firefox-addon/ (identical contents).
+# Built add-on package, regenerate by zipping firefox-addon/ (identical contents).
 cram-addon.zip

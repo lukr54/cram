@@ -1,10 +1,10 @@
 #!/bin/sh
-# Cram installer — fetch the latest Linux release binary and drop it on your PATH.
+# Cram installer: fetch the latest Linux release binary and drop it on your PATH.
 #
 #   curl -fsSL https://raw.githubusercontent.com/lukr54/cram/master/install.sh | sh
 #
 # POSIX sh (not bash) on purpose, so it runs the same on a minimal container as on a full desktop. It
-# installs ONLY the `cram` binary — no daemon, no root, no system files touched — into ~/.local/bin
+# installs ONLY the `cram` binary (no daemon, no root, no system files touched) into ~/.local/bin
 # (or $CRAM_INSTALL_DIR if you set one). Re-running it upgrades in place. To uninstall: delete the
 # binary it prints at the end. Set CRAM_VERSION=vX.Y.Z to pin a specific release.
 set -eu

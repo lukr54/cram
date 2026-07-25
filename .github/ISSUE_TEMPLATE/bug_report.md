@@ -8,7 +8,7 @@ assignees: ''
 
 **What happened**
 
-A clear description of the bug — what you ran and what went wrong.
+A clear description of the bug: what you ran and what went wrong.
 
 **To reproduce**
 
