@@ -5,8 +5,8 @@ mounts archives, signs them and builds parity sidecars for them, finds duplicate
 drives, plus a native format (`.cram`) that stores repeated data once and losslessly repacks JPEGs.
 
 This repository is the **engine and the command line**. The `cram` CLI is free and fully featured;
-nothing in it is restricted. It is written in Rust. Windows (the GNU/mingw toolchain) and Linux are
-both built and tested; macOS is supported in the source but has not been run yet (see
+nothing in it is restricted. It is written in Rust, and Windows (the GNU/mingw toolchain), Linux and
+Apple Silicon macOS each build and run the full test suite. Archive **mount** is Windows-only (see
 [Limitations](#limitations)).
 Everything is pure Rust **except the UnRAR C++ decoder**, which is always compiled in because it is
 what reads RAR; the optional `zstd-c` feature links C libzstd, and `libdeflate` is a further opt-in
@@ -353,11 +353,10 @@ contains no benchmark harness, so nothing here is a performance claim.
 - **Nothing is code-signed.** There is no Authenticode certificate, so Windows SmartScreen warns on
   first run of the released binaries. (`cram sign` signs *archives*; that is unrelated to Windows
   executable trust.)
-- **Platform status is not uniform.** Windows (`x86_64-pc-windows-gnu`) and Linux
-  (`x86_64-unknown-linux-gnu`) are both built and tested, including the full test suite on each.
-  macOS (`aarch64-apple-darwin`) has been written but **never compiled or run**: it is checked for
-  the first time by CI, so treat it as unproven until a release exists. Mount is Windows-only
-  regardless, because it is built on ProjFS.
+- **Platform support is not uniform.** Windows (`x86_64-pc-windows-gnu`), Linux
+  (`x86_64-unknown-linux-gnu`) and macOS (`aarch64-apple-darwin`) each build and run the full test
+  suite, clippy and the fuzz smoke tests on their own CI runner. What differs is **mount**, which is
+  Windows-only because it is built on ProjFS; every other verb behaves the same on all three.
 
 ---
 

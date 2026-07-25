@@ -58,9 +58,9 @@ than the originals, `tar.xz` managed 2.7%, and `.cram` was 23.6% smaller with al
 extracting byte-identical. That is a single sample rather than a benchmark. Every candidate is verified to round-trip before it is stored, and anything that
 fails verification is stored untouched. `cram a --no-recompress` turns it off.
 
-**Linux support** (`x86_64-unknown-linux-gnu`), built and tested alongside Windows, plus an
-`install.sh` for a one-line install. macOS (`aarch64-apple-darwin`) is written but unproven; see
-Known limitations.
+**Linux and macOS support** (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`), built and tested
+alongside Windows, plus an `install.sh` that fetches the right binary for either. See Known
+limitations for what still differs between the three.
 
 **A second, independent `.cram` decoder.** `cram-extract.exe` implements the same spec from the
 document alone, shares no code with the engine, and takes four direct pure-Rust dependencies
@@ -119,9 +119,9 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 
 ### Known limitations
 
-- **Platform status is not uniform.** Windows (`x86_64-pc-windows-gnu`) and Linux
-  (`x86_64-unknown-linux-gnu`) are built and tested. macOS (`aarch64-apple-darwin`) is written but
-  has never been compiled or run; CI is the first thing to exercise it. Mount is Windows-only.
+- **Platform support is not uniform.** Windows (`x86_64-pc-windows-gnu`), Linux
+  (`x86_64-unknown-linux-gnu`) and macOS (`aarch64-apple-darwin`) each build and run the full test
+  suite. Mount is Windows-only.
 - **`cram test` cannot detect every bit flip.** An unencrypted *stored* `.cram`, `tar` / `.tar.zst`,
   and ISO and RAR, for which Cram computes no checksum of its own; carry no per-chunk or per-file
   content checksum, so a flip inside file content can decode to wrong bytes undetected. What you get

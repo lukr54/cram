@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cram installer: fetch the latest Linux release binary and drop it on your PATH.
+# Cram installer: fetch the latest Linux or macOS release binary and drop it on your PATH.
 #
 #   curl -fsSL https://raw.githubusercontent.com/lukr54/cram/master/install.sh | sh
 #
