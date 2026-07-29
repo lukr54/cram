@@ -1,0 +1,34 @@
+[package]
+name = "cram-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Cram's Windows Explorer context menu: a COM IContextMenu handler that puts extract/test/create on the right-click menu"
+
+# An in-process COM server, so Explorer can load it. Windows-only in practice: on every other
+# platform this compiles to an empty library rather than being excluded from the workspace, which
+# would make `cargo test --workspace` on Linux fail to resolve it.
+# `rlib` alongside the DLL purely so the menu-building logic can be unit-tested. Code that runs
+# inside Explorer is the last place to find out a decision was wrong.
+[lib]
+name = "cram_shell"
+crate-type = ["cdylib", "rlib"]
+
+# The whole crate is behind `cfg(windows)`, so nothing here is pulled in on a Linux/macOS build.
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }

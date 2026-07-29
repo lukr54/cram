@@ -49,6 +49,7 @@ jobs:
         run: |
           cargo build --release -p cram-cli --features download,zstd-c,phash
           cargo build --release -p cram-extract
+          cargo build --release -p cram-shell
 
       # The parsers eat untrusted input, so the fuzz smoke tests are part of the gate rather than
       # something run by hand. They are bounded and fast; they are NOT a substitute for a real
@@ -199,6 +200,7 @@ jobs:
         run: |
           cargo build --release -p cram-cli --features download,zstd-c,phash
           cargo build --release -p cram-extract
+          cargo build --release -p cram-shell
 
       - name: Stage the distributable
         shell: bash
@@ -207,7 +209,9 @@ jobs:
           rel=target/x86_64-pc-windows-gnu/release
           dist="cram-${GITHUB_REF_NAME}-x86_64-pc-windows-gnu"
           mkdir "$dist"
-          cp "$rel/cram.exe" "$rel/cram-extract.exe" "$dist"/
+          # cram_shell.dll is the Explorer context menu, and `cram shell install` registers it from
+          # wherever it sits next to cram.exe — so it has to travel with it.
+          cp "$rel/cram.exe" "$rel/cram-extract.exe" "$rel/cram_shell.dll" "$dist"/
           cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md README.md "$dist"/
           # libwinpthread-1.dll must ship next to the exe (see THIRD-PARTY-NOTICES.md section 3).
           cp "$(dirname "$(command -v gcc)")/libwinpthread-1.dll" "$dist"/

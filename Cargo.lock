@@ -471,6 +471,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cram-shell"
+version = "1.0.0"
+dependencies = [
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "cram-sign"
 version = "1.0.0"
 dependencies = [

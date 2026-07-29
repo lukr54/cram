@@ -17,6 +17,8 @@
 //! cram make-sfx <archive.cram> <out.exe>       build a self-extracting executable
 //! cram update [--check] [--force]              download the latest published release, verify its
 //!                                              SHA-256 and replace this install [--features download]
+//! cram shell <install|uninstall|status>        add/remove Cram on Explorer's right-click menu
+//!                                              (Windows; the handler is the cram-shell crate)
 //! ```
 //!
 //! Archive verbs are handled here (calling cram-core's engine); the sidecar/mount tools delegate to
@@ -36,6 +38,10 @@ use cram_core::secret::{
 };
 use cram_core::writer::{CreateOptions, Level};
 use cram_core::{engine, formats, sniff};
+
+/// Registering (and removing) the Explorer context menu. Always compiled — it is a handful of
+/// registry writes, and the platform check lives inside.
+mod shell;
 
 /// `update` needs HTTP, so it rides the same opt-in feature as `dl`. The shipped release binaries
 /// are built with it; a bare `cargo build` gets the stub below.
@@ -230,6 +236,7 @@ fn run(args: &[String]) -> Result<()> {
         Some("dl") | Some("download") => download_cmd(args),
         Some("dedup") | Some("dupes") => dedup_cmd(args),
         Some("update") | Some("upgrade") => update_cmd(args),
+        Some("shell") => shell::shell_cmd(args),
         _ => {
             usage();
             Ok(())
@@ -272,6 +279,9 @@ fn usage() {
     eprintln!("  rec <create|verify|repair> <file> …   Reed-Solomon recovery sidecar");
     eprintln!("  sign <file> -k <keyfile> | verify <file> [--key <hex>] | keygen <keyfile>");
     eprintln!("  make-sfx <archive.cram> <out.exe>   build a self-extracting executable");
+    eprintln!(
+        "  shell <install|uninstall|status>    Cram on Explorer's right-click menu (Windows)"
+    );
     eprintln!("  update [--check] [--force]          install the latest published release");
     eprintln!("       downloads it, verifies the published SHA-256, replaces this install;");
     eprintln!("       --check only reports what is available");
