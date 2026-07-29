@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cram installer: fetch the latest Linux or macOS release binary and drop it on your PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/lukr54/cram/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/lukr54/cram/main/install.sh | sh
 #
 # POSIX sh (not bash) on purpose, so it runs the same on a minimal container as on a full desktop. It
 # installs ONLY the `cram` binary (no daemon, no root, no system files touched) into ~/.local/bin

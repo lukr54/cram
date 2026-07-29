@@ -21,10 +21,10 @@ Licensed under **MIT OR Apache-2.0**.
 | | ZIP | 7z | tar(.\*) | ISO 9660 | RAR | `.cram` |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | List / extract | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Create | ✅ | ✅ | ✅ |, |; ✱ | ✅ |
+| Create | ✅ | ✅ | ✅ | ❌ | ❌ ✱ | ✅ |
 | Test (integrity) † | CRC-32 / AES auth | CRC-32 if stored | decode | decode | decode | decode |
 | Mount as a folder ‡ | on-demand | ≤ 2 GiB RAM | ≤ 2 GiB RAM | on-demand | ≤ 2 GiB RAM | on-demand |
-| Encryption | AES-256 | AES-256 |, |; | read | AES-256-GCM |
+| Encryption | AES-256 | AES-256 | ❌ | ❌ | read | AES-256-GCM |
 
 `tar(.*)` covers plain tar plus gzip, xz, zstd, bzip2, lz4 and brotli. A **bare single-stream
 compressed file** (`foo.gz`, `foo.xz`, `foo.zst`, `foo.bz2`, `foo.lz4`, `foo.br`) is read as a
@@ -82,7 +82,7 @@ on first run (see [Limitations](#limitations)).
 The `cram` CLI runs on Linux x86-64 and on Apple Silicon macOS. Install the latest release binary with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/lukr54/cram/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/lukr54/cram/main/install.sh | sh
 ```
 
 That drops `cram` into `~/.local/bin` (no root, no daemon, nothing else touched); re-run it to upgrade.
