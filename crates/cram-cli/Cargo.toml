@@ -16,6 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 cram-core = { path = "../cram-core" }
+# Reading the release JSON for `cram update`. Optional, so a default build (no `download`) does not
+# compile it; already in the graph via rdm-core, so it costs nothing extra in a shipped build.
+serde_json = { version = "1", optional = true }
 cram-mount = { path = "../cram-mount" }
 cram-recovery = { path = "../cram-recovery" }
 cram-sign = { path = "../cram-sign" }
@@ -23,7 +26,7 @@ cram-sign = { path = "../cram-sign" }
 [features]
 default = []
 # Forward the opt-in cram-core features so `cram` can be built with them.
-download = ["cram-core/download"]
+download = ["cram-core/download", "dep:serde_json"]
 zstd-c = ["cram-core/zstd-c"]
 libdeflate = ["cram-core/libdeflate"]
 # Perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos.

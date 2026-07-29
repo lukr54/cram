@@ -401,6 +401,7 @@ dependencies = [
  "cram-mount",
  "cram-recovery",
  "cram-sign",
+ "serde_json",
 ]
 
 [[package]]
@@ -416,6 +417,7 @@ dependencies = [
  "fastcdc",
  "filetime",
  "flate2",
+ "futures-util",
  "getrandom 0.2.17",
  "image",
  "lepton_jpeg",

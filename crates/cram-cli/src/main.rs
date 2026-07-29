@@ -15,6 +15,8 @@
 //! cram rec <create|verify|repair> <file> …     Reed-Solomon recovery sidecar
 //! cram sign|verify|keygen …                    ed25519 signing
 //! cram make-sfx <archive.cram> <out.exe>       build a self-extracting executable
+//! cram update [--check] [--force]              download the latest published release, verify its
+//!                                              SHA-256 and replace this install [--features download]
 //! ```
 //!
 //! Archive verbs are handled here (calling cram-core's engine); the sidecar/mount tools delegate to
@@ -34,6 +36,23 @@ use cram_core::secret::{
 };
 use cram_core::writer::{CreateOptions, Level};
 use cram_core::{engine, formats, sniff};
+
+/// `update` needs HTTP, so it rides the same opt-in feature as `dl`. The shipped release binaries
+/// are built with it; a bare `cargo build` gets the stub below.
+#[cfg(feature = "download")]
+mod update;
+
+#[cfg(feature = "download")]
+fn update_cmd(args: &[String]) -> Result<()> {
+    update::update_cmd(args)
+}
+
+#[cfg(not(feature = "download"))]
+fn update_cmd(_args: &[String]) -> Result<()> {
+    Err(cram_core::error::ArchiveError::Backend(
+        "update support not compiled in, rebuild with `--features download`".into(),
+    ))
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -210,6 +229,7 @@ fn run(args: &[String]) -> Result<()> {
         Some("conv") | Some("convert") => convert_cmd(args),
         Some("dl") | Some("download") => download_cmd(args),
         Some("dedup") | Some("dupes") => dedup_cmd(args),
+        Some("update") | Some("upgrade") => update_cmd(args),
         _ => {
             usage();
             Ok(())
@@ -252,6 +272,9 @@ fn usage() {
     eprintln!("  rec <create|verify|repair> <file> …   Reed-Solomon recovery sidecar");
     eprintln!("  sign <file> -k <keyfile> | verify <file> [--key <hex>] | keygen <keyfile>");
     eprintln!("  make-sfx <archive.cram> <out.exe>   build a self-extracting executable");
+    eprintln!("  update [--check] [--force]          install the latest published release");
+    eprintln!("       downloads it, verifies the published SHA-256, replaces this install;");
+    eprintln!("       --check only reports what is available");
     eprintln!(
         "  --version                           version + which optional features are compiled in"
     );

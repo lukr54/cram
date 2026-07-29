@@ -212,6 +212,9 @@ jobs:
           # libwinpthread-1.dll must ship next to the exe (see THIRD-PARTY-NOTICES.md section 3).
           cp "$(dirname "$(command -v gcc)")/libwinpthread-1.dll" "$dist"/
           7z a "$dist.zip" "$dist" >/dev/null
+          # `cram update` refuses to install an archive it cannot verify, so the Windows artifact
+          # needs its checksum published the same way the Linux and macOS ones do.
+          sha256sum "$dist.zip" > SHA256SUMS.windows
 
       - name: Publish the GitHub release
         shell: bash
@@ -221,7 +224,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "Cram $GITHUB_REF_NAME" \
             --generate-notes \
-            cram-*-x86_64-pc-windows-gnu.zip
+            cram-*-x86_64-pc-windows-gnu.zip SHA256SUMS.windows
 
   # The Linux artifact for the same release. Built on the OLDEST supported runner (Ubuntu 22.04,
   # glibc 2.35) so the binary also runs on newer distros; a binary built against a newer glibc would

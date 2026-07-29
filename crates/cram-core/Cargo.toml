@@ -101,6 +101,9 @@ tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 # per-OS in the `[target.…]` tables below, SChannel on Windows, rustls on Unix, matching rdm-core.
 # Verify a finished download against a Metalink SHA-256 (pure Rust, mingw-clean).
 sha2 = { version = "0.10", optional = true }
+# Chunked reads of a response body, so `net::fetch_text` can stop at its size cap instead of
+# buffering whatever the server decides to send. Already in the graph via rdm-core.
+futures-util = { version = "0.3", optional = true }
 
 # statvfs (free space) + dev_t plumbing for the Unix hardware profiler (see src/hw.rs). Unix-only;
 # the Windows profiler uses raw kernel32 FFI and needs no external crate.
@@ -118,7 +121,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "h
 
 [features]
 default = []
-download = ["dep:rdm-core", "dep:tokio", "dep:reqwest", "dep:sha2"]
+download = ["dep:rdm-core", "dep:tokio", "dep:reqwest", "dep:sha2", "dep:futures-util"]
 # Opt-in C backends. Gated so the default build is 100% pure-Rust / always-builds.
 zstd-c = ["dep:zstd"]
 libdeflate = ["dep:libdeflater"]

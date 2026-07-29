@@ -227,6 +227,60 @@ pub fn discover_mirrors(input: &str) -> io::Result<Option<Discovered>> {
     })
 }
 
+/// Fetch a small text document over HTTPS: the GitHub release JSON and the `SHA256SUMS` file that
+/// `cram update` reads. Not for payloads, those go through [`RdmSource`] so they get the segmented
+/// engine, resume and the verify gate.
+///
+/// The body is **capped before it is read into memory**: a response is attacker-controlled in size
+/// as well as content, and a `Content-Length` cannot be trusted to bound it. `accept` sets the
+/// `Accept` header where the endpoint cares (GitHub's API does).
+///
+/// Builds its own short-lived runtime + client so it is callable from synchronous code, like
+/// [`discover_mirrors`].
+pub fn fetch_text(url: &str, accept: Option<&str>, max_bytes: usize) -> io::Result<String> {
+    use futures_util::StreamExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(io::Error::other)?;
+        let mut req = client
+            .get(url)
+            // GitHub rejects requests without one, and it is the only thing identifying us.
+            .header("User-Agent", concat!("cram/", env!("CARGO_PKG_VERSION")));
+        if let Some(a) = accept {
+            req = req.header("Accept", a);
+        }
+        let resp = req.send().await.map_err(io::Error::other)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(io::Error::other(format!(
+                "{url} replied {}",
+                status.as_u16()
+            )));
+        }
+        // Read the stream chunk by chunk and stop at the cap, rather than `resp.text()`, which
+        // would happily buffer a body sized to exhaust memory.
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(io::Error::other)?;
+            if body.len() + chunk.len() > max_bytes {
+                return Err(io::Error::other(format!(
+                    "{url} sent more than {max_bytes} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).map_err(|_| io::Error::other(format!("{url} sent invalid UTF-8")))
+    })
+}
+
 /// Stream a finished download through SHA-256 and compare (case-insensitively) to `expected_hex`.
 /// Used to verify a completed download against a checksum discovery supplied (e.g. a Metalink), so a
 /// mirror set that all agreed on a *wrong* file is still caught end-to-end.
