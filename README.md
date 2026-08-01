@@ -73,9 +73,14 @@ and work on **any file**, not just Cram's own formats. The self-extracting `.exe
 
 ## Install
 
-Prebuilt Windows x86-64 binaries, `cram.exe` and `cram-extract.exe`, are attached to the releases
-at <https://github.com/lukr54/cram/releases>. They are **not code-signed**, so SmartScreen will warn
-on first run (see [Limitations](#limitations)).
+Prebuilt Windows x86-64 binaries are attached to the releases at
+<https://github.com/lukr54/cram/releases>: `cram.exe`, `cram-extract.exe`, and `cram_shell.dll` (the
+Explorer right-click menu, which does nothing until you run `cram shell install`). Keep the three
+together. They are **not code-signed**, so SmartScreen will warn on first run (see
+[Limitations](#limitations)).
+
+Once installed, `cram update` fetches the next release, checks it against the SHA-256 the release
+publishes, and replaces itself. It refuses to install anything it cannot verify.
 
 ### Linux and macOS
 
@@ -141,10 +146,10 @@ cargo build --release -p cram-cli --features zstd-c,download
 writes different `.cram` bytes than the pure-Rust default, so it is worth checking before comparing
 two archives.
 
-Run the tests with `cargo test`; that is 166 tests across the workspace (167 with `--features
-cram-cli/phash`, which adds the perceptual-hash test). `cargo fmt --all -- --check`
-and `cargo clippy --workspace --all-targets -- -D warnings` are clean. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Run the tests with `cargo test`; that is 174 tests across the workspace, and 185 with the features
+the release is built with (`download,zstd-c,phash`), which compile code the default build leaves out.
+`cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -181,6 +186,12 @@ cram sign <file> -k <keyfile>                     write a detached ed25519 signa
 cram verify <file> [--key <hex>]                  verify a signature (pin --key to require a signer)
 cram keygen <keyfile>                             create a signing key (prints its public key)
 cram make-sfx <archive.cram> <out.exe>            build a self-extracting executable
+cram shell <install|uninstall|status>             add or remove Cram's Explorer right-click menu
+                                                  (Windows; writes under HKCU only, no elevation)
+cram update [--check] [--force]                   download the latest published release, verify its
+                                                  published SHA-256 and replace this install.
+                                                  --check reports and changes nothing. Needs a
+                                                  build with the `download` feature.
 cram --version                                    version + which optional features are compiled in
 ```
 
@@ -277,6 +288,24 @@ canonical one.
 Whatever the plan says, each pair is **re-hashed at the moment of action** and skipped if it no longer
 matches, so a plan made hours earlier can never act on a file that changed in the meantime.
 
+### The Explorer right-click menu (Windows)
+
+```powershell
+cram shell install      # cram shell status / cram shell uninstall
+```
+
+Right-clicking an archive then offers **Extract here**, **Extract to `<name>\`** and **Test
+archive**; right-clicking anything else offers to add it to a `.cram` or a `.zip`. Everything sits
+under one **Cram** submenu, and each verb runs the same `cram` command you would have typed.
+
+It registers under `HKCU` only, so there is no elevation prompt and nothing is changed for other
+accounts. `cram shell uninstall` removes it, and `cram shell status` reports whether the handler is
+registered and whether the DLL it points at still exists.
+
+On **Windows 11 it appears under "Show more options"** (or Shift+F10), which is where the shell puts
+every context-menu handler. Reaching the compact top-level menu needs a different mechanism
+(`IExplorerCommand` in a signed package) that Cram does not currently ship.
+
 ### What a damaged archive does
 
 Extraction is best-effort. A damaged entry does not abort the job: intact entries are written,
@@ -289,8 +318,8 @@ things sit outside that guarantee, and a script should know both:
 
 - A **bare single-stream compressed file** (`foo.gz`, `foo.xz`, …) declares no uncompressed length,
   so there is no length to check against; the check is that the stream decoded cleanly.
-- An entry whose stored name cannot be represented safely on Windows, a `..` component, a `:` or a
-  NUL byte in any component, or a path thousands of components deep; is **refused**: it is not
+- An entry whose stored name cannot be represented safely on Windows is **refused**: a `..`
+  component, a `:` or a NUL byte in any component, or a path thousands of components deep. It is not
   listed, not tested and not extracted, and that on its own does not make the exit code non-zero.
   Archives written on other platforms can legitimately carry such names, so if it matters that
   nothing was left behind, compare `cram l` against the source.
@@ -371,7 +400,8 @@ this repository, and nothing in this repository depends on it.
 
 `crates/cram-core` (engine, format backends and `.cram`), `crates/cram-cli` (the `cram` binary),
 `crates/cram-mount` · `cram-recovery` · `cram-sign` (mount and the sidecar tools),
-`crates/cram-extract` (standalone decoder / SFX stub), `crates/rdm-core` (the segmented-download
+`crates/cram-extract` (standalone decoder / SFX stub), `crates/cram-shell` (the Explorer
+context-menu handler), `crates/rdm-core` (the segmented-download
 engine behind `cram dl`). [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how they fit
 together; every source file carries a module-level doc comment for the local detail.
 

@@ -11,10 +11,10 @@ user's seat is [`README.md`](../README.md); how to build and test is
 ## 1. The core
 
 Cram reads and writes many formats, but almost none of the interesting code is format-specific. A
-backend only knows how to yield entry **metadata** and entry **bytes**. Everything else, safe output
-paths, overwrite/skip policy, progress, cancellation, the parallel scheduler; lives once in the
-engine, so every format inherits it and adding a format means implementing two small traits rather
-than re-plumbing the world.
+backend only knows how to yield entry **metadata** and entry **bytes**. Everything else lives once in
+the engine: safe output paths, overwrite and skip policy, progress, cancellation, the parallel
+scheduler. So every format inherits all of it, and adding a format means implementing two small
+traits rather than re-plumbing the world.
 
 The traits are in [`cram-core/src/reader.rs`](../crates/cram-core/src/reader.rs) and
 [`writer.rs`](../crates/cram-core/src/writer.rs):
@@ -56,6 +56,7 @@ in the engine.
 | **`cram-recovery`** | Reed-Solomon parity **sidecar** (`.cramrec`): store parity, later repair bit-rot or truncation. Works on any file. |
 | **`cram-sign`** | detached **ed25519** signature sidecar (`.cramsig`), authorship plus integrity. Works on any file. |
 | **`cram-extract`** | a standalone, dependency-minimal `.cram` decoder, which also serves as the self-extractor (SFX) stub. Shares no code with `cram-core` by design (§6). |
+| **`cram-shell`** | the Explorer right-click menu: a COM `IContextMenu` handler built as a cdylib and loaded **into explorer.exe** (§9). Depends only on the `windows` crate, not on the engine. |
 | **`rdm-core`** | the segmented, resumable, multi-source **download engine** (library, no GUI) behind `cram dl` and extract-while-download. Vendored in-tree. |
 
 `cram-extract`'s whole manifest is four decode-only, pure-Rust crates: `lzma-rust2` (XZ), `ruzstd`
@@ -68,7 +69,9 @@ feature is off**, so an external path breaks every crate in the workspace on a f
 
 `cram-mount`, `cram-recovery` and `cram-sign` are libraries whose command-line logic lives in a
 `cli::main` the unified `cram` binary calls. The workspace's other binaries are `cram-extract` and
-`calibrate`, an internal hardware-measurement tool in `cram-core`.
+`calibrate`, an internal hardware-measurement tool in `cram-core`. `cram-shell` is neither a library
+for the CLI nor a binary: it is a cdylib the operating system loads, and the only thing `cram-cli`
+does with it is write the registry keys that point at it.
 
 ---
 
@@ -191,9 +194,9 @@ members and there is no runtime signal of it.
 spines composed: read any source front-to-back and stream each entry into a destination writer, so
 every readable × writable pair works without per-pair code. One limit: a **bare single-stream** source
 of unknown length must be buffered to learn its size before a size-trusting destination will accept
-it, and convert refuses above **2 GiB** rather than hold that much in RAM. Encryption is not inherited
-, converting an encrypted source produces a plaintext archive unless the caller supplies `--encrypt`
-for the destination.
+it, and convert refuses above **2 GiB** rather than hold that much in RAM. Encryption is not
+inherited: converting an encrypted source produces a plaintext archive unless the caller supplies
+`--encrypt` for the destination.
 
 `dedup` ([`engine/dedup.rs`](../crates/cram-core/src/engine/dedup.rs)) works on loose files rather
 than archives: it finds the same file in several places across folders and drives. Three gates run in
@@ -268,8 +271,8 @@ reject what it does not understand rather than guess. Every build can *decode* z
 always-present pure-Rust decoder, so archives stay readable across build configurations.
 
 `cram-extract` is an independent implementation of this spec. It proves the document is implementable
-on its own and gives users a small, auditable tool that can recover their data without the main build
-, which is why it shares no code with `cram-core`.
+on its own and gives users a small, auditable tool that can recover their data without the main
+build, which is why it shares no code with `cram-core`.
 
 ---
 
@@ -326,7 +329,41 @@ carry no linkage; only the function bindings do.
 
 ---
 
-## 9. Safety model
+## 9. The Explorer menu
+
+[`cram-shell`](../crates/cram-shell) is a COM `IContextMenu` handler. Explorer loads it in-process,
+calls `Initialize` with the selection, `QueryContextMenu` to add items, and `InvokeCommand` when one
+is chosen, at which point it spawns `cram.exe` and returns.
+
+**Why COM rather than registry verbs.** Plain `HKCR\<type>\shell\<verb>` entries are far simpler and
+were tried first, in this project's predecessor: they did not render. A COM handler does, and it is
+the same mechanism WinRAR and 7-Zip use. The price is that this code runs inside somebody else's
+process, which sets the constraints:
+
+- **Never block.** `InvokeCommand` spawns and returns; it does not wait for an extraction.
+- **Never panic across the boundary.** Every entry point returns an `HRESULT`, and unwinding into
+  Explorer's C++ frames is undefined behaviour, so the panic-prone work is kept out rather than
+  caught.
+- **Do almost nothing in `QueryContextMenu`.** It runs on every right-click, so it reads file
+  *extensions* and never opens a file to sniff it.
+- **Take no dependency that pulls in a runtime DLL.** `cram_shell.dll` currently imports only OS
+  libraries, unlike `cram.exe`, which needs `libwinpthread-1.dll`. That is what lets Explorer load
+  it wherever it happens to be installed; a dependency that reintroduced a runtime DLL would make
+  the menu silently fail to appear.
+
+The menu is one submenu whose contents depend on the selection: extract verbs when everything
+selected is an archive, create verbs otherwise. The two entries that open Cram Studio appear only
+when `cram-studio.exe` is actually beside the DLL, so a CLI-only install never offers to launch
+something that is not installed.
+
+Registration is `cram shell install` ([`cram-cli/src/shell.rs`](../crates/cram-cli/src/shell.rs)),
+which writes three `HKCU` keys through `reg.exe`: the class id, its `InprocServer32` pointing at the
+DLL with `ThreadingModel=Apartment`, and the handler entry under `*` and `Directory`. HKCU only, so
+no elevation and nothing changed for other accounts.
+
+---
+
+## 10. Safety model
 
 Archives are untrusted input, so hardening is centralized rather than sprinkled through the backends.
 
@@ -368,7 +405,7 @@ Archives are untrusted input, so hardening is centralized rather than sprinkled 
 
 ---
 
-## 10. Build shape
+## 11. Build shape
 
 - **Pure Rust apart from the pieces named here.**
   - **UnRAR is C++ and is not optional.** `unrar` is a plain dependency of `cram-core`, so every build
@@ -379,7 +416,9 @@ Archives are untrusted input, so hardening is centralized rather than sprinkled 
   - **`zstd-c`** (off by default) adds the C libzstd encoder, which gives `.cram` packs the full zstd
     level range; `ruzstd` only encodes at its fastest setting. Any build can *decode* zstd packs, so
     enabling it does not fork the format.
-  - **`libdeflate`** (off by default) is a further opt-in C gate.
+  - **`libdeflate`** (off by default) adds the C libdeflate dependency and nothing else. No code
+    path selects it, so DEFLATE goes through `flate2` / miniz_oxide whether it is on or not, and
+    enabling it to benchmark DEFLATE measures nothing. It is a placeholder for work not yet done.
   - **`download`** (off by default) pulls in `rdm-core` and its async/HTTP dependencies for `cram dl`
     and extract-while-download.
   - `cram --version` prints which of these the binary was built with.

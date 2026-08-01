@@ -17,9 +17,9 @@ authoritative toolchain setup; the short form:
 cargo build --release
 ```
 
-At the workspace root that builds every member, the engine, the CLI, the sidecar and mount
-libraries, the standalone decoder, and the vendored `rdm-core` download engine; with default
-features. For just the two binaries you actually run:
+At the workspace root that builds every member with default features: the engine, the CLI, the
+sidecar and mount libraries, the standalone decoder, the Explorer shell handler, and the vendored
+`rdm-core` download engine. For just the two binaries you actually run:
 
 ```sh
 cargo build --release -p cram-cli -p cram-extract
@@ -41,7 +41,8 @@ Optional features are opt-in so the base build always compiles:
 | Feature | Effect |
 |---|---|
 | `zstd-c` | full-range zstd encoder (C libzstd). **The shipped binary is built with this**, it is not a pure-Rust build. |
-| `download` | `cram dl` segmented downloader. Opens no listening socket. |
+| `download` | `cram dl` segmented downloader, and `cram update`. Opens no listening socket. |
+| `phash` | perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos. Pure Rust, but a large dependency tree. |
 
 There is also a `libdeflate` feature, which `cram --version` lists. It only adds the C libdeflate
 dependency to the build: no code path selects it, so every DEFLATE inflate and deflate goes through
@@ -50,8 +51,20 @@ dependency to the build: no code path selects it, so every DEFLATE inflate and d
 The release CLI is built as:
 
 ```sh
-cargo build --release -p cram-cli --features download,zstd-c --bin cram
+cargo build --release -p cram-cli --features download,zstd-c,phash --bin cram
 ```
+
+The Explorer menu is a separate cdylib and has to be built too, or `cram shell install` has nothing
+to register:
+
+```sh
+cargo build --release -p cram-shell
+```
+
+That produces `target/release/cram_shell.dll`, which belongs beside `cram.exe`. Keep its dependency
+list to the `windows` crate: it is loaded into `explorer.exe`, and it currently imports only OS
+libraries. A dependency that pulled in a runtime DLL the way `cram.exe` pulls in
+`libwinpthread-1.dll` would make the menu silently stop appearing.
 
 `cram --version` prints which of these are compiled in, worth checking before you report a bug,
 since a `zstd-c` build writes different `.cram` bytes than the pure-Rust default.
@@ -79,9 +92,13 @@ cargo test -p cram-core         # one crate
 cargo test -- --ignored         # runs ONLY the ignored (heavy) tests
 ```
 
-As of 1.0.0 that is **149 passing tests, 0 failures**. One further test is marked `#[ignore]`: it
-pushes more than 16 MiB through the pure-Rust XZ compressor and is skipped by default for time, not
-because it fails.
+On default features that is **174 passing tests, 0 failures**, and **185** with the features the
+release is built with (`download,zstd-c,phash`), which compile code the default build leaves out.
+
+One test is marked `#[ignore]` on default features: it pushes more than 16 MiB through the pure-Rust
+XZ compressor and is skipped for time, not because it fails. A `download` build has a second, named
+`sleeper`, which is not a test at all; it is the child process that
+`a_running_binary_can_still_be_replaced` starts so it has a genuinely running executable to replace.
 
 [`crates/cram-core/tests/fuzz_parsers.rs`](crates/cram-core/tests/fuzz_parsers.rs) runs as part of
 that suite: a bounded smoke-fuzz of every pure-Rust parser (150 iterations each by default). Raise it

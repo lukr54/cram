@@ -7,10 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [1.0.0], 2026-07-24
+## [1.0.0], unreleased
 
 First public release of the Cram engine and command line. Everything below is new, so there is
-nothing to list as changed or fixed.
+nothing to list as changed or fixed. The date goes in when the tag does; nothing has been published
+yet, so the link at the foot of this file will 404 until then.
 
 ### Added
 
@@ -97,6 +98,18 @@ are served by byte range straight from disk; tar, 7z, RAR and bare compressed st
 into RAM up front and capped at 2 GiB. ProjFS is an optional Windows feature (`Client-ProjFS`, off by
 default); the DLL is bound lazily at run time, so every other command works whether or not it is
 enabled.
+
+**`cram shell`**, Cram on the Windows Explorer right-click menu. Extract here, extract to a
+subfolder and test on an archive; add to a `.cram` or a `.zip` on anything else. A COM
+`IContextMenu` handler, the same mechanism WinRAR and 7-Zip use, registered under `HKCU` only so it
+needs no elevation and changes nothing for other accounts. On Windows 11 it appears under "Show more
+options". `cram shell uninstall` removes it and `cram shell status` reports what is registered.
+
+**`cram update`**, replace the installation with the latest published release. It fetches the
+checksum the release publishes before downloading anything and refuses to install what it cannot
+verify; the download URL is built locally rather than taken from the API response; and the running
+binary is replaced by a move-aside and a rename, so a failure leaves the previous version in place.
+`--check` reports and changes nothing. Needs the `download` feature.
 
 **`cram conv`**, re-export any readable archive into another format, so no archive is a dead end.
 Conversion does not carry encryption across: `-p` opens an encrypted *source*, `--encrypt <pw>`

@@ -15,7 +15,8 @@ in full in the companion `THIRD-PARTY-LICENSES.md`.
 ## 1. UnRAR (RARLAB), RAR decoding
 
 Cram reads RAR archives using the official UnRAR C++ engine (via the `unrar` / `unrar_sys` crates),
-statically linked into `cram.exe` and `cram-studio.exe`.
+statically linked into `cram.exe`. It is not linked into `cram-extract.exe`, which depends on none of
+the engine, nor into `cram_shell.dll`, which depends only on the Windows API.
 
 **Cram never creates RAR archives, and never will**: clause 2 below forbids using this source to
 develop a RAR-compatible archiver or to re-create the RAR compression algorithm. Cram's RAR support
@@ -139,6 +140,9 @@ materials provided with the distribution, which is what this section is.
 Cram is built with the MinGW-w64 (GNU) toolchain. The UnRAR C++ code pulls in the pthreads shim, and
 that one runtime DLL is redistributed next to the executables (`libwinpthread-1.dll`); libstdc++ and
 libgcc are linked statically and are not shipped.
+
+It is `cram.exe` that needs it. `cram-extract.exe` and `cram_shell.dll` import only Windows' own
+libraries and would run without it, though it ships in the same folder as all three.
 
 ```
 Copyright (c) 2011 mingw-w64 project

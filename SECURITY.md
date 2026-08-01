@@ -4,8 +4,8 @@ Cram parses files that come from other people, downloads, mail attachments, a co
 This document says where to report a problem, what counts as one, and which protections exist.
 
 It covers the code in this repository: the `cram-core` engine, the `cram` CLI, the `cram-sign`,
-`cram-recovery` and `cram-mount` sidecars, and the standalone `cram-extract` decoder. The **In scope**
-table below is the specific list.
+`cram-recovery` and `cram-mount` sidecars, the standalone `cram-extract` decoder, and the
+`cram-shell` Explorer handler. The **In scope** table below is the specific list.
 
 ---
 
@@ -61,6 +61,8 @@ Anything below, reachable by feeding Cram a file you control:
 | **Crypto** | [`formats/cram.rs`](crates/cram-core/src/formats/cram.rs), [`cram-sign`](crates/cram-sign/src/lib.rs) | `.cram` Argon2id + AES-256-GCM, ZIP/7z AES-256, and `cram verify` accepting a `.cramsig` that a given key never produced |
 | **Recovery sidecar reader** | [`crates/cram-recovery`](crates/cram-recovery/src/lib.rs) | a hostile `.cramrec` that crashes or forces an absurd allocation |
 | **Standalone decoder** | [`crates/cram-extract`](crates/cram-extract/src/main.rs) | it is shipped to people who may have no other tool to hand; it gets the same scrutiny as the engine |
+| **Explorer handler** | [`crates/cram-shell`](crates/cram-shell/src/lib.rs) | it runs **inside explorer.exe**: anything that lets a crafted file name reach a command line unquoted, crash Explorer, or make a menu verb act on a path the user did not select |
+| **Self-update** | [`cram-cli/src/update.rs`](crates/cram-cli/src/update.rs) | it replaces the running binary: anything that lets an unverified, wrong-version or attacker-chosen payload be installed |
 
 ## Out of scope
 
@@ -112,6 +114,19 @@ optional features add more C: `zstd-c` links C libzstd and `libdeflate` links C 
 on by default, and `cram --version` prints which of them a binary was built with; worth including in
 a report.
 
+**`cram update` refuses what it cannot verify.** The update path fetches the checksum the release
+publishes *before* it downloads anything, and a checksum that is missing, unreadable or unmatched is
+a refusal rather than a warning. The download URL is built locally from a character-checked tag and
+this build's own target triple, never taken from the API response, so whoever answers the request
+does not get to choose what is installed. The replacement is a move-aside followed by a rename, so a
+failure leaves the previous binary in place rather than a half-written one.
+
+**The Explorer handler stays small on purpose.** `cram-shell` runs inside `explorer.exe`, so it never
+blocks, never lets a panic cross the FFI boundary, and does no file I/O while building the menu, only
+extension matching. Selected paths are quoted before they reach a command line, including the
+embedded-quote case. It registers under `HKCU` alone, so installing or removing the menu needs no
+elevation and changes nothing for other accounts.
+
 These are the protections that are built. They are not a claim that Cram handles hostile input better
 than any other tool, treat an archive from a stranger as hostile whatever you open it with.
 
@@ -125,9 +140,9 @@ to be caught only for ZIP, for 7z entries that carry a stored CRC, and for compr
 none because the AES authentication already proves the content is intact; such an entry is verified by
 that authentication instead.)
 
-Everywhere else, an **unencrypted, stored `.cram`**, **`tar` / `.tar.zst`**, **ISO 9660**, **RAR**,
-and a **7z entry that carries no stored CRC**, Cram has no per-entry content checksum to compare
-against. A pass there means every entry decoded cleanly and its decoded length matched the declared
+Everywhere else Cram has no per-entry content checksum to compare against: an **unencrypted, stored
+`.cram`**, **`tar` / `.tar.zst`**, **ISO 9660**, **RAR**, and a **7z entry that carries no stored
+CRC**. A pass there means every entry decoded cleanly and its decoded length matched the declared
 size, plus whatever the underlying decoder rejects; it does not prove the bytes are the original ones.
 Truncation and structural damage *are* caught.
 
