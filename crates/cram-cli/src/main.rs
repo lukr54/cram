@@ -4,13 +4,14 @@
 //! cram l  <archive>                            list entries
 //! cram x  <archive> [-o <dir>] [-p <pw>]       extract (parallel per-entry for ZIP) [--skip]
 //! cram a  <archive> <input...> [-p <pw>]       create [--store|--fast|--best] [--encrypt-names]
+//!                                              [--overwrite] to replace an existing <archive>
 //! cram t  <archive> [-p <pw>]                  test integrity (decode + checksums, no extract)
 //! cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format
 //! cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>]   download (segmented, multi-mirror,
 //!                                              --discover / --auto / --sha256) [--features download]
-//! cram dedup <folder|file…> [--similar]        find duplicate files across folders/drives
-//!                                              (read-only report; --similar also flags
-//!                                              visually-alike images for human review)
+//! cram dedup <folder|file…> [--similar]        find duplicate files across folders/drives; reports
+//!                                              unless --link / --quarantine --apply reclaim the
+//!                                              space. --similar also flags alike images.
 //! cram mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)
 //! cram rec <create|verify|repair> <file> …     Reed-Solomon recovery sidecar
 //! cram sign|verify|keygen …                    ed25519 signing
@@ -78,7 +79,6 @@ fn main() -> ExitCode {
             let enabled: Vec<&str> = [
                 ("zstd-c", cfg!(feature = "zstd-c")),
                 ("download", cfg!(feature = "download")),
-                ("libdeflate", cfg!(feature = "libdeflate")),
                 ("phash", cfg!(feature = "phash")),
             ]
             .iter()
@@ -92,6 +92,12 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        // Asked for by name, so the usage block is the answer rather than context for an error:
+        // stdout, and a success code, so `cram --help | less` works.
+        Some("--help") | Some("-h") | Some("help") => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
         // Sub-crate CLIs own their own exit code. `rec` is namespaced (its create/verify collide with
         // the archive verbs), so its subcommand starts at args[2]; the others align at args[1].
         Some("mount") => cram_mount::cli::main(&args[1..]),
@@ -100,10 +106,21 @@ fn main() -> ExitCode {
         Some("make-sfx") => make_sfx(&args),
         // Archive verbs return `Result` and share one error rendering + exit code.
         _ => match run(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
+            Some(Ok(())) => ExitCode::SUCCESS,
+            Some(Err(e)) => {
                 eprintln!("cram: {e}");
                 ExitCode::FAILURE
+            }
+            // A typo that exits 0 is worse than one that fails loudly: `cram exract deps.zip -o
+            // build/ && make` would go on to build against an empty tree. 2 is what the sub-crate
+            // CLIs here already return for a usage error.
+            None => {
+                match args.get(1) {
+                    Some(verb) => eprintln!("cram: unknown command '{verb}'"),
+                    None => eprintln!("cram: no command given"),
+                }
+                usage();
+                ExitCode::from(2)
             }
         },
     }
@@ -190,7 +207,7 @@ fn isolated_rar_extract(archive: &Path, dir: &Path, args: &[String]) -> Result<(
         .arg("-o")
         .arg(dir)
         .env(RAR_WORKER_ENV, "1");
-    if let Some(pw) = opt(args, "-p") {
+    if let Some(pw) = opt(args, "-p")? {
         cmd.arg("-p").arg(pw);
     }
     match cmd.status() {
@@ -225,9 +242,11 @@ fn names_rar_file(arg: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn run(args: &[String]) -> Result<()> {
+/// Dispatch an archive verb. `None` means the verb is not one of ours; the caller decides what to
+/// say and which code to exit with, so the verb list stays in one place.
+fn run(args: &[String]) -> Option<Result<()>> {
     let cmd = args.get(1).map(String::as_str);
-    match cmd {
+    Some(match cmd {
         Some("l") | Some("list") => list(args),
         Some("x") | Some("extract") => extract(args),
         Some("a") | Some("add") | Some("create") => create(args),
@@ -237,57 +256,44 @@ fn run(args: &[String]) -> Result<()> {
         Some("dedup") | Some("dupes") => dedup_cmd(args),
         Some("update") | Some("upgrade") => update_cmd(args),
         Some("shell") => shell::shell_cmd(args),
-        _ => {
-            usage();
-            Ok(())
-        }
-    }
+        _ => return None,
+    })
 }
 
+const USAGE: &str = "\
+usage: cram <command> …
+  l  <archive>                        list entries
+  x  <archive> [-o <dir>] [-p <pw>]   extract [--skip]
+  a  <archive> <input...> [-p <pw>]   create [--store|--fast|--best] [--encrypt-names]
+       .cram losslessly recompresses JPEGs (~23%, exact originals restored on extract);
+       --no-recompress stores them as-is instead
+       --overwrite (-y) replaces an existing <archive>; without it cram refuses, because
+       `a` creates a new archive rather than adding to one
+  t  <archive> [-p <pw>]              test integrity (decode + checksums, no extract)
+  conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--best|--fast|--store]
+       also refuses an existing <out> unless --overwrite
+  dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]
+       several urls = mirrors of one file · --discover finds mirrors · --auto ramps
+       connections · --sha256 <hex> verifies (a Metalink supplies it automatically)
+  mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)
+  dedup <folder|file…> [--similar] [--min-size <bytes>] [--json]
+       find duplicate files across folders/drives, reports only by default
+       [--link] [--quarantine <dir>] [--keep shortest|oldest|first] [--apply]
+       reclaim space: --link hard-links copies (every path stays put), --quarantine
+       moves them aside. Previews unless --apply. Nothing is ever deleted.
+  rec <create|verify|repair> <file> …   Reed-Solomon recovery sidecar
+  sign <file> -k <keyfile> | verify <file> [--key <hex>] | keygen <keyfile>
+  make-sfx <archive.cram> <out.exe>   build a self-extracting executable
+  shell <install|uninstall|status>    Cram on Explorer's right-click menu (Windows)
+  update [--check] [--force]          install the latest published release
+       downloads it, verifies the published SHA-256, replaces this install;
+       --check only reports what is available
+  --version                           version + which optional features are compiled in";
+
+/// The usage block as *context for an error*, so it goes to stderr and stays out of a pipe. When it
+/// was asked for by name, `main` prints it to stdout instead.
 fn usage() {
-    eprintln!("usage: cram <command> …");
-    eprintln!("  l  <archive>                        list entries");
-    eprintln!("  x  <archive> [-o <dir>] [-p <pw>]   extract [--skip]");
-    eprintln!(
-        "  a  <archive> <input...> [-p <pw>]   create [--store|--fast|--best] [--encrypt-names]"
-    );
-    eprintln!(
-        "       .cram losslessly recompresses JPEGs (~23%, exact originals restored on extract);"
-    );
-    eprintln!("       --no-recompress stores them as-is instead");
-    eprintln!(
-        "  t  <archive> [-p <pw>]              test integrity (decode + checksums, no extract)"
-    );
-    eprintln!("  conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--best|--fast|--store]");
-    eprintln!("  dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]");
-    eprintln!(
-        "       several urls = mirrors of one file · --discover finds mirrors · --auto ramps"
-    );
-    eprintln!(
-        "       connections · --sha256 <hex> verifies (a Metalink supplies it automatically)"
-    );
-    eprintln!(
-        "  mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)"
-    );
-    eprintln!("  dedup <folder|file…> [--similar] [--min-size <bytes>] [--json]");
-    eprintln!("       find duplicate files across folders/drives, reports only by default");
-    eprintln!("       [--link] [--quarantine <dir>] [--keep shortest|oldest|first] [--apply]");
-    eprintln!(
-        "       reclaim space: --link hard-links copies (every path stays put), --quarantine"
-    );
-    eprintln!("       moves them aside. Previews unless --apply. Nothing is ever deleted.");
-    eprintln!("  rec <create|verify|repair> <file> …   Reed-Solomon recovery sidecar");
-    eprintln!("  sign <file> -k <keyfile> | verify <file> [--key <hex>] | keygen <keyfile>");
-    eprintln!("  make-sfx <archive.cram> <out.exe>   build a self-extracting executable");
-    eprintln!(
-        "  shell <install|uninstall|status>    Cram on Explorer's right-click menu (Windows)"
-    );
-    eprintln!("  update [--check] [--force]          install the latest published release");
-    eprintln!("       downloads it, verifies the published SHA-256, replaces this install;");
-    eprintln!("       --check only reports what is available");
-    eprintln!(
-        "  --version                           version + which optional features are compiled in"
-    );
+    eprintln!("{USAGE}");
 }
 
 /// Is `flag` present anywhere in `args`?
@@ -331,12 +337,18 @@ fn streamable_fmt_from_name(name: &str) -> Option<Format> {
 /// would otherwise become a traversal on Windows. `EntryPath::from_raw` applies the same rules as
 /// archive entries (rejects `..`/absolute/`:`/NUL, mangles device names); anything that doesn't
 /// reduce to exactly one component falls back to `download.bin`.
+///
+/// The device-name mangle is applied here rather than being read out of `safe()`: it belongs at the
+/// point a name becomes a path on disk, so a URL ending `/nul` is written as `_nul` instead of
+/// opening the Win32 null device and reporting a successful download of nothing.
 #[cfg(feature = "download")]
 fn filename_from_url(url: &str) -> String {
     let stem = url.split(['?', '#']).next().unwrap_or(url);
     let seg = stem.trim_end_matches('/').rsplit('/').next().unwrap_or("");
     match cram_core::model::EntryPath::from_raw(seg) {
-        Some(p) if p.safe().components().count() == 1 => p.safe().to_string_lossy().into_owned(),
+        Some(p) if p.safe().components().count() == 1 => {
+            cram_core::model::mangle_dos_device(&p.safe().to_string_lossy()).into_owned()
+        }
         _ => "download.bin".to_string(),
     }
 }
@@ -426,13 +438,13 @@ fn download_cmd(args: &[String]) -> Result<()> {
 
     let discover = has(args, "--discover");
     let auto = has(args, "--auto");
-    let conns_explicit = opt(args, "-n").is_some();
-    let conns: usize = opt(args, "-n").and_then(|s| s.parse().ok()).unwrap_or(8);
-    let chunk: u64 = opt(args, "--chunk")
+    let conns_explicit = opt(args, "-n")?.is_some();
+    let conns: usize = opt(args, "-n")?.and_then(|s| s.parse().ok()).unwrap_or(8);
+    let chunk: u64 = opt(args, "--chunk")?
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
-    let extract = opt(args, "--extract").map(PathBuf::from);
-    let mut expected_sha = opt(args, "--sha256").map(str::to_string);
+    let extract = opt(args, "--extract")?.map(PathBuf::from);
+    let mut expected_sha = opt(args, "--sha256")?.map(str::to_string);
 
     // Mirror discovery: a `.meta4`/`.metalink` input, or `--discover` on a single URL, expands to a
     // verified mirror list (+ maybe a whole-file SHA-256). Only for a single input, several given
@@ -461,7 +473,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
 
     // Output name comes from the (post-discovery) anchor source, so a `.meta4` input yields the real
     // filename rather than "foo.meta4".
-    let out = opt(args, "-o")
+    let out = opt(args, "-o")?
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(filename_from_url(&sources[0])));
     let name = out.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -506,7 +518,7 @@ fn download_cmd(args: &[String]) -> Result<()> {
                 let report =
                     stream::extract_stream(src, fmt, dir, ExtractOptions::default(), &NullSink)?;
                 println!(
-                    "extracted {} files ({:.1} MiB) to {}",
+                    "extracted {} file(s) ({:.1} MiB) to {}",
                     report.extracted,
                     report.bytes as f64 / (1024.0 * 1024.0),
                     dir.display()
@@ -568,12 +580,12 @@ fn download_cmd(args: &[String]) -> Result<()> {
         let report = engine::extract(
             &out,
             dir,
-            password_provider(args),
+            password_provider(args)?,
             Default::default(),
             &NullSink,
         )?;
         println!(
-            "extracted {} files ({}) to {}",
+            "extracted {} file(s) ({}) to {}",
             report.extracted,
             fmt.label(),
             dir.display()
@@ -590,53 +602,181 @@ fn download_cmd(args: &[String]) -> Result<()> {
 /// via the exit code, not just stderr text. Every command that extracts routes through here.
 fn report_issues(report: &cram_core::error::Report) -> Result<()> {
     if !report.failed.is_empty() {
-        eprintln!("{} failures:", report.failed.len());
+        eprintln!("{} failure(s):", report.failed.len());
         for (name, err) in &report.failed {
-            eprintln!("  {name}: {err}");
+            eprintln!("  {}: {err}", printable(name));
         }
     }
     if report.cancelled {
         eprintln!("(cancelled)");
     }
-    if !report.failed.is_empty() {
-        return Err(cram_core::error::ArchiveError::Backend(format!(
-            "extraction completed with {} failure(s)",
-            report.failed.len()
-        )));
+    // `Report::is_ok` is the engine's own predicate and covers cancellation too. Gating on `failed`
+    // alone reported a half-finished extract as a success.
+    if report.is_ok() {
+        return Ok(());
+    }
+    Err(cram_core::error::ArchiveError::Backend(
+        if report.cancelled {
+            format!(
+                "extraction was cancelled after {} file(s), the destination is incomplete",
+                report.extracted
+            )
+        } else {
+            format!(
+                "extraction completed with {} failure(s)",
+                report.failed.len()
+            )
+        },
+    ))
+}
+
+/// Value of a `-flag value` option. A flag given as the *last* argument is an error rather than a
+/// silent `None`: `cram x a.zip -o` used to fall back to the default destination and write somewhere
+/// the user never named.
+fn opt<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>> {
+    match args.iter().position(|a| a == flag) {
+        None => Ok(None),
+        Some(i) => match args.get(i + 1) {
+            Some(v) => Ok(Some(v.as_str())),
+            None => Err(cram_core::error::ArchiveError::Backend(format!(
+                "{flag} needs a value after it"
+            ))),
+        },
+    }
+}
+
+fn password_provider(args: &[String]) -> Result<Arc<dyn PasswordProvider>> {
+    Ok(match opt(args, "-p")? {
+        Some(pw) => Arc::new(FixedPassword(Secret::new(pw))),
+        None => Arc::new(NoPassword),
+    })
+}
+
+/// Refuse to write over something already at `path` unless the user asked for it. `cram a` is
+/// spelled like 7-Zip's append but creates a new archive, so an unguarded run replaces the file the
+/// user meant to add to; the staging-and-rename discipline only ever protected the *failure* path.
+/// `cram-sign`'s keygen takes the same line for keyfiles.
+fn overwrite_guard(path: &Path, args: &[String]) -> Result<()> {
+    // A password of `-y` is a password. Reading it as consent would make the guard bypassable by
+    // the one thing it exists to protect against.
+    let asked = |flag: &str| {
+        args.iter().enumerate().any(|(i, a)| {
+            a == flag
+                && !matches!(
+                    args.get(i.wrapping_sub(1)).map(String::as_str),
+                    Some("-p") | Some("--encrypt")
+                )
+        })
+    };
+    if !path.exists() || asked("--overwrite") || asked("-y") {
+        return Ok(());
+    }
+    // Naming the cause matters on `a`: the user typed what 7-Zip spells as an append.
+    let why = match args.get(1).map(String::as_str) {
+        Some("a") | Some("add") | Some("create") => {
+            " (cram a creates a new archive, it does not add to an existing one)"
+        }
+        _ => "",
+    };
+    Err(cram_core::error::ArchiveError::Backend(format!(
+        "{} already exists; pass --overwrite to replace it{why}",
+        path.display()
+    )))
+}
+
+/// Index of a read verb's first positional argument: right after the verb, or one further along when
+/// a `--` separates them. Both `check_args` and the verbs themselves locate their archive through
+/// this, so the check cannot disagree with what is then opened.
+fn first_positional(args: &[String]) -> usize {
+    if args.get(2).map(String::as_str) == Some("--") {
+        3
+    } else {
+        2
+    }
+}
+
+/// Reject anything a read verb does not understand, instead of ignoring it. Ignoring is how
+/// `cram x bundle.zip -o sel src/a.txt` came to extract the whole archive rather than the one named
+/// entry, and how `--overwrite`, `-y`, `--force` and `-r` were accepted as no-ops while files were
+/// replaced anyway. `positionals` counts the arguments the verb reads by index, the verb excluded.
+///
+/// Those positionals are exempt from the option check, because position is what identifies them: an
+/// archive really can be named `-weird.zip`, and calling that a typo would contradict
+/// `create_inputs`, which already treats such a name as a path. A `--` says the same explicitly.
+fn check_args(args: &[String], positionals: usize, flags: &[&str], valued: &[&str]) -> Result<()> {
+    let verb = args.get(1).map(String::as_str).unwrap_or("");
+    let extracting = matches!(verb, "x" | "extract");
+    let mut i = first_positional(args).saturating_add(positionals);
+    while i < args.len() {
+        let a = args[i].as_str();
+        if valued.contains(&a) {
+            i += 2; // the next argument is this flag's value; `opt` reports it when it is missing
+        } else if flags.contains(&a) {
+            i += 1;
+        } else if a.len() > 1 && a.starts_with('-') {
+            // The overwrite family is the trap worth naming: it reads like a safety flag and did
+            // nothing, on a verb that replaces existing files without being asked.
+            let hint = match a {
+                "--overwrite" | "-y" | "--force" | "-f" if extracting => {
+                    ", extraction replaces existing files by default; --skip keeps them instead"
+                }
+                _ => "",
+            };
+            return Err(cram_core::error::ArchiveError::Backend(format!(
+                "cram {verb}: unrecognised option '{a}'{hint}"
+            )));
+        } else {
+            let why = if extracting {
+                "cram x extracts the whole archive; selecting individual entries is not \
+                 supported yet, so this would have been ignored"
+            } else {
+                "this verb does not take it"
+            };
+            return Err(cram_core::error::ArchiveError::Backend(format!(
+                "cram {verb}: unexpected argument '{a}', {why}"
+            )));
+        }
     }
     Ok(())
 }
 
-/// Value of a `-flag value` option.
-fn opt<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
-}
-
-fn password_provider(args: &[String]) -> Arc<dyn PasswordProvider> {
-    match opt(args, "-p") {
-        Some(pw) => Arc::new(FixedPassword(Secret::new(pw))),
-        None => Arc::new(NoPassword),
+/// Entry names come out of the archive and are attacker-controlled: an ESC starts an ANSI sequence
+/// the terminal obeys, and a newline forges a whole listing row. Render control characters visibly
+/// rather than emitting them. `EntryPath::safe()` is not a substitute, it keeps ESC/CR/LF.
+fn printable(name: &str) -> String {
+    if !name.chars().any(char::is_control) {
+        return name.to_string();
     }
+    let mut out = String::with_capacity(name.len() + 8);
+    for c in name.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:04x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn list(args: &[String]) -> Result<()> {
-    let archive = args.get(2).map(PathBuf::from).ok_or_else(|| {
-        usage();
-        cram_core::error::ArchiveError::Backend("missing archive path".into())
-    })?;
+    check_args(args, 1, &[], &["-p"])?;
+    let archive = args
+        .get(first_positional(args))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            usage();
+            cram_core::error::ArchiveError::Backend("missing archive path".into())
+        })?;
     let fmt = sniff::sniff_path(&archive)?;
     // Honor `-p` so an encrypted-names archive (7z `-mhe`, `.cram`) can still be listed.
-    let reader = formats::open(&archive, fmt, password_provider(args))?;
+    let reader = formats::open(&archive, fmt, password_provider(args)?)?;
     let entries = reader.entries()?;
     println!("{} ({} entries)", fmt.label(), entries.len());
     let mut total = 0u64;
     for e in entries {
         let kind = if e.is_dir() { "d" } else { "-" };
         let lock = if e.encrypted { " [encrypted]" } else { "" };
-        println!("  {kind} {:>12}  {}{lock}", e.size, e.name());
+        println!("  {kind} {:>12}  {}{lock}", e.size, printable(e.name()));
         // Declared sizes are untrusted header fields (ZIP64 permits u64::MAX per entry): the sum
         // must saturate, not wrap (release) or panic (debug), on a hostile listing.
         total = total.saturating_add(e.size);
@@ -646,14 +786,18 @@ fn list(args: &[String]) -> Result<()> {
 }
 
 fn extract(args: &[String]) -> Result<()> {
-    let archive = args.get(2).map(PathBuf::from).ok_or_else(|| {
-        usage();
-        cram_core::error::ArchiveError::Backend("missing archive path".into())
-    })?;
-    let dest = opt(args, "-o")
+    check_args(args, 1, &["--skip"], &["-o", "-p"])?;
+    let archive = args
+        .get(first_positional(args))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            usage();
+            cram_core::error::ArchiveError::Backend("missing archive path".into())
+        })?;
+    let dest = opt(args, "-o")?
         .map(PathBuf::from)
         .unwrap_or_else(|| default_dest(&archive));
-    let pw = password_provider(args);
+    let pw = password_provider(args)?;
     let opts = ExtractOptions {
         skip_existing: has(args, "--skip"),
     };
@@ -669,7 +813,7 @@ fn extract(args: &[String]) -> Result<()> {
         String::new()
     };
     println!(
-        "extracted {} files{} ({:.1} MiB) to {} in {:.2}s ({:.0} MiB/s)",
+        "extracted {} file(s){} ({:.1} MiB) to {} in {:.2}s ({:.0} MiB/s)",
         report.extracted,
         skipped,
         mib,
@@ -684,11 +828,15 @@ fn extract(args: &[String]) -> Result<()> {
 /// `test`, decode every entry and verify stored checksums without extracting. Exit non-zero if any
 /// entry fails, so it's usable in scripts / CI ("is this archive still good?").
 fn test_cmd(args: &[String]) -> Result<()> {
-    let archive = args.get(2).map(PathBuf::from).ok_or_else(|| {
-        usage();
-        cram_core::error::ArchiveError::Backend("missing archive path".into())
-    })?;
-    let pw = password_provider(args);
+    check_args(args, 1, &[], &["-p"])?;
+    let archive = args
+        .get(first_positional(args))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            usage();
+            cram_core::error::ArchiveError::Backend("missing archive path".into())
+        })?;
+    let pw = password_provider(args)?;
 
     let t0 = Instant::now();
     let rep = engine::verify::verify(&archive, pw, &NullSink)?;
@@ -703,7 +851,7 @@ fn test_cmd(args: &[String]) -> Result<()> {
         Ok(())
     } else {
         for (name, why) in &rep.failures {
-            eprintln!("  FAIL {name}: {why}");
+            eprintln!("  FAIL {}: {why}", printable(name));
         }
         let total = rep.checked + rep.failures.len() as u64;
         Err(cram_core::error::ArchiveError::Backend(format!(
@@ -717,8 +865,9 @@ fn test_cmd(args: &[String]) -> Result<()> {
 
 /// `cram dedup <paths…>`, find duplicate files across folders and drives.
 ///
-/// **Read-only.** It reports; it never deletes, moves, or links anything. That is deliberate for a
-/// first release over irreplaceable data: the scan has to earn trust before it is allowed to act.
+/// **Reports unless told otherwise.** The scan itself only reads. Reclaiming is opt-in and previews
+/// first: `--link` hard-links redundant copies, `--quarantine` moves them aside, and neither touches
+/// the disk without `--apply`. Nothing is ever deleted.
 fn dedup_cmd(args: &[String]) -> Result<()> {
     use cram_core::engine::dedup::{self, DedupOptions, GroupKind};
 
@@ -747,7 +896,29 @@ fn dedup_cmd(args: &[String]) -> Result<()> {
             "no paths given".into(),
         ));
     }
+    // A root that is not there scans as empty and reports "no duplicates found", which is a clean
+    // bill of health for a mistyped drive letter or an unmounted backup disk. Say so instead.
+    let missing: Vec<String> = roots
+        .iter()
+        .filter(|p| !p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Err(cram_core::error::ArchiveError::Backend(format!(
+            "no such path: {} (check the spelling, and that the drive is mounted)",
+            missing.join(", ")
+        )));
+    }
     let json = args.iter().any(|a| a == "--json");
+    // The JSON report covers the scan and returns before the reclaim phase, so accepting both let
+    // `--json --link --apply` exit 0 having reclaimed nothing.
+    if json && (has(args, "--link") || has(args, "--quarantine") || has(args, "--apply")) {
+        return Err(cram_core::error::ArchiveError::Backend(
+            "--json reports the scan only; run the reclaim (--link / --quarantine / --apply) \
+             without it"
+                .into(),
+        ));
+    }
     let opts = DedupOptions {
         min_size: args
             .iter()
@@ -1120,7 +1291,14 @@ fn thousands(n: u64) -> String {
 /// starts with `-` from the archive, which is data loss with no warning. Unknown dash-args that name
 /// nothing get a loud warning.
 fn create_inputs(args: &[String]) -> Vec<PathBuf> {
-    const CREATE_FLAGS: &[&str] = &["--best", "--fast", "--store", "--encrypt-names"];
+    const CREATE_FLAGS: &[&str] = &[
+        "--best",
+        "--fast",
+        "--store",
+        "--encrypt-names",
+        "--overwrite",
+        "-y",
+    ];
     let mut out = Vec::new();
     let mut positional_only = false;
     let mut i = 3; // skip "a" and <archive>
@@ -1196,6 +1374,7 @@ fn create(args: &[String]) -> Result<()> {
             "no input files/dirs to add".into(),
         ));
     }
+    overwrite_guard(&archive, args)?;
     let fmt = fmt_for_create(&archive)?;
 
     let level = if has(args, "--best") {
@@ -1205,7 +1384,7 @@ fn create(args: &[String]) -> Result<()> {
     } else {
         Level::Auto
     };
-    let encrypt = opt(args, "-p").map(|pw| {
+    let encrypt = opt(args, "-p")?.map(|pw| {
         let mut spec = EncryptSpec::new(Secret::new(pw));
         // `--encrypt-names` hides the file listing too (7z / .cram only; ignored by ZIP/tar).
         if has(args, "--encrypt-names") {
@@ -1267,14 +1446,30 @@ fn create(args: &[String]) -> Result<()> {
 /// readable archive into `<out>`'s format. `-p` opens an encrypted SOURCE; `--encrypt` encrypts the
 /// DESTINATION (independent passwords). The interop escape hatch: a `.cram` is never a dead end.
 fn convert_cmd(args: &[String]) -> Result<()> {
-    let src = args.get(2).map(PathBuf::from).ok_or_else(|| {
+    check_args(
+        args,
+        2,
+        &[
+            "--best",
+            "--fast",
+            "--store",
+            "--encrypt-names",
+            "--no-recompress",
+            "--overwrite",
+            "-y",
+        ],
+        &["-p", "--encrypt"],
+    )?;
+    let first = first_positional(args);
+    let src = args.get(first).map(PathBuf::from).ok_or_else(|| {
         usage();
         cram_core::error::ArchiveError::Backend("missing source archive".into())
     })?;
-    let dst = args.get(3).map(PathBuf::from).ok_or_else(|| {
+    let dst = args.get(first + 1).map(PathBuf::from).ok_or_else(|| {
         usage();
         cram_core::error::ArchiveError::Backend("missing destination archive".into())
     })?;
+    overwrite_guard(&dst, args)?;
     let src_fmt = sniff::sniff_path(&src)?; // magic-sniff the existing source
     let dst_fmt = fmt_for_create(&dst)?; // format from the destination extension
 
@@ -1285,7 +1480,7 @@ fn convert_cmd(args: &[String]) -> Result<()> {
     } else {
         Level::Auto
     };
-    let encrypt = opt(args, "--encrypt").map(|pw| {
+    let encrypt = opt(args, "--encrypt")?.map(|pw| {
         let mut spec = EncryptSpec::new(Secret::new(pw));
         if has(args, "--encrypt-names") {
             spec.header = HeaderMode::NamesToo;
@@ -1309,7 +1504,7 @@ fn convert_cmd(args: &[String]) -> Result<()> {
         &dst,
         dst_fmt,
         &opts,
-        password_provider(args),
+        password_provider(args)?,
         &NullSink,
     )?;
     let secs = t0.elapsed().as_secs_f64();
@@ -1338,11 +1533,20 @@ fn convert_cmd(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Default output dir = the archive's stem next to it (`foo.zip` → `./foo/`).
+/// Default output dir = the archive's stem next to it (`foo.zip` → `./foo/`). Compound extensions
+/// come off whole, so `foo.tar.gz` yields `foo/` and not `foo.tar/`, which reads as a tarball.
 fn default_dest(archive: &Path) -> PathBuf {
-    let stem = archive
-        .file_stem()
-        .and_then(|s| s.to_str())
+    const COMPOUND: &[&str] = &[
+        ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.lz4", ".tar.br", ".tar.zst",
+    ];
+    let name = archive.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let lower = name.to_ascii_lowercase();
+    let stem = COMPOUND
+        .iter()
+        .find(|ext| lower.ends_with(*ext))
+        .map(|ext| &name[..name.len() - ext.len()])
+        .filter(|s| !s.is_empty())
+        .or_else(|| archive.file_stem().and_then(|s| s.to_str()))
         .unwrap_or("out");
     archive.parent().unwrap_or(Path::new(".")).join(stem)
 }
@@ -1357,6 +1561,10 @@ fn make_sfx(args: &[String]) -> ExitCode {
         eprintln!("usage: cram make-sfx <archive.cram> <out.exe>");
         return ExitCode::from(2);
     };
+    if let Err(e) = overwrite_guard(Path::new(out), args) {
+        eprintln!("cram: {e}");
+        return ExitCode::FAILURE;
+    }
     let stub = match locate_stub() {
         Some(p) => p,
         None => {
@@ -1413,5 +1621,131 @@ mod tests {
         assert!(!names_rar_file("-p")); // a flag is never a target
         assert!(!names_rar_file(dir.join("missing").to_str().unwrap())); // no such file
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("cram".to_string())
+            .chain(parts.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn overwrite_guard_protects_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("cram-cli-ow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("important.zip");
+        std::fs::write(&existing, b"PRECIOUS").unwrap();
+
+        let plain = argv(&["a", "important.zip", "src"]);
+        let err = overwrite_guard(&existing, &plain).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        // The 7-Zip muscle memory is the cause, so `a` says so; other verbs do not.
+        assert!(err.contains("does not add to an existing one"), "{err}");
+        assert!(overwrite_guard(&existing, &argv(&["a", "x", "--overwrite"])).is_ok());
+        assert!(overwrite_guard(&existing, &argv(&["a", "x", "-y"])).is_ok());
+        assert!(overwrite_guard(&dir.join("absent.zip"), &plain).is_ok());
+        // A password that reads like the flag is a password, not consent.
+        let pw = argv(&["a", "important.zip", "-p", "-y", "src"]);
+        assert!(overwrite_guard(&existing, &pw).is_err());
+
+        let conv = argv(&["conv", "in.zip", "out.7z"]);
+        let err = overwrite_guard(&existing, &conv).unwrap_err().to_string();
+        assert!(!err.contains("does not add to an existing one"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_verbs_reject_what_they_would_otherwise_ignore() {
+        let flags = ["--skip"];
+        let valued = ["-o", "-p"];
+        // The filename filter that used to be dropped, extracting the whole archive instead.
+        let filter = argv(&["x", "bundle.zip", "-o", "sel", "src/a.txt"]);
+        assert!(check_args(&filter, 1, &flags, &valued).is_err());
+        // Guard flags that were accepted as no-ops while files were replaced.
+        for f in ["--overwrite", "-y", "--force", "-r"] {
+            let a = argv(&["x", "bundle.zip", f]);
+            assert!(check_args(&a, 1, &flags, &valued).is_err(), "{f}");
+        }
+        // A password that looks like a flag still belongs to `-p`.
+        let pw = argv(&["x", "bundle.zip", "-p", "--force"]);
+        assert!(check_args(&pw, 1, &flags, &valued).is_ok());
+        assert!(check_args(&argv(&["x", "bundle.zip", "--skip"]), 1, &flags, &valued).is_ok());
+        // `conv` reads two positionals, not one.
+        let conv = argv(&["conv", "in.zip", "out.7z"]);
+        assert!(check_args(&conv, 2, &[], &["-p"]).is_ok());
+        assert!(check_args(&conv, 1, &[], &["-p"]).is_err());
+    }
+
+    #[test]
+    fn an_archive_named_like_an_option_is_still_an_archive() {
+        // Downloads arrive named `-weird.zip`, and the verb reads its archive by index, so the
+        // check must not call it a typo. `create_inputs` takes the same line for input files.
+        assert!(check_args(&argv(&["l", "-weird.zip"]), 1, &[], &["-p"]).is_ok());
+        assert!(check_args(&argv(&["t", "-weird.zip", "-p", "pw"]), 1, &[], &["-p"]).is_ok());
+        let conv = argv(&["conv", "-in.zip", "-out.7z"]);
+        assert!(check_args(&conv, 2, &[], &["-p"]).is_ok());
+        // What follows the positionals is checked exactly as before.
+        let after = argv(&["x", "-weird.zip", "--force"]);
+        assert!(check_args(&after, 1, &["--skip"], &["-o", "-p"]).is_err());
+
+        // `--` says the same thing explicitly, and moves where the archive is read from.
+        assert_eq!(first_positional(&argv(&["l", "--", "-weird.zip"])), 3);
+        assert_eq!(first_positional(&argv(&["l", "-weird.zip"])), 2);
+        assert!(check_args(&argv(&["l", "--", "-weird.zip"]), 1, &[], &["-p"]).is_ok());
+        assert!(check_args(&argv(&["l", "--", "-a.zip", "-b.zip"]), 1, &[], &["-p"]).is_err());
+    }
+
+    #[test]
+    fn opt_separates_an_absent_flag_from_a_valueless_one() {
+        assert_eq!(opt(&argv(&["x", "a.zip"]), "-o").unwrap(), None);
+        assert_eq!(
+            opt(&argv(&["x", "a.zip", "-o", "dest"]), "-o").unwrap(),
+            Some("dest")
+        );
+        // Silently defaulting here wrote to a directory the user never named.
+        assert!(opt(&argv(&["x", "a.zip", "-o"]), "-o").is_err());
+    }
+
+    #[test]
+    fn printable_defuses_terminal_escapes_in_entry_names() {
+        assert_eq!(printable("plain.txt"), "plain.txt");
+        assert_eq!(printable("\x1b[31mred.txt"), "\\u{001b}[31mred.txt");
+        // A newline forges a whole listing row; it must not reach the terminal.
+        assert_eq!(printable("a.txt\nfake"), "a.txt\\u{000a}fake");
+        assert_eq!(printable("héllo.txt"), "héllo.txt");
+    }
+
+    #[test]
+    fn default_dest_takes_compound_extensions_whole() {
+        assert_eq!(default_dest(Path::new("foo.tar.gz")), PathBuf::from("foo"));
+        assert_eq!(default_dest(Path::new("foo.TAR.GZ")), PathBuf::from("foo"));
+        assert_eq!(default_dest(Path::new("foo.tar.zst")), PathBuf::from("foo"));
+        assert_eq!(default_dest(Path::new("foo.tgz")), PathBuf::from("foo"));
+        assert_eq!(default_dest(Path::new("foo.zip")), PathBuf::from("foo"));
+        assert_eq!(
+            default_dest(Path::new("d/foo.tar.bz2")),
+            PathBuf::from("d/foo")
+        );
+    }
+
+    #[test]
+    fn report_issues_treats_a_cancelled_extract_as_a_failure() {
+        let clean = cram_core::error::Report {
+            extracted: 3,
+            ..Default::default()
+        };
+        assert!(report_issues(&clean).is_ok());
+        // No CLI verb can cancel today (they all pass a NullSink), but the exit code has to be
+        // right the moment one can: a half-written destination is not a success.
+        let cancelled = cram_core::error::Report {
+            extracted: 1,
+            cancelled: true,
+            ..Default::default()
+        };
+        assert!(report_issues(&cancelled).is_err());
+        let mut failed = cram_core::error::Report::default();
+        failed.push_failure("a.txt", "boom");
+        assert!(report_issues(&failed).is_err());
     }
 }

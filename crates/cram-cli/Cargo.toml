@@ -28,6 +28,5 @@ default = []
 # Forward the opt-in cram-core features so `cram` can be built with them.
 download = ["cram-core/download", "dep:serde_json"]
 zstd-c = ["cram-core/zstd-c"]
-libdeflate = ["cram-core/libdeflate"]
 # Perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos.
 phash = ["cram-core/phash"]
