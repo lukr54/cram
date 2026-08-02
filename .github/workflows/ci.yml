@@ -258,6 +258,19 @@ jobs:
           # `cram update` refuses to install an archive it cannot verify, so the Windows artifact
           # needs its checksum published the same way the Linux and macOS ones do.
           sha256sum "$dist.zip" > SHA256SUMS.windows
+          # A second copy under a version-free name. GitHub serves
+          # /releases/latest/download/<asset> as a permanent redirect to the newest release's asset
+          # of that exact name, so a download button on nexalit.fr can be a plain <a href> that never
+          # needs editing again — but only if the filename does not move with the tag.
+          #
+          # `cram update` is unaffected: it builds the URL from a character-checked tag and asks for
+          # the VERSIONED artifact, which is the one SHA256SUMS.windows covers. This copy is for
+          # humans clicking a link, and is deliberately not checksummed as a second entry, so there
+          # is exactly one authoritative hash per release.
+          #
+          # No change needed below: the `gh release create` file list already globs
+          # cram-*-x86_64-pc-windows-gnu.zip, which matches both.
+          cp "$dist.zip" cram-latest-x86_64-pc-windows-gnu.zip
 
       # Created as a DRAFT. `/releases/latest` — what `cram update` asks for and what the Releases
       # page shows — skips drafts, so nobody is offered a release whose Linux and macOS artifacts are
