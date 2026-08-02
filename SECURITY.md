@@ -4,8 +4,10 @@ Cram parses files that come from other people, downloads, mail attachments, a co
 This document says where to report a problem, what counts as one, and which protections exist.
 
 It covers the code in this repository: the `cram-core` engine, the `cram` CLI, the `cram-sign`,
-`cram-recovery` and `cram-mount` sidecars, the standalone `cram-extract` decoder, and the
-`cram-shell` Explorer handler. The **In scope** table below is the specific list.
+`cram-recovery` and `cram-mount` sidecars, the standalone `cram-extract` decoder, the `cram-shell`
+Explorer handler, and the `rdm-core` download engine. The **In scope** table below is the specific
+list. Windows, Linux and macOS all count; the handler and the mount are Windows-only because the
+features are.
 
 ---
 
@@ -33,8 +35,8 @@ A useful report contains:
 
 - the file that triggers it (or a short script that builds it),
 - the exact command, e.g. `cram x evil.zip -o out`,
-- **which binary**: `cram.exe` or `cram-extract.exe`,
-- the version (`cram --version`) and your Windows build.
+- **which binary**: `cram` or `cram-extract`,
+- the version (`cram --version`), and your OS and its version.
 
 ### What to expect
 
@@ -63,6 +65,7 @@ Anything below, reachable by feeding Cram a file you control:
 | **Standalone decoder** | [`crates/cram-extract`](crates/cram-extract/src/main.rs) | it is shipped to people who may have no other tool to hand; it gets the same scrutiny as the engine |
 | **Explorer handler** | [`crates/cram-shell`](crates/cram-shell/src/lib.rs) | it runs **inside explorer.exe**: anything that lets a crafted file name reach a command line unquoted, crash Explorer, or make a menu verb act on a path the user did not select |
 | **Self-update** | [`cram-cli/src/update.rs`](crates/cram-cli/src/update.rs) | it replaces the running binary: anything that lets an unverified, wrong-version or attacker-chosen payload be installed |
+| **Download engine** | [`crates/rdm-core`](crates/rdm-core/src/) | it parses Metalink XML and HTTP `Link` headers straight off the network, ahead of any user decision: a redirect, header or manifest that makes `cram dl` write outside the chosen directory, fetch from a host the user never named, or exhaust memory |
 
 ## Out of scope
 
@@ -109,10 +112,10 @@ damaged ones are listed by name, and the process still exits **non-zero**, so a 
 **RAR is isolated in the CLI.** RAR is decoded by the UnRAR C++ engine, the one non-Rust component in
 a default build, and a crafted RAR can fault the process rather than raise a catchable Rust error.
 When a `cram` command names a RAR file, the CLI re-runs itself in a child process, so a fault kills
-only that child and the parent reports an error. Everything else in a default build is Rust. Two
-optional features add more C: `zstd-c` links C libzstd and `libdeflate` links C libdeflate. Neither is
-on by default, and `cram --version` prints which of them a binary was built with; worth including in
-a report.
+only that child and the parent reports an error. Everything else in a default build is Rust. One
+optional feature adds more C: `zstd-c` links C libzstd. It is off by default but **on in the shipped
+binary**, and `cram --version` prints which optional features a binary was built with; worth including
+in a report.
 
 **`cram update` refuses what it cannot verify.** The update path fetches the checksum the release
 publishes *before* it downloads anything, and a checksum that is missing, unreadable or unmatched is

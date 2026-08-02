@@ -248,8 +248,11 @@ appear, with their own notices, in `THIRD-PARTY-LICENSES.md`.)
 ## 5. Rust dependencies
 
 Cram statically links a large graph of third-party Rust crates. **There is no GPL, AGPL, LGPL or MPL
-anywhere in the graph**, every dependency is permissive (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause,
-ISC, Unicode-3.0, bzip2-1.0.6, and 0BSD / CC0 / Unlicense, in various combinations).
+anywhere in the graph**, every dependency is permissive. The licences the resolved graph actually uses
+are MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, Unicode-3.0, bzip2-1.0.6 and CC0-1.0. `about.toml`
+additionally permits ISC, 0BSD, Unlicense, Zlib and Unicode-DFS-2016, all of which are permissive and
+any of which a future dependency may resolve to; nothing outside that list can enter without failing
+generation, which is what keeps the sentence above true rather than merely asserted.
 
 The **full copyright notice and licence text for every one of these crates** is reproduced in the
 companion [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md), generated from each crate's own
@@ -261,7 +264,14 @@ binary distributions.
 build (`about.toml` and `about.hbs` in this repo drive it):
 
 ```bash
-cargo install cargo-about --locked --features cli
+cargo install cargo-about --locked --version 0.9.1 --features cli
 cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
-  -m crates/cram-cli/Cargo.toml --features "download zstd-c phash"
+  --workspace --features "download zstd-c phash"
 ```
+
+`--workspace` rather than `-m crates/cram-cli/Cargo.toml`: the zip ships three artifacts and only one
+of them is the CLI. Resolving the whole workspace is the only single command that also covers
+`cram-extract.exe` and `cram_shell.dll`. On Windows, convert the result to LF before committing
+(`.gitattributes` stores it that way, and a handful of crates' own LICENSE files carry CRLF). CI
+regenerates and diffs on every push, so an appendix that has drifted from `Cargo.lock` fails the build
+instead of shipping.

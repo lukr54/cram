@@ -20,7 +20,7 @@ repro matters more than a description: archive bugs are usually specific to how 
 **Environment**
 
 - Cram version (`cram --version`):
-- Windows version:
+- OS and version (Windows / Linux / macOS):
 - Archive format(s) involved (zip / 7z / rar / tar family / `.cram` / …):
 
 **Anything else**

@@ -59,9 +59,11 @@ in the engine.
 | **`cram-shell`** | the Explorer right-click menu: a COM `IContextMenu` handler built as a cdylib and loaded **into explorer.exe** (§9). Depends only on the `windows` crate, not on the engine. |
 | **`rdm-core`** | the segmented, resumable, multi-source **download engine** (library, no GUI) behind `cram dl` and extract-while-download. Vendored in-tree. |
 
-`cram-extract`'s whole manifest is four decode-only, pure-Rust crates: `lzma-rust2` (XZ), `ruzstd`
-(zstd), `aes-gcm` and `argon2`. What it has none of is *shared code* with `cram-core`, no writer,
-chunker, hasher or thread pool, because a recovery reader needs none of that.
+`cram-extract`'s whole manifest is five decode-only, pure-Rust crates: `lzma-rust2` (XZ), `ruzstd`
+(zstd), `aes-gcm`, `argon2` and `lepton_jpeg`, the last so it can reverse the writer's lossless JPEG
+recompression, since a photo archive the recovery tool cannot read would defeat the point of having
+one. No C or C++ anywhere in that graph. What it has none of is *shared code* with `cram-core`, no
+writer, chunker, hasher or thread pool, because a recovery reader needs none of that.
 
 `rdm-core` is vendored rather than referenced by an out-of-tree path because Cargo loads a path
 dependency's manifest during workspace resolution **even when the dependency is optional and its
@@ -157,7 +159,7 @@ What "verified" means is per format, and the difference matters:
   `cram sign` or `cram rec`.
 - **`.cram`**, every pack must decode cleanly. Encrypted packs are authenticated by their AES-GCM
   tag and compressed packs by their codec framing, but an **unencrypted, stored** pack (what
-  incompressible media compresses to) carries no per-chunk checksum in the frozen v1 format, so
+  incompressible media compresses to) carries no per-chunk checksum in the frozen format, so
   `cram test` confirms it decodes structurally and cannot detect an in-place bit flip inside it. For
   guaranteed content integrity on such archives, pair with `cram sign` or `cram rec`, which cover the
   whole file's bytes.
@@ -266,9 +268,10 @@ byte-level spec is [`CRAM_FORMAT.md`](CRAM_FORMAT.md); the code is
   *not* reproducible (fresh salt, fresh nonces), and that test asserts the difference so
   "reproducible" is never misread as "encryption is deterministic".
 
-The format is **frozen at v1**: any layout change bumps the version byte, and a conforming reader must
-reject what it does not understand rather than guess. Every build can *decode* zstd packs via the
-always-present pure-Rust decoder, so archives stay readable across build configurations.
+The format is **frozen and versioned**: v1, and v2, which adds only the per-entry transform byte. Any
+layout change bumps the version byte, and a conforming reader must reject what it does not understand
+rather than guess. Every build can *decode* zstd packs via the always-present pure-Rust decoder, so
+archives stay readable across build configurations.
 
 `cram-extract` is an independent implementation of this spec. It proves the document is implementable
 on its own and gives users a small, auditable tool that can recover their data without the main
@@ -416,9 +419,6 @@ Archives are untrusted input, so hardening is centralized rather than sprinkled 
   - **`zstd-c`** (off by default) adds the C libzstd encoder, which gives `.cram` packs the full zstd
     level range; `ruzstd` only encodes at its fastest setting. Any build can *decode* zstd packs, so
     enabling it does not fork the format.
-  - **`libdeflate`** (off by default) adds the C libdeflate dependency and nothing else. No code
-    path selects it, so DEFLATE goes through `flate2` / miniz_oxide whether it is on or not, and
-    enabling it to benchmark DEFLATE measures nothing. It is a placeholder for work not yet done.
   - **`download`** (off by default) pulls in `rdm-core` and its async/HTTP dependencies for `cram dl`
     and extract-while-download.
   - `cram --version` prints which of these the binary was built with.

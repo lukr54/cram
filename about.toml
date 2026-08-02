@@ -14,8 +14,10 @@ accepted = [
     "0BSD",
     "CC0-1.0",
     "Unlicense",
-    "MPL-2.0",
 ]
+# MPL-2.0 is deliberately absent. THIRD-PARTY-NOTICES.md §5 tells redistributors there is no copyleft
+# in the graph; leaving MPL accepted here would let a weak-copyleft crate in and make that claim false
+# with no CI signal. Anything not on this list fails generation, which is the point.
 
 # The one platform the binaries are shipped for. Filtering to it keeps the appendix to what actually
 # links (e.g. on windows-gnu reqwest uses SChannel, so rustls/ring are not pulled in).

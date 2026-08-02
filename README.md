@@ -9,8 +9,7 @@ nothing in it is restricted. It is written in Rust, and Windows (the GNU/mingw t
 Apple Silicon macOS each build and run the full test suite. Archive **mount** is Windows-only (see
 [Limitations](#limitations)).
 Everything is pure Rust **except the UnRAR C++ decoder**, which is always compiled in because it is
-what reads RAR; the optional `zstd-c` feature links C libzstd, and `libdeflate` is a further opt-in
-C dependency.
+what reads RAR; the optional `zstd-c` feature links C libzstd.
 
 Licensed under **MIT OR Apache-2.0**.
 
@@ -135,7 +134,6 @@ Optional features are opt-in, so the base build always compiles on a bare mingw 
 |---|---|
 | `zstd-c` | full-range zstd encoder (C libzstd), and the default `.cram` pack codec once enabled. Without it, `.cram` packs use pure-Rust XZ. |
 | `download` | enables the `cram dl` segmented downloader. It is a client and opens no listening socket. |
-| `libdeflate` | a faster DEFLATE backend (C libdeflate). |
 | `phash` | perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos. Pure Rust, but a large dependency tree, hence opt-in. |
 
 ```sh
@@ -164,28 +162,37 @@ cram conv backup.cram backup.zip     # convert to another format
 cram mount backup.cram .\view        # mount as a virtual folder; press Enter to unmount
 ```
 
+`cram a` writes a new archive. If a file of that name is already there it stops and changes nothing;
+pass `--overwrite`, or `-y`, to replace it. `cram conv` and `cram make-sfx` guard their output the
+same way.
+
 ### Command reference
 
 ```
 cram l  <archive>                                 list entries
 cram x  <archive> [-o <dir>] [-p <pw>] [--skip]   extract
 cram a  <archive> <input...> [-p <pw>]            create [--store|--fast|--best] [--encrypt-names]
+           [--overwrite]                          [--overwrite] replaces an existing <archive>
 cram t  <archive> [-p <pw>]                       test integrity (decode + checksums, no extract)
 cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--best|--fast|--store]
+           [--overwrite]                          [--overwrite] replaces an existing <out>
 cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]
                                                   segmented download; several URLs are mirrors of
                                                   one file. --discover finds mirrors, --auto ramps
                                                   connections, --sha256 <hex> verifies. Needs a
                                                   build with the `download` feature.
-cram dedup <folder|file…> [--similar]             find duplicate files across folders and drives
-           [--similar-distance <0-15>]            (read-only report). --similar also flags
-           [--min-size <bytes>] [--json]          visually-alike images for human review.
+cram dedup <folder|file…> [--similar]             find duplicate files across folders and drives.
+           [--similar-distance <0-15>]            Previews by default; --link (hard-link) or
+           [--link] [--quarantine <dir>]          --quarantine <dir>, each with --apply, reclaim
+           [--apply] [--min-size <bytes>]         the space. --similar also flags visually-alike
+           [--json]                               images for human review.
 cram mount [--selftest] [-p <pw>] <archive> <dir> mount as a virtual folder (ProjFS)
 cram rec <create|verify|repair> <file> …          Reed-Solomon recovery sidecar (.cramrec)
 cram sign <file> -k <keyfile>                     write a detached ed25519 signature (.cramsig)
 cram verify <file> [--key <hex>]                  verify a signature (pin --key to require a signer)
 cram keygen <keyfile>                             create a signing key (prints its public key)
 cram make-sfx <archive.cram> <out.exe>            build a self-extracting executable
+           [--overwrite]                          [--overwrite] replaces an existing <out.exe>
 cram shell <install|uninstall|status>             add or remove Cram's Explorer right-click menu
                                                   (Windows; writes under HKCU only, no elevation)
 cram update [--check] [--force]                   download the latest published release, verify its
@@ -201,8 +208,16 @@ cram --version                                    version + which optional featu
   tar, RAR, ISO, a bare compressed file and `.cram` there is no stored CRC to compare against and
   every entry is re-extracted as normal.
 - `--encrypt-names` (7z and `.cram` only) hides the file listing as well as the contents.
+- `--overwrite`, alias `-y`, lets `cram a`, `cram conv` and `cram make-sfx` write over a file that
+  already exists. Without it they refuse and exit non-zero, leaving the file as it was. `cram a` is
+  spelled like 7-Zip's *add to archive* but creates a new one, which is the case the guard exists
+  for.
 - The format on create is chosen from the output extension (`.zip` / `.7z` / `.cram` /
   `.tar[.gz|.xz|.bz2|.lz4|.br|.zst]`).
+- `cram l`, `cram x`, `cram t` and `cram conv` refuse an argument they do not recognise instead of
+  ignoring it. `cram x bundle.zip src/a.txt` used to extract the whole archive, because selecting
+  individual entries is not supported; it now fails and says why. An archive whose name starts with
+  `-` is still read as the archive, and `--` before it states that explicitly.
 
 ### Photos: ~23% smaller, and still byte-for-byte the same files
 
@@ -342,7 +357,10 @@ contains no benchmark harness, so nothing here is a performance claim.
   the inputs is stored once, with no dictionary-window limit. Optional encryption is Argon2id +
   AES-256-GCM. Unencrypted `.cram` output is byte-for-byte reproducible; encrypted output is
   not (a fresh random salt per archive).
-- The format is **frozen at v1** and specified normatively in
+- The format is **frozen and versioned**: v1, plus v2, which adds only the per-entry transform byte
+  that carries lossless JPEG recompression. A writer emits v2 only when a transform was actually used,
+  and a reader that meets a version it does not know refuses the archive rather than guessing. Both
+  versions are specified normatively in
   [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md), that document, not the code, is the contract. The
   decoder in [`crates/cram-extract`](crates/cram-extract) is an independent implementation of the
   same spec.

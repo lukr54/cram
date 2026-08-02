@@ -44,10 +44,6 @@ Optional features are opt-in so the base build always compiles:
 | `download` | `cram dl` segmented downloader, and `cram update`. Opens no listening socket. |
 | `phash` | perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos. Pure Rust, but a large dependency tree. |
 
-There is also a `libdeflate` feature, which `cram --version` lists. It only adds the C libdeflate
-dependency to the build: no code path selects it, so every DEFLATE inflate and deflate goes through
-`flate2` / `miniz_oxide` either way. Enabling it to benchmark DEFLATE will measure nothing.
-
 The release CLI is built as:
 
 ```sh
@@ -141,8 +137,9 @@ If you change a performance claim in the docs, the number must come from a run a
 - **Removing a documented bound** (see [`SECURITY.md`](SECURITY.md)) without an equivalent
   replacement, or bypassing `EntryPath::from_raw` in a new backend. Entry names go through the one
   guard, always.
-- **A change to the frozen `.cram` v1 layout.** Any layout change bumps the version byte and updates
-  [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md) normatively, it does not quietly redefine v1.
+- **A change to a frozen `.cram` layout.** v1 and v2 are both defined and both frozen. Any layout
+  change bumps the version byte and updates [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md) normatively,
+  it does not quietly redefine a version that archives already in the wild claim to be.
 - **Marketing voice in the docs.** Understated and verifiable beats impressive and unbacked.
 
 ---

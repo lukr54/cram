@@ -64,10 +64,10 @@ alongside Windows, plus an `install.sh` that fetches the right binary for either
 limitations for what still differs between the three.
 
 **A second, independent `.cram` decoder.** `cram-extract.exe` implements the same spec from the
-document alone, shares no code with the engine, and takes four direct pure-Rust dependencies
-(`lzma-rust2`, `ruzstd`, `aes-gcm`, `argon2`). It contains no C or C++ code, so unlike `cram.exe` it
-needs no DLL beside it beyond the OS's own. Your data stays recoverable even if the main build is not
-available. It doubles as the `make-sfx` self-extractor stub.
+document alone, shares no code with the engine, and takes five direct pure-Rust dependencies
+(`lzma-rust2`, `ruzstd`, `aes-gcm`, `argon2`, `lepton_jpeg`). It contains no C or C++ code,
+so unlike `cram.exe` it needs no DLL beside it beyond the OS's own. Your data stays recoverable even
+if the main build is not available. It doubles as the `make-sfx` self-extractor stub.
 
 **Parallel extraction** for the formats with a random-access interface (ZIP, ISO, `.cram`). The worker
 count is derived from the *destination* drive, hardware auto-detect plus a one-shot calibration

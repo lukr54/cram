@@ -1,10 +1,11 @@
-# The `.cram` archive format, version 1
+# The `.cram` archive format
 
-**Status: frozen.** This document is the normative specification of the on-disk `.cram`
-container as produced and consumed by Cram. A file that conforms to this document is a valid
-`.cram` v1 archive; any future change to the byte layout will bump the version byte (§2) and be
-described in a new revision of this document. A conforming reader **must** reject anything it does
-not understand rather than guess (see §9).
+**Status: frozen, versions 1 and 2.** This document is the normative specification of the on-disk
+`.cram` container as produced and consumed by Cram. Two version bytes are defined (§2): v1, and v2,
+which adds the per-entry transform byte and nothing else (§6, §13). Frozen means the layout of a
+defined version never changes; any future change bumps the version byte and is described in a new
+revision of this document. A conforming reader **must** reject anything it does not understand rather
+than guess (see §9).
 
 The reference implementation lives in
 [`crates/cram-core/src/formats/cram.rs`](../crates/cram-core/src/formats/cram.rs); where this
