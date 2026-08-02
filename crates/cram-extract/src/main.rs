@@ -491,8 +491,9 @@ impl Archive {
         }
 
         // Sanitize names and DROP any entry whose path is unsafe (traversal / device / too deep), so a
-        // hostile name is never listed, never printed by --list (no terminal-escape injection), and
-        // never extracted, matching the reference reader. Retained entries carry their safe path.
+        // hostile name is never listed and never extracted, matching the reference reader. Retained
+        // entries carry their safe path. A safe path is still an arbitrary string: ESC and CR survive
+        // sanitization, so anything that prints a name goes through `printable` as well.
         let total = entries.len();
         let entries: Vec<EntryMeta> = entries
             .into_iter()
@@ -617,16 +618,21 @@ impl Archive {
         result
     }
 
-    /// Extract every entry under `dest`. Returns (files, dirs). Unsafe entries were already dropped at
-    /// open, so every entry here carries a validated relative `safe` path; just join it under `dest`.
-    fn extract_all(&mut self, dest: &Path) -> R<(u64, u64)> {
+    /// Extract every entry under `dest`. Unsafe entries were already dropped at open, so every entry
+    /// here carries a validated relative `safe` path; just join it under `dest`.
+    ///
+    /// A decode failure removes the partial file and continues to the next entry, matching the
+    /// reference engine. Returning at the first bad entry left a truncated file sitting on disk at a
+    /// fraction of its real length and never attempted the rest, which matters most here: this is
+    /// the self-extractor, and its recipient has no second tool to check the result with.
+    fn extract_all(&mut self, dest: &Path) -> R<Extracted> {
         fs::create_dir_all(dest).map_err(io_err)?;
-        let (mut files, mut dirs) = (0u64, 0u64);
+        let mut out = Extracted::default();
         for i in 0..self.entries.len() {
             let path = dest.join(&self.entries[i].safe);
             if self.entries[i].is_dir {
                 fs::create_dir_all(&path).map_err(io_err)?;
-                dirs += 1;
+                out.dirs += 1;
                 continue;
             }
             if let Some(parent) = path.parent() {
@@ -634,22 +640,80 @@ impl Archive {
             }
             let f = File::create(&path).map_err(io_err)?;
             let mut w = io::BufWriter::new(f);
-            self.write_entry(i, &mut w)?;
-            w.flush().map_err(io_err)?;
-            files += 1;
+            let mut outcome = self.write_entry(i, &mut w);
+            if outcome.is_ok() {
+                outcome = w.flush().map_err(io_err);
+            }
+            drop(w);
+            match outcome {
+                Ok(()) => out.files += 1,
+                Err(e) => {
+                    // Whatever reached the disk is a fragment, not a file. Leaving it behind hands
+                    // the recipient a plausible-looking short file with no way to tell.
+                    let _ = fs::remove_file(&path);
+                    out.failures.push((self.entries[i].name.clone(), e));
+                }
+            }
         }
-        Ok((files, dirs))
+        Ok(out)
     }
 
     fn list(&self) {
         for e in &self.entries {
+            let name = printable(&e.name);
             if e.is_dir {
-                println!("  [d] {}", e.name);
+                println!("  [d] {name}");
             } else {
-                println!("  [f] {} ({} bytes)", e.name, e.size);
+                println!("  [f] {name} ({} bytes)", e.size);
             }
         }
     }
+}
+
+/// Entry names come out of the archive and are attacker-controlled: an ESC starts an ANSI sequence
+/// the terminal obeys, and a newline forges a whole listing row. Render control characters visibly
+/// rather than emitting them. Sanitization is not a substitute, a safe *path* still keeps ESC/CR/LF.
+fn printable(name: &str) -> String {
+    if !name.chars().any(char::is_control) {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len() + 8);
+    for c in name.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:04x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// What one extraction produced. A per-entry failure is non-fatal (the run continues past it), so
+/// what succeeded and what did not are both needed to report the outcome honestly.
+#[derive(Default)]
+struct Extracted {
+    files: u64,
+    dirs: u64,
+    failures: Vec<(String, String)>,
+}
+
+/// Report an extraction and pick its exit code. Per-entry failures are named (escaped, like the
+/// listing) and make the run fail, so a partial extraction can never read as a complete one.
+fn finish(out: &Extracted, dest: &Path) -> ExitCode {
+    println!(
+        "extracted {} files, {} dirs to {}",
+        out.files,
+        out.dirs,
+        dest.display()
+    );
+    if out.failures.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!("{} failures:", out.failures.len());
+    for (name, why) in &out.failures {
+        eprintln!("  {}: {why}", printable(name));
+    }
+    ExitCode::FAILURE
 }
 
 fn usage() -> ExitCode {
@@ -791,10 +855,7 @@ fn run_self_extract(payload: Vec<u8>, dest: &Path, password: Option<&str>) -> Ex
     let outcome = Archive::open(&tmp, password).and_then(|mut arc| arc.extract_all(dest));
     let _ = fs::remove_file(&tmp);
     match outcome {
-        Ok((files, dirs)) => {
-            println!("extracted {files} files, {dirs} dirs to {}", dest.display());
-            ExitCode::SUCCESS
-        }
+        Ok(out) => finish(&out, dest),
         Err(e) => fail(&e),
     }
 }
@@ -891,10 +952,7 @@ fn main() -> ExitCode {
 
     let dest = dest.expect("dest is present in extract mode (arity checked above)");
     match arc.extract_all(&dest) {
-        Ok((files, dirs)) => {
-            println!("extracted {files} files, {dirs} dirs to {}", dest.display());
-            ExitCode::SUCCESS
-        }
+        Ok(out) => finish(&out, &dest),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE

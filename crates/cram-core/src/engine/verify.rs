@@ -56,6 +56,22 @@ impl VerifyReport {
     pub fn ok(&self) -> bool {
         self.failures.is_empty() && !self.cancelled
     }
+
+    /// The sentence a caller must print alongside a clean result when nothing about the *content*
+    /// was actually checked.
+    ///
+    /// A stored, unencrypted `.cram` carries no per-entry checksum (the frozen v1 index records
+    /// chunk locations, not hashes), so a pass over one proves the archive still decodes and is the
+    /// declared length, and nothing more. `OK: 3 entries verified (0 by CRC)` is true and reads as a
+    /// full integrity pass to the person checking whether their backup survived; a bit flipped in a
+    /// stored pack goes unreported. The exit code deliberately does not change, scripts already
+    /// depend on `cram t` returning 0 for an archive that decodes.
+    pub fn content_unverified(&self) -> Option<&'static str> {
+        (self.checked > 0 && self.crc_verified == 0).then_some(
+            "warning: no entry carried a content checksum, structure and length were verified but \
+             the bytes were not; use `cram sign` or `cram rec` to detect damage in this archive",
+        )
+    }
 }
 
 /// A `Write` sink that CRC-32s and counts the bytes streamed through it (never buffering), reports

@@ -96,7 +96,8 @@ fn extract_tar_stream(
         };
         let is_dir = et.is_dir();
         let Some(safe) = EntryPath::from_raw(&raw) else {
-            continue; // zip-slip name → drop
+            report.dropped_unsafe += 1; // zip-slip name → drop, but say how many
+            continue;
         };
         let entry = Entry {
             index: 0,
@@ -230,7 +231,10 @@ fn extract_zip_stream(
         let raw = zf.name().to_string();
         let is_dir = zf.is_dir();
         let Some(safe) = EntryPath::from_raw(&raw) else {
-            continue; // zip-slip name → skip (Drop drains the entry so the parser stays aligned)
+            // zip-slip name → skip (Drop drains the entry so the parser stays aligned), counted so
+            // the caller can say the archive carried entries it refused.
+            report.dropped_unsafe += 1;
+            continue;
         };
         let entry = Entry {
             index: 0,

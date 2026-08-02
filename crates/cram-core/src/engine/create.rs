@@ -12,11 +12,11 @@ use std::time::SystemTime;
 
 use crate::error::{ArchiveError, Result};
 use crate::format::{Codec, Container, Format};
+use crate::formats;
 use crate::model::{Entry, EntryKind, EntryPath};
 use crate::probe::{self, ProbeSummary};
 use crate::progress::{CountingReader, ProgressSink};
 use crate::writer::{CreateOptions, CreateReport, Level, WriteHint};
-use crate::{formats, model};
 
 /// One planned archive member: its metadata entry plus, for files, the disk path to stream from.
 struct CreateItem {
@@ -67,7 +67,18 @@ fn collect_dir(dir: &Path, prefix: &str, items: &mut Vec<CreateItem>) -> Result<
     let mut children: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
     children.sort_by_key(|e| e.file_name());
     for child in children {
-        let name = child.file_name().to_string_lossy().into_owned();
+        // Refuse a name that isn't UTF-8 rather than lossily replacing the undecodable units:
+        // `a\u{D800}.txt` and `a\u{D801}.txt` both became `a\u{FFFD}.txt`, so tar and `.cram` wrote
+        // two entries under one name and extraction destroyed the first file, with `cram a` and
+        // `cram x` both reporting success. `collect_input` below already refuses such a name one
+        // level up; this only makes the walk agree with it.
+        let file_name = child.file_name();
+        let Some(name) = file_name.to_str() else {
+            return Err(ArchiveError::Backend(format!(
+                "{}: file name is not valid UTF-8, archive entry names must be",
+                child.path().display()
+            )));
+        };
         let child_name = format!("{prefix}/{name}");
         let ft = child.file_type()?;
         if ft.is_dir() {
@@ -90,15 +101,24 @@ fn collect_dir(dir: &Path, prefix: &str, items: &mut Vec<CreateItem>) -> Result<
 
 /// Expand one CLI input (file or directory) into archive members, rooted at its base name.
 fn collect_input(input: &Path, items: &mut Vec<CreateItem>) -> Result<()> {
-    let base = input
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| ArchiveError::Backend(format!("cannot derive a name for {input:?}")))?;
+    // `.`, `./` and `..` have no `file_name`, and they are how people actually spell "this
+    // directory". Resolve them to the directory they name, so `cram a out.zip .` roots the archive
+    // exactly as naming that directory would. Only the filesystem root is left with no answer.
+    let base = match input.file_name().and_then(|s| s.to_str()) {
+        Some(b) => b.to_string(),
+        None => fs::canonicalize(input)
+            .ok()
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| ArchiveError::Backend(format!("cannot derive a name for {input:?}")))?,
+    };
     let meta = fs::metadata(input)?;
     if meta.is_dir() {
-        collect_dir(input, base, items)?;
+        collect_dir(input, &base, items)?;
     } else if meta.is_file() {
-        if let Some(entry) = make_entry(base, meta.len(), false, meta.modified().ok()) {
+        if let Some(entry) = make_entry(&base, meta.len(), false, meta.modified().ok()) {
             items.push(CreateItem {
                 entry,
                 disk_path: Some(input.to_path_buf()),
@@ -114,8 +134,9 @@ fn collect_input(input: &Path, items: &mut Vec<CreateItem>) -> Result<()> {
 }
 
 /// Create `archive` of format `fmt` from `inputs`, honoring `opts` (level/codec/encryption). Returns
-/// the writer's [`CreateReport`]. Cancellation stops before the next entry (the partial archive is
-/// still finalized so it stays a valid file).
+/// the writer's [`CreateReport`]. Cancellation abandons the job: the staging file is removed and
+/// `archive` is never written, so a cancelled create can never be mistaken for a complete archive
+/// that happens to be missing files.
 pub fn create(
     archive: &Path,
     fmt: Format,
@@ -132,9 +153,17 @@ pub fn create(
     for input in inputs {
         collect_input(input, &mut items)?;
     }
-    let entries: Vec<Entry> = items.iter().map(|i| i.entry.clone()).collect();
-    let (total_bytes, total_files) = model::totals(&entries);
-    let _ = (total_bytes, total_files); // sizing hook for a caller-supplied Progress
+    // Sizing hook for a caller-supplied Progress. Accumulated over the plan in place: handing
+    // `model::totals` a slice meant cloning every Entry (144 bytes plus two heap allocations each)
+    // into a Vec that outlived the whole create for two numbers.
+    let (mut total_bytes, mut total_files) = (0u64, 0u64);
+    for item in items.iter().filter(|i| !i.entry.is_dir()) {
+        // Sizes are read off the filesystem here, but saturate anyway: this is the same accounting
+        // `model::totals` does for untrusted archive metadata.
+        total_bytes = total_bytes.saturating_add(item.entry.size);
+        total_files += 1;
+    }
+    let _ = (total_bytes, total_files);
 
     // Adaptive probe (Level::Auto only): classify each file store-vs-compress. A per-entry hint is
     // honored by the random-access backends (ZIP, 7z); the aggregate summary lets a whole-stream
@@ -180,9 +209,25 @@ pub fn create(
             match &item.disk_path {
                 None => writer.add_dir(&item.entry)?,
                 Some(disk) => {
-                    let file = File::open(disk)?;
+                    // Name the file. One locked or unreadable source aborts the whole create, and
+                    // `io::Error` from `File::open` carries no path, so on a 100 000-file backup the
+                    // operator could not tell what to exclude.
+                    let file = File::open(disk)
+                        .map_err(|e| ArchiveError::Backend(format!("{}: {e}", disk.display())))?;
                     let mut body = CountingReader::new(file, sink);
-                    writer.add_file(&item.entry, &mut body, item.hint)?;
+                    // A cancel that fires mid-body comes back as whatever the backend wrapped the
+                    // reader's error in (`chunker: … "cancelled"` for `.cram`). Translate it back,
+                    // the same way both extract paths do, so a user pressing Cancel is told the job
+                    // was cancelled rather than shown what reads like archive damage.
+                    writer
+                        .add_file(&item.entry, &mut body, item.hint)
+                        .map_err(|e| {
+                            if sink.is_cancelled() {
+                                ArchiveError::Cancelled
+                            } else {
+                                e
+                            }
+                        })?;
                 }
             }
             sink.on_file_done(&item.entry);

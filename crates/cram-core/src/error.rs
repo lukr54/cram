@@ -60,6 +60,11 @@ pub struct Report {
     pub bytes: u64,
     /// Per-entry failures: (entry name, message). Non-fatal; extraction continues.
     pub failed: Vec<(String, String)>,
+    /// Entries refused by the path guard and never written (traversal names, absolute paths, a
+    /// drive letter or ADS, a pathologically deep name). Dropping them is the correct action, but
+    /// doing it silently makes a tampered archive indistinguishable from a nearly-empty one, so the
+    /// count is carried out to the caller to report. `cram-extract` already prints its own.
+    pub dropped_unsafe: u64,
     /// Set if the job was cancelled partway.
     pub cancelled: bool,
 }

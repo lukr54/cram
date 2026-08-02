@@ -124,7 +124,15 @@ impl<'s, R: Read> CountingReader<'s, R> {
 }
 
 impl<R: Read> Read for CountingReader<'_, R> {
+    /// Same cancel discipline as the extract side's `ProgressWriter`: a create loop only checks
+    /// cancellation between entries, so without this a single 200 GB source could not be cancelled
+    /// at all until it had been read and compressed in full. Deliberately NOT
+    /// `ErrorKind::Interrupted`, `io::copy` and `read_exact` silently *retry* that, which against a
+    /// one-way cancel latch spins forever; `Other` unwinds the copy at once.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.sink.is_cancelled() {
+            return Err(io::Error::other("cancelled"));
+        }
         let n = self.inner.read(buf)?;
         self.sink.on_bytes(n as u64);
         Ok(n)

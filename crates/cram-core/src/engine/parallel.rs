@@ -69,19 +69,26 @@ pub fn run(
         }
     }
 
-    // Deduplicate by DESTINATION path before scheduling. Two entries can map to one on-disk file,
+    // Group by DESTINATION path before scheduling. Two entries can map to one on-disk file,
     // literal duplicate names (legal in ZIP), case-variants (`A.txt`/`a.txt` on case-insensitive
     // NTFS), Win32 trailing-dot/space normalization, or device-name mangling collisions, and two
     // workers writing the same file interleave their 8 MiB blocks into silent corruption (each
     // passes its own size check, so the report says clean), while a failing worker's remove_file
-    // deletes its sibling's finished output. Schedule only the LAST occurrence per folded path
-    // (sequential extraction's last-writer-wins) and count the shadowed ones as skipped.
+    // deletes its sibling's finished output.
     //
-    // The fold must match the TARGET filesystem's own collision rule, or it wrongly drops a distinct
-    // file. Case folding is therefore decided by probing `dest` at runtime rather than by `cfg`:
-    // case-insensitivity belongs to the filesystem, not the OS, and a macOS volume is
-    // case-insensitive by default while ext4 is not. Trailing dots and spaces are separate: that is
-    // a Win32 path-normalization rule rather than a filesystem one, so it stays compile-gated.
+    // A colliding group is SERIALISED onto one task in archive order, never thinned. Keeping only
+    // the last entry per folded key destroyed files whenever the fold was harsher than the target
+    // filesystem's own rule: `K.txt` (U+212A) and `k.txt`, `ẞ.txt` (U+1E9E) and `ß.txt`, `Å.txt`
+    // (U+00C5) and `Å.txt` (U+212B) are each two distinct files on NTFS and each fold to one key
+    // under Rust's full-Unicode `to_lowercase`, so a four-pair archive lost three files with exit 0
+    // while the sequential path wrote all eight. Writing a group in order gives last-writer-wins
+    // where the destinations really are one file (the semantics the dedup was for, and the ones
+    // sequential extraction already has) and gives every file where they are not.
+    //
+    // That leaves the fold a scheduling prefilter rather than a decision about data, so it is
+    // deliberately AGGRESSIVE: over-folding costs one group a little parallelism, under-folding puts
+    // two workers back on one file. Case folding is still probed on `dest` at runtime rather than
+    // assumed from `cfg`, because case-insensitivity belongs to the filesystem and not to the OS.
     let fold_case = dest_is_case_insensitive(dest);
     let dest_key = |e: &Entry| -> String {
         e.path
@@ -89,6 +96,10 @@ pub fn run(
             .components()
             .map(|c| {
                 let s = c.as_os_str().to_string_lossy();
+                // Mangle first, exactly as `join_under` does: `safe()` records the archive's own
+                // name, so `NUL` and `_NUL` only become one destination here. Skipping this put two
+                // workers back on one file and interleaved their blocks (2 runs in 12).
+                let s = crate::model::mangle_dos_device(&s);
                 #[cfg(windows)]
                 let s = s.trim_end_matches([' ', '.']).to_string();
                 #[cfg(not(windows))]
@@ -102,26 +113,29 @@ pub fn run(
             .collect::<Vec<_>>()
             .join("/")
     };
-    let mut last_for_path: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, e) in entries.iter().enumerate() {
-        if !e.is_dir() {
-            last_for_path.insert(dest_key(e), i);
+        if e.is_dir() {
+            continue;
+        }
+        let key = dest_key(e);
+        match group_of.get(&key) {
+            Some(&g) => groups[g].push(i),
+            None => {
+                group_of.insert(key, groups.len());
+                groups.push(vec![i]);
+            }
         }
     }
-    let mut shadowed = 0u64;
-    // Longest-processing-time-first: extract the biggest entries first to keep the pool balanced.
-    let mut order: Vec<usize> = (0..entries.len())
-        .filter(|&i| !entries[i].is_dir())
-        .filter(|&i| {
-            let wins = last_for_path.get(&dest_key(&entries[i])) == Some(&i);
-            if !wins {
-                shadowed += 1;
-            }
-            wins
-        })
-        .collect();
-    order.sort_by_key(|&i| Reverse(entries[i].size));
+    // Longest-processing-time-first: schedule the heaviest group first to keep the pool balanced.
+    // A group's weight is its total, not its largest entry, because its members run in sequence.
+    groups.sort_by_key(|g| {
+        Reverse(
+            g.iter()
+                .fold(0u64, |acc, &i| acc.saturating_add(entries[i].size)),
+        )
+    });
 
     let report = Mutex::new(Report::default());
     let pool = ThreadPoolBuilder::new()
@@ -130,31 +144,35 @@ pub fn run(
         .map_err(|e| ArchiveError::Backend(e.to_string()))?;
 
     pool.install(|| {
-        order.par_iter().for_each(|&i| {
-            sink.wait_if_paused();
-            if sink.is_cancelled() {
-                return;
-            }
-            // Isolate each entry: a panic inside a decoder (e.g. a malformed or pathological
-            // compressed stream) is caught and recorded as a failed entry rather than unwinding the
-            // whole extraction, one bad entry in a big archive can't take down the rest or crash the
-            // host process (which matters for the GUI, which extracts in-process).
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                extract_one(ra, dest, i, &entries[i], skip_existing, sink)
-            }));
-            match outcome {
-                Ok(Ok(EntryOutcome::Wrote(bytes))) => {
-                    let mut r = report.lock().unwrap();
-                    r.extracted += 1;
-                    r.bytes += bytes;
+        groups.par_iter().for_each(|group| {
+            // One task per destination group; its members run in archive order on this thread, so
+            // two entries that resolve to the same file can never be in flight at once.
+            for &i in group {
+                sink.wait_if_paused();
+                if sink.is_cancelled() {
+                    return;
                 }
-                Ok(Ok(EntryOutcome::Skipped)) => report.lock().unwrap().skipped += 1,
-                Ok(Err(ArchiveError::Cancelled)) => {}
-                Ok(Err(e)) => report.lock().unwrap().push_failure(entries[i].name(), e),
-                Err(panic) => report.lock().unwrap().push_failure(
-                    entries[i].name(),
-                    ArchiveError::Backend(panic_message(panic.as_ref())),
-                ),
+                // Isolate each entry: a panic inside a decoder (e.g. a malformed or pathological
+                // compressed stream) is caught and recorded as a failed entry rather than unwinding
+                // the whole extraction, one bad entry in a big archive can't take down the rest or
+                // crash the host process (which matters for the GUI, which extracts in-process).
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    extract_one(ra, dest, i, &entries[i], skip_existing, sink)
+                }));
+                match outcome {
+                    Ok(Ok(EntryOutcome::Wrote(bytes))) => {
+                        let mut r = report.lock().unwrap();
+                        r.extracted += 1;
+                        r.bytes += bytes;
+                    }
+                    Ok(Ok(EntryOutcome::Skipped)) => report.lock().unwrap().skipped += 1,
+                    Ok(Err(ArchiveError::Cancelled)) => {}
+                    Ok(Err(e)) => report.lock().unwrap().push_failure(entries[i].name(), e),
+                    Err(panic) => report.lock().unwrap().push_failure(
+                        entries[i].name(),
+                        ArchiveError::Backend(panic_message(panic.as_ref())),
+                    ),
+                }
             }
         });
     });
@@ -165,9 +183,6 @@ pub fn run(
     }
 
     let mut r = report.into_inner().unwrap();
-    // Shadowed duplicates were not written (their later twin owns the destination), surface them
-    // as skipped, never as extracted.
-    r.skipped += shadowed;
     r.cancelled = sink.is_cancelled();
     Ok(r)
 }
@@ -254,15 +269,16 @@ mod dest_race_tests {
     use std::sync::Arc;
 
     /// Case-variant names (`A.txt` / `a.txt`) resolve to ONE file on a case-insensitive filesystem,
-    /// so only the LAST entry may be scheduled; that is what stops two workers racing the same
-    /// destination and interleaving their write blocks into silent corruption. Where the two names
-    /// are distinct files, both are written and nothing is shadowed.
+    /// so both must run on ONE task in archive order: that is what stops two workers racing the same
+    /// destination and interleaving their write blocks into silent corruption, and it leaves the
+    /// last entry's content on disk exactly as sequential extraction would. Where the two names are
+    /// distinct files, both are written and keep their own content. Either way nothing is discarded.
     ///
     /// Which of those holds is decided by the filesystem under the temp directory, not by the OS, so
     /// the test asks the same question the engine asks instead of branching on `cfg`. That keeps it
     /// honest on a case-sensitive APFS volume and on a case-insensitive mount under Linux.
     #[test]
-    fn duplicate_destinations_are_deduped_last_wins() {
+    fn duplicate_destinations_are_serialised_last_wins() {
         use zip::write::SimpleFileOptions;
         let mut w = zip::write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         // The bigger entry first: LPT ordering would schedule it first if it survived dedup.
@@ -290,13 +306,10 @@ mod dest_race_tests {
 
         assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
         if dest_is_case_insensitive(&out) {
-            // `A.txt` and `a.txt` are ONE destination, so only the last survives and the shadowed
-            // entry is surfaced as skipped.
-            assert_eq!(report.extracted, 1, "only the winning duplicate is written");
-            assert_eq!(
-                report.skipped, 1,
-                "the shadowed duplicate is surfaced as skipped"
-            );
+            // `A.txt` and `a.txt` are ONE destination: both entries are written, in archive order,
+            // and the last one owns the file. Nothing is dropped and nothing is called "skipped".
+            assert_eq!(report.extracted, 2, "both entries are written, in order");
+            assert_eq!(report.skipped, 0, "a collision is not a skip");
             let got = fs::read(out.join("a.txt"))
                 .or_else(|_| fs::read(out.join("A.txt")))
                 .unwrap();
@@ -315,6 +328,44 @@ mod dest_race_tests {
             assert_eq!(fs::read(out.join("A.txt")).unwrap(), vec![b'A'; 300_000]);
             assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"last-writer-wins");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `K` (U+212A KELVIN SIGN) and `k` fold to one key under Rust's full-Unicode `to_lowercase`
+    /// but are two distinct files on NTFS, which folds through the fixed `$UpCase` table. They must
+    /// both survive: the fold decides scheduling, never which file is worth keeping.
+    #[test]
+    fn unicode_fold_collision_writes_both_files() {
+        use zip::write::SimpleFileOptions;
+        let mut w = zip::write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file("\u{212A}.txt", SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(b"KELVIN").unwrap();
+        w.start_file("k.txt", SimpleFileOptions::default()).unwrap();
+        w.write_all(b"ascii-k").unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+
+        let dir = std::env::temp_dir().join(format!("cram-fold-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("fold.zip");
+        fs::write(&zip_path, &bytes).unwrap();
+
+        let reader = crate::formats::open(
+            &zip_path,
+            crate::format::Format::zip(),
+            Arc::new(NoPassword),
+        )
+        .unwrap();
+        let ra = reader.as_random_access().expect("zip is random-access");
+        let out = dir.join("out");
+        let report = run(ra, &out, 4, false, &NullSink).unwrap();
+
+        assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
+        assert_eq!(report.extracted, 2, "both distinct files are written");
+        assert_eq!(report.skipped, 0, "neither is discarded as a duplicate");
+        assert_eq!(fs::read(out.join("\u{212A}.txt")).unwrap(), b"KELVIN");
+        assert_eq!(fs::read(out.join("k.txt")).unwrap(), b"ascii-k");
         let _ = fs::remove_dir_all(&dir);
     }
 }

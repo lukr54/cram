@@ -2,6 +2,7 @@
 //! lives is [`EntryPath::from_raw`], every backend must funnel entry names through it, so no
 //! backend can accidentally write outside the output directory.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -24,6 +25,7 @@ pub struct EntryPath {
 /// Does this single path component resolve to a Win32 DOS device? Win32 name parsing ignores
 /// trailing spaces/dots and matches the name *before* the first `.`, case-insensitively; so
 /// `nul`, `NUL.txt`, and `COM1 ` all name devices. Used to mangle such names on extraction.
+#[cfg(windows)]
 fn is_reserved_dos_name(comp: &str) -> bool {
     let trimmed = comp.trim_end_matches([' ', '.']);
     let stem = trimmed.split('.').next().unwrap_or(trimmed);
@@ -57,6 +59,32 @@ fn is_reserved_dos_name(comp: &str) -> bool {
     )
 }
 
+/// Prefix a component Win32 would read as a DOS device with `_`, so creating it makes a file
+/// instead of opening the device and swallowing the bytes.
+///
+/// This belongs to the *output* path only, [`EntryPath::join_under`] applies it to every component
+/// on the way to disk. It must NOT touch the name an archive records: mangling at
+/// [`EntryPath::from_raw`] renamed the user's own `aux.h` to `_aux.h` inside every archive Cram
+/// wrote, and `cram conv` carried that rename into every other format. Anything else that turns an
+/// untrusted string into a path on disk (a download's filename, a mount's projected name) has to
+/// call this for itself.
+///
+/// A no-op off Windows, where these are ordinary filenames and mangling would corrupt them.
+#[cfg(windows)]
+pub fn mangle_dos_device(comp: &str) -> Cow<'_, str> {
+    if is_reserved_dos_name(comp) {
+        Cow::Owned(format!("_{comp}"))
+    } else {
+        Cow::Borrowed(comp)
+    }
+}
+
+/// See the Windows definition: off Windows a reserved name is just a name.
+#[cfg(not(windows))]
+pub fn mangle_dos_device(comp: &str) -> Cow<'_, str> {
+    Cow::Borrowed(comp)
+}
+
 /// Reject absurdly deep entry paths. A hostile archive could otherwise carry a single name with
 /// hundreds of thousands of `/`-components and drive pathological per-component work (deep recursion
 /// or filesystem traversal) in a consumer. Real archives never approach this.
@@ -68,10 +96,10 @@ impl EntryPath {
     /// unsafe names (the caller turns that into `ArchiveError::UnsafePath`). Also rejects paths
     /// deeper than `MAX_PATH_DEPTH` components (hostile-archive DoS guard).
     ///
-    /// Windows reserved device names (`NUL`, `CON`, `COM1`, …) are *mangled* (prefixed with `_`),
-    /// not rejected: a Unix-authored archive may legitimately contain a file named `NUL`, and
-    /// `File::create("…\\NUL")` opens the null device, the bytes vanish while the extractor
-    /// reports success. Mangling extracts the file under a safe name instead of losing it.
+    /// Windows reserved device names (`NUL`, `CON`, `COM1`, …) survive this untouched: the name a
+    /// Unix-authored archive gives a file is a fact about that archive, and the create side stores
+    /// `safe()` verbatim. They are mangled where they become a real path instead, see
+    /// [`mangle_dos_device`] and [`Self::join_under`].
     pub fn from_raw(raw: &str) -> Option<Self> {
         let mut safe = PathBuf::new();
         let mut depth = 0usize;
@@ -86,11 +114,7 @@ impl EntryPath {
             if depth > MAX_PATH_DEPTH {
                 return None; // pathologically deep path, reject rather than process it
             }
-            if is_reserved_dos_name(c) {
-                safe.push(format!("_{c}"));
-            } else {
-                safe.push(c);
-            }
+            safe.push(c);
         }
         if safe.as_os_str().is_empty() {
             return None;
@@ -108,8 +132,17 @@ impl EntryPath {
         &self.safe
     }
     /// The absolute output path for this entry under `base` (guaranteed to stay under `base`).
+    ///
+    /// Every component goes through [`mangle_dos_device`], so `NUL` lands as `_NUL` rather than
+    /// opening the null device and reporting a clean extraction over vanished bytes. This is the
+    /// one place that mangling happens: every write path in the engine resolves its destination
+    /// here, and nothing that only *records* a name passes through it.
     pub fn join_under(&self, base: &Path) -> PathBuf {
-        base.join(&self.safe)
+        let mut out = base.to_path_buf();
+        for comp in self.safe.components() {
+            out.push(mangle_dos_device(&comp.as_os_str().to_string_lossy()).as_ref());
+        }
+        out
     }
 }
 
@@ -192,42 +225,46 @@ mod tests {
     }
 
     #[test]
-    fn mangles_reserved_device_names() {
+    fn device_names_are_recorded_verbatim() {
+        // The stored name is what the source was called. `aux.h` is an ordinary header file on
+        // every Unix box; a create that renamed it to `_aux.h` inside the archive lost the real
+        // name for good, and `cram conv` propagated the rename into every other container.
+        for name in ["NUL", "nul", "CON.txt", "com1", "aux.h", "a/NUL/b.txt"] {
+            assert_eq!(
+                EntryPath::from_raw(name).unwrap().safe(),
+                Path::new(name),
+                "{name} must be stored as itself"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mangles_reserved_device_names_on_the_way_to_disk() {
+        let out = Path::new("out");
+        let joined = |raw: &str| EntryPath::from_raw(raw).unwrap().join_under(out);
         // Bare device name → mangled to a safe on-disk name (file kept, not silently lost).
-        assert_eq!(
-            EntryPath::from_raw("NUL").unwrap().safe(),
-            Path::new("_NUL")
-        );
-        assert_eq!(
-            EntryPath::from_raw("nul").unwrap().safe(),
-            Path::new("_nul")
-        );
+        assert_eq!(joined("NUL"), out.join("_NUL"));
+        assert_eq!(joined("nul"), out.join("_nul"));
         // Device name with an extension (Win32 matches the stem before the first '.').
-        assert_eq!(
-            EntryPath::from_raw("CON.txt").unwrap().safe(),
-            Path::new("_CON.txt")
-        );
-        assert_eq!(
-            EntryPath::from_raw("com1").unwrap().safe(),
-            Path::new("_com1")
-        );
+        assert_eq!(joined("CON.txt"), out.join("_CON.txt"));
+        assert_eq!(joined("com1"), out.join("_com1"));
         // Reserved even as a directory component.
         assert_eq!(
-            EntryPath::from_raw("a/NUL/b.txt").unwrap().safe(),
-            Path::new("a/_NUL/b.txt")
+            joined("a/NUL/b.txt"),
+            out.join("a").join("_NUL").join("b.txt")
         );
         // Non-devices are untouched (substring / wrong-arity must not trigger).
-        assert_eq!(
-            EntryPath::from_raw("NULL.txt").unwrap().safe(),
-            Path::new("NULL.txt")
-        );
-        assert_eq!(
-            EntryPath::from_raw("COM10").unwrap().safe(),
-            Path::new("COM10")
-        );
-        assert_eq!(
-            EntryPath::from_raw("console.log").unwrap().safe(),
-            Path::new("console.log")
-        );
+        assert_eq!(joined("NULL.txt"), out.join("NULL.txt"));
+        assert_eq!(joined("COM10"), out.join("COM10"));
+        assert_eq!(joined("console.log"), out.join("console.log"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn device_names_are_left_alone_off_windows() {
+        // `NUL` names no device here, so extracting it under a mangled name would be the corruption.
+        let p = EntryPath::from_raw("a/NUL/b.txt").unwrap();
+        assert_eq!(p.join_under(Path::new("out")), Path::new("out/a/NUL/b.txt"));
     }
 }
