@@ -25,6 +25,9 @@ getrandom = "0.2" # random GUID for the virtualization-instance id
 # DLL stops the whole process from starting, over a feature only `mount` uses.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    # FindFirstFileW, for the reparse tag on a candidate mount root: the tag is the only way to tell
+    # a folder a dead mount left behind from a junction that merely happens to be empty.
+    "Win32_Storage_FileSystem",
     "Win32_Storage_ProjectedFileSystem",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",

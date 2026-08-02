@@ -69,8 +69,14 @@ impl Mount {
 
 /// Mount `archive` (any random-access format, `.cram` or ZIP) as a virtual folder at `root`. The
 /// format is sniffed from the file; a sequential-only container (tar/7z/rar/raw) is rejected with
-/// `ArchiveError::UnsupportedFormat`. `root` is created if absent and must be empty. Returns a
-/// [`Mount`] guard; the folder stays live until it is dropped.
+/// `ArchiveError::UnsupportedFormat`. Returns a [`Mount`] guard; the folder stays live until it is
+/// dropped.
+///
+/// `root` is created if absent. A `root` that already holds anything is **refused**: the mount hides
+/// the folder's contents while it runs and unmounting cannot restore them. Dropping the [`Mount`]
+/// deletes `root` only if this call created it, so pointing a mount at a folder of your own can
+/// never destroy it. An empty `root` left reparse-tagged by a mount that crashed is cleared and
+/// reported, since that folder is otherwise unmountable for good.
 #[cfg(windows)]
 pub fn mount(archive: &Path, root: &Path, pw: Arc<dyn PasswordProvider>) -> Result<Mount> {
     // Sniff → dispatch to whichever backend offers random access (ZIP or `.cram`). The mount only
@@ -137,13 +143,22 @@ impl DirModel {
         tree.entry(String::new()).or_default(); // root always exists
 
         for (index, e) in reader.entries().iter().enumerate() {
-            // Project the SANITIZED path, not the raw archive name: `safe()` carries the reserved-
-            // device mangling (`NUL` → `_NUL`) that extraction applies. Serving the raw name would
-            // let a mounted entry called `NUL`/`CON` bind the Win32 device, opens hit the null/
-            // console device before ever reaching ProjFS, so the entry's real content is unreachable
-            // and a copy silently produces an empty file.
+            // Project the SANITIZED path, not the raw archive name, and mangle reserved device
+            // names per component the way extraction does. Serving the raw name would let a mounted
+            // entry called `NUL`/`CON` bind the Win32 device, opens hit the null/console device
+            // before ever reaching ProjFS, so the entry's real content is unreachable and a copy
+            // silently produces an empty file.
+            //
+            // The mangle has to be applied here rather than read out of `safe()`: it lives at the
+            // point a name becomes a filesystem path (`join_under` for extraction, this loop for the
+            // mount), because applying it earlier corrupted the name stored on the create side.
             let path = e.path.safe().to_string_lossy().replace('\\', "/");
-            let path = path.trim_matches('/').to_string();
+            let path = path
+                .trim_matches('/')
+                .split('/')
+                .map(cram_core::model::mangle_dos_device)
+                .collect::<Vec<_>>()
+                .join("/");
             if path.is_empty() {
                 continue;
             }
