@@ -20,20 +20,27 @@
 //!   user deletes themselves once satisfied. There is no code path in this module that deletes a
 //!   user's file outright.
 //!
-//! ## Hard links, and their one caveat
+//! ## Hard links, and their caveats
 //!
 //! [`Action::Link`] leaves every path exactly where it was, the folder structure of a photo
 //! collection often *is* the meaning, so nothing disappears from view; while the redundant copies
-//! stop occupying space. The caveat, which callers must surface: linked paths are one file, so an
-//! editor that rewrites a photo **in place** changes it under every name. Tools that write a new file
-//! (the overwhelmingly common case) are unaffected. Quarantine is the alternative when that matters.
+//! stop occupying space. The caveats, which callers must surface:
+//!
+//! - Linked paths are one file, so an editor that rewrites a photo **in place** changes it under
+//!   every name. Tools that write a new file (the overwhelmingly common case) are unaffected.
+//! - A linked path also takes on the keeper's attributes, permissions and timestamps. Those live on
+//!   the file record the two names now share, not on the name, so a read-only copy comes back
+//!   writable and no hard-link deduplicator can preserve them.
+//!
+//! Quarantine is the alternative when either matters.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use super::dedup::{
-    hash_whole, same_physical_file, volume_of, DedupReport, GroupKind, ScannedFile,
+    file_identity, hash_whole, volume_of, DedupReport, FileId, GroupKind, ScannedFile,
 };
 use crate::error::{ArchiveError, Result};
 use crate::progress::ProgressSink;
@@ -66,7 +73,9 @@ pub enum Action {
     Quarantine,
 }
 
-/// One decided operation. `bytes` is what this single action frees.
+/// One decided operation. `bytes` is what this single action frees, and is 0 when an earlier action
+/// in the same group already accounted for those blocks (two victims that are hard links to one
+/// another), so summing a plan never promises the same space twice.
 #[derive(Clone, Debug)]
 pub struct PlannedAction {
     pub keeper: PathBuf,
@@ -137,22 +146,42 @@ pub struct ReclaimReport {
 pub fn plan(report: &DedupReport, opts: &ReclaimOptions) -> Plan {
     let mut out = Plan::default();
     for group in report.groups.iter().filter(|g| g.kind == GroupKind::Exact) {
-        if group.files.len() < 2 {
+        // A copy already sitting in the quarantine directory has been acted on once. Planning it
+        // again rebuilds its path — quarantine root and all — underneath the quarantine root, so
+        // each run nests the last one deeper and reports the same saving a second time.
+        let members: Vec<ScannedFile> = group
+            .files
+            .iter()
+            .filter(|f| !in_quarantine(opts.quarantine.as_deref(), &f.path))
+            .cloned()
+            .collect();
+        if members.len() < 2 {
             continue;
         }
-        let keeper = match choose_keeper(&group.files, opts.keep) {
+        let keeper = match choose_keeper(&members, opts.keep) {
             Some(k) => k,
             None => continue,
         };
-        for victim in &group.files {
+        let keeper_id = file_identity(&keeper.path);
+        // Physical files already accounted for in this group. Victims hard-linked to *each other*
+        // must all be acted on, the space comes back only once the last name stops pointing at
+        // those blocks, but the bytes they share are freed once and must be counted once.
+        let mut physical: HashSet<FileId> = HashSet::new();
+        for victim in &members {
             if victim.path == keeper.path {
                 continue;
             }
+            let victim_id = file_identity(&victim.path);
             // Already one file under two names: linking it again would free nothing and the "saving"
-            // would be fictional.
-            if same_physical_file(&keeper.path, &victim.path) {
+            // would be fictional. An unknown identity is never treated as "same file", that would
+            // skip a real duplicate.
+            if victim_id.is_some() && victim_id == keeper_id {
                 continue;
             }
+            let bytes = match victim_id {
+                Some(id) if !physical.insert(id) => 0,
+                _ => victim.size,
+            };
             let same_volume = volume_of(&keeper.path) == volume_of(&victim.path);
             let action = if opts.link && same_volume {
                 Some(Action::Link)
@@ -166,7 +195,7 @@ pub fn plan(report: &DedupReport, opts: &ReclaimOptions) -> Plan {
                     keeper: keeper.path.clone(),
                     victim: victim.path.clone(),
                     action: Action::Link,
-                    bytes: victim.size,
+                    bytes,
                     dest: None,
                 }),
                 Some(Action::Quarantine) => {
@@ -175,7 +204,7 @@ pub fn plan(report: &DedupReport, opts: &ReclaimOptions) -> Plan {
                         keeper: keeper.path.clone(),
                         victim: victim.path.clone(),
                         action: Action::Quarantine,
-                        bytes: victim.size,
+                        bytes,
                         dest: Some(quarantine_dest(qdir, &victim.path)),
                     });
                 }
@@ -250,6 +279,26 @@ fn looks_like_a_copy(path: &Path) -> bool {
         return !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit());
     }
     false
+}
+
+/// Is this file already inside the quarantine directory?
+///
+/// Quarantining into a folder that is itself under a scan root is the ordinary case (`cram dedup D:\
+/// --quarantine D:\dupes`), and without this the operation never converges: run two finds the
+/// quarantined copy, rebuilds its path under the quarantine root again, and claims the same bytes
+/// back a second time.
+///
+/// Canonical paths where both resolve, so a relative `--quarantine dupes` still matches the absolute
+/// paths the walk produces; the literal prefix otherwise, since a dry run may name a directory that
+/// does not exist yet.
+fn in_quarantine(qdir: Option<&Path>, path: &Path) -> bool {
+    let Some(q) = qdir else {
+        return false;
+    };
+    match (q.canonicalize(), path.canonicalize()) {
+        (Ok(q), Ok(p)) => p.starts_with(q),
+        _ => path.starts_with(q),
+    }
 }
 
 /// Where a quarantined file lands: the original path rebuilt under the quarantine root, so what was
@@ -382,21 +431,59 @@ fn replace_with_hardlink(keeper: &Path, victim: &Path) -> io::Result<()> {
     }
 }
 
+/// Rename refused because the two paths are on different filesystems: `EXDEV` on Unix,
+/// `ERROR_NOT_SAME_DEVICE` on Windows. The one failure the copy fallback below is meant for.
+#[cfg(windows)]
+const CROSS_DEVICE: i32 = 17;
+#[cfg(not(windows))]
+const CROSS_DEVICE: i32 = 18;
+
 /// Move `victim` into quarantine. A plain rename when the destination is on the same filesystem;
 /// otherwise copy, **verify the copy against `expect`**, and only then remove the original, so an
 /// interrupted or corrupted cross-drive move can never destroy the only good copy.
+///
+/// Every path out of here that reports failure leaves the disk as it found it. That matters more
+/// here than anywhere else in the module: a failed action that left its copy behind would be
+/// indistinguishable from a successful move, on a command whose whole purpose is to use less space.
 fn move_to_quarantine(victim: &Path, dest: &Path, expect: &[u8; 32]) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     let dest = unique_dest(dest);
-    if fs::rename(victim, &dest).is_ok() {
-        return Ok(());
+    match fs::rename(victim, &dest) {
+        Ok(()) => return Ok(()),
+        // Only a genuine cross-filesystem rename earns the fallback. A sharing violation or a
+        // permission error would copy the file and then fail to delete the original, leaving a
+        // second copy behind on an action that reported failure. The volume comparison is the
+        // second opinion: a cross-drive quarantine must keep working even if some filesystem
+        // refuses the rename with a code of its own rather than the documented one.
+        Err(e)
+            if e.raw_os_error() != Some(CROSS_DEVICE) && volume_of(victim) == volume_of(&dest) =>
+        {
+            return Err(e)
+        }
+        Err(_) => {}
     }
-    // Cross-filesystem (or a rename the OS refused): fall back to copy-verify-delete.
-    fs::copy(victim, &dest)?;
+    // Cross-filesystem: copy, verify, delete.
+    if let Err(e) = fs::copy(victim, &dest) {
+        let _ = fs::remove_file(&dest);
+        return Err(e);
+    }
+    // `fs::copy` carries permissions but not timestamps on Unix (Windows' CopyFileEx does), and a
+    // file that comes back from quarantine stamped with the date of the run has lost something.
+    if let Ok(t) = fs::metadata(victim).and_then(|m| m.modified()) {
+        let _ = filetime::set_file_mtime(&dest, filetime::FileTime::from_system_time(t));
+    }
     match hash_whole(&dest) {
-        Ok(got) if &got == expect => fs::remove_file(victim),
+        Ok(got) if &got == expect => match fs::remove_file(victim) {
+            Ok(()) => Ok(()),
+            // The original is still in place, so the copy is a stray duplicate of a file that was
+            // never moved.
+            Err(e) => {
+                let _ = fs::remove_file(&dest);
+                Err(e)
+            }
+        },
         Ok(_) => {
             let _ = fs::remove_file(&dest);
             Err(io::Error::new(
@@ -653,6 +740,126 @@ mod tests {
             blob,
             "quarantined bytes intact"
         );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&q);
+    }
+
+    #[test]
+    fn victims_hard_linked_to_each_other_are_counted_once() {
+        // Both names have to be relinked, the blocks stay allocated while any name still points at
+        // them, but they are one physical copy and the plan must promise them back only once.
+        let dir = scratch("linked-victims");
+        let blob = vec![0x31u8; 300 * 1024];
+        write(&dir.join("a.bin"), &blob);
+        let b = dir.join("dir/b.bin");
+        write(&b, &blob);
+        if fs::hard_link(&b, dir.join("dir/c.bin")).is_err() {
+            let _ = fs::remove_dir_all(&dir);
+            return; // filesystem without hard links: nothing to assert
+        }
+
+        let rep = scan_dir(&dir);
+        let plan = plan(
+            &rep,
+            &ReclaimOptions {
+                link: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.actions.len(), 2, "both names must be relinked");
+        assert_eq!(plan.bytes(), 300 * 1024, "one physical copy comes back");
+        assert_eq!(
+            plan.bytes(),
+            rep.reclaimable(),
+            "the scan and the plan agree"
+        );
+
+        let sink = Progress::new(0, 0);
+        let done = apply(&plan, &sink).unwrap();
+        assert!(done.failed.is_empty(), "failures: {:?}", done.failed);
+        assert_eq!(done.bytes_reclaimed, 300 * 1024, "and so does the apply");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_quarantine_inside_a_scan_root_converges() {
+        // The ordinary invocation (`--quarantine` pointing somewhere under the folder being
+        // scanned). Without the exclusion, run two moves the quarantined copy into a rebuilt path
+        // *underneath the quarantine root again* and reports the same bytes reclaimed a second time.
+        let dir = scratch("quar-nested");
+        let q = dir.join("_quarantine");
+        let blob = vec![0x6Bu8; 50 * 1024];
+        write(&dir.join("k.bin"), &blob);
+        write(&dir.join("sub/d.bin"), &blob);
+        let opts = ReclaimOptions {
+            link: false,
+            quarantine: Some(q.clone()),
+            keep: KeepPolicy::First,
+        };
+
+        let first = plan(&scan_dir(&dir), &opts);
+        assert_eq!(first.quarantines(), 1);
+        let sink = Progress::new(0, 0);
+        let done = apply(&first, &sink).unwrap();
+        assert_eq!(done.quarantined, 1);
+        assert_eq!(done.bytes_reclaimed, 50 * 1024);
+
+        let second = plan(&scan_dir(&dir), &opts);
+        assert!(
+            second.actions.is_empty(),
+            "the second run planned {:?}",
+            second.actions
+        );
+        let done = apply(&second, &sink).unwrap();
+        assert_eq!(done.bytes_reclaimed, 0, "the saving happened once");
+        assert_eq!(walk_files(&q).len(), 1, "still one quarantined file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file held open without `FILE_SHARE_DELETE`, which is what an open file on Windows ordinarily
+    /// looks like. The rename is refused, and the copy fallback must not run: it would succeed, the
+    /// delete that follows would fail, and the failed action would leave a byte-perfect second copy
+    /// in quarantine that nothing distinguishes from a real move.
+    #[cfg(windows)]
+    #[test]
+    fn a_quarantine_move_that_fails_leaves_no_copy_behind() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+
+        let dir = scratch("quar-locked");
+        let q = scratch("quar-locked-store");
+        let blob = vec![0x2Du8; 120 * 1024];
+        write(&dir.join("aaa-keep/orig.bin"), &blob);
+        let victim = dir.join("zzz-dupes/locked.bin");
+        write(&victim, &blob);
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&victim)
+            .unwrap();
+
+        let plan = plan(
+            &scan_dir(&dir),
+            &ReclaimOptions {
+                link: false,
+                quarantine: Some(q.clone()),
+                keep: KeepPolicy::First,
+            },
+        );
+        assert_eq!(plan.quarantines(), 1);
+        let sink = Progress::new(0, 0);
+        let done = apply(&plan, &sink).unwrap();
+
+        assert_eq!(done.quarantined, 0);
+        assert_eq!(done.bytes_reclaimed, 0);
+        assert_eq!(done.failed.len(), 1, "the move is reported as failed");
+        assert!(victim.exists(), "the original is left intact");
+        assert!(
+            walk_files(&q).is_empty(),
+            "a failed move must leave nothing in quarantine: {:?}",
+            walk_files(&q)
+        );
+        drop(held);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&q);
     }

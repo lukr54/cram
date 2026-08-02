@@ -171,7 +171,7 @@ pub fn scan(
 
     // ---- 1. Walk ------------------------------------------------------------------------------
     let mut files: Vec<ScannedFile> = Vec::new();
-    for root in roots {
+    for root in collapse_roots(roots) {
         walk(
             root,
             opts.min_size,
@@ -292,6 +292,53 @@ fn distinct_copies(files: &[ScannedFile]) -> usize {
     seen.len() + unknown
 }
 
+/// Drop every root that another root already covers, comparing canonical paths so `.`, `..` and a
+/// relative spelling all resolve to the same place. `cram dedup D:\photos D:\photos\2019` otherwise
+/// walks the inner folder twice: the same file lands in its own duplicate group under one identical
+/// path, and the reclaim plan then contains the same action twice.
+///
+/// The kept roots are the caller's originals, not the canonical forms; walking a canonicalized path
+/// on Windows would print every result with a `\\?\` prefix.
+fn collapse_roots(roots: &[PathBuf]) -> Vec<&PathBuf> {
+    let canon: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
+        .collect();
+    roots
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            !canon.iter().enumerate().any(|(j, other)| {
+                // Equal roots keep the first spelling; a nested root loses to its ancestor.
+                j != *i && canon[*i].starts_with(other) && (canon[*i] != *other || j < *i)
+            })
+        })
+        .map(|(_, r)| r)
+        .collect()
+}
+
+/// The scratch names [`super::reclaim`] renames through while it swaps a duplicate for a hard link.
+/// A crash between those two renames leaves the victim under one of them; it is a real file, but it
+/// is the wreckage of an interrupted swap rather than something to plan a second swap for, so the
+/// walk leaves it where it is.
+fn is_reclaim_scratch(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.starts_with('.') => n,
+        _ => return false,
+    };
+    let Some(pos) = name.rfind(".cram-") else {
+        return false;
+    };
+    match name[pos + ".cram-".len()..].rsplit_once('-') {
+        Some((tag, pid)) => {
+            matches!(tag, "link" | "old")
+                && !pid.is_empty()
+                && pid.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Recursively collect regular files at or above `min_size`. Symlinks are never followed, that would
 /// invent "duplicates" that are really one file, and could loop forever. Unreadable directories are
 /// counted and skipped rather than aborting a scan that may span many drives.
@@ -326,7 +373,7 @@ fn walk(
         for entry in entries.flatten() {
             walk(&entry.path(), min_size, out, unreadable, sink)?;
         }
-    } else if meta.is_file() && meta.len() >= min_size.max(1) {
+    } else if meta.is_file() && meta.len() >= min_size.max(1) && !is_reclaim_scratch(path) {
         out.push(ScannedFile {
             path: path.to_path_buf(),
             size: meta.len(),
@@ -464,17 +511,6 @@ pub(crate) fn volume_of(path: &Path) -> String {
     match path.components().next() {
         Some(std::path::Component::Prefix(p)) => p.as_os_str().to_string_lossy().to_uppercase(),
         _ => String::new(),
-    }
-}
-
-/// Whether two existing paths are the *same bytes on disk* (one inode, two names). Acting on a pair
-/// that is already hard-linked would be pure churn, and would "reclaim" space that was never in use,
-/// reporting a saving that did not happen.
-pub(crate) fn same_physical_file(a: &Path, b: &Path) -> bool {
-    match (file_identity(a), file_identity(b)) {
-        (Some(x), Some(y)) => x == y,
-        // Unknown identity must never be treated as "same file", that would skip a real duplicate.
-        _ => false,
     }
 }
 
@@ -994,6 +1030,53 @@ mod tests {
         assert_eq!(g[0].reclaimable, 0, "one physical file frees nothing");
         assert_eq!(rep.reclaimable(), 0);
         assert_eq!(rep.redundant_files(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_root_nested_inside_another_root_is_walked_once() {
+        // `cram dedup D:\photos D:\photos\2019`. Walking the inner folder twice puts one path into
+        // its own duplicate group twice, and the reclaim plan then holds the same action twice.
+        let dir = scratch("overlap");
+        let blob = vec![0x5Au8; 200 * 1024];
+        write(&dir.join("k.bin"), &blob);
+        write(&dir.join("sub/dup.bin"), &blob);
+
+        let sink = Progress::new(0, 0);
+        let roots = vec![dir.clone(), dir.join("sub")];
+        let rep = scan(&roots, &DedupOptions::default(), &sink).unwrap();
+        assert_eq!(rep.files_scanned, 2, "two files, not three");
+        let g: Vec<_> = rep.exact_groups().collect();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].files.len(), 2, "each path listed once");
+        assert_eq!(g[0].reclaimable, 200 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_wreckage_of_an_interrupted_link_swap_is_left_alone() {
+        let dir = scratch("orphan");
+        let blob = vec![0x1Fu8; 100 * 1024];
+        write(&dir.join("k.bin"), &blob);
+        // What a crash between reclaim's two renames leaves behind.
+        write(&dir.join(".d.bin.cram-old-1234"), &blob);
+        // A file that merely looks similar is an ordinary file and must still be scanned.
+        write(&dir.join("notes.cram-old-1234"), &blob);
+
+        let sink = Progress::new(0, 0);
+        let rep = scan(std::slice::from_ref(&dir), &DedupOptions::default(), &sink).unwrap();
+        assert_eq!(rep.files_scanned, 2, "the orphan is not scanned");
+        let g: Vec<_> = rep.exact_groups().collect();
+        assert_eq!(g.len(), 1);
+        assert!(
+            !g[0].files.iter().any(|f| f
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with('.')),
+            "an interrupted swap must never be planned for another one"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
