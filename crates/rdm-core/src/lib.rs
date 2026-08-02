@@ -210,31 +210,49 @@ fn apply(
 }
 
 /// (total_size, supports_ranges). Tries HEAD, then a 1-byte Range GET.
+///
+/// A status that says the resource is not there ends the probe. Without that, a 404's own
+/// `Content-Length` was taken as the file size and the chunk workers spent the whole per-chunk
+/// attempt budget, with escalating backoff, discovering one range at a time what the first response
+/// already said. Note what is deliberately NOT checked: a 200 carrying an HTML error page has served
+/// that body as the resource, and there is no signal here distinguishing it from a real one.
 pub async fn probe(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
 ) -> Result<(u64, bool), Err> {
     if let Ok(resp) = apply(client.head(url), headers).send().await {
-        let len = resp
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let ranges = resp
-            .headers()
-            .get(ACCEPT_RANGES)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.contains("bytes"))
-            .unwrap_or(false);
-        if len > 0 {
-            return Ok((len, ranges));
+        let status = resp.status().as_u16();
+        // Only 404/410 are conclusive from a HEAD. Everything else falls through to the range GET,
+        // because plenty of servers answer HEAD with 405, and a URL presigned for GET alone answers
+        // 403 while still serving the file.
+        if status == 404 || status == 410 {
+            return Err(format!("HTTP {status}: no such file at {url}").into());
+        }
+        if resp.status().is_success() {
+            let len = resp
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let ranges = resp
+                .headers()
+                .get(ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("bytes"))
+                .unwrap_or(false);
+            if len > 0 {
+                return Ok((len, ranges));
+            }
         }
     }
     let resp = apply(client.get(url).header(RANGE, "bytes=0-0"), headers)
         .send()
         .await?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}: cannot fetch {url}", resp.status().as_u16()).into());
+    }
     let is206 = resp.status().as_u16() == 206;
     let total = resp
         .headers()
@@ -1721,6 +1739,93 @@ mod net_tests {
             "should have ramped above the start of {RAMP_START}, peaked at {peak}"
         );
         assert!(peak <= 16, "must not exceed the ceiling, peaked at {peak}");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(sidecar_path(&out));
+    }
+
+    /// A server that answers everything with one status and an error page, the shape a hosting
+    /// provider's 404 actually takes: it carries a `Content-Length`, which is what the probe used to
+    /// read as the file size. Counts the requests it received, since the cost of the old behaviour
+    /// was the requests, not the outcome.
+    async fn serve_status(
+        status: u16,
+        reason: &'static str,
+    ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let head_end = loop {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                            match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        };
+                        let req = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                        buf.drain(..head_end);
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        let page = b"<html>not found</html>";
+                        let mut out = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                            page.len()
+                        )
+                        .into_bytes();
+                        if !req.starts_with("HEAD") {
+                            out.extend_from_slice(page);
+                        }
+                        if sock.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    /// A missing file is reported as missing, from the first answer. It used to be read as a 22-byte
+    /// file and then rediscovered one ranged request at a time, through the whole per-chunk attempt
+    /// budget and its escalating backoff, before surfacing as "the download did not complete".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_404_is_reported_as_one_and_costs_one_request() {
+        let (addr, hits) = serve_status(404, "Not Found").await;
+        let out = scratch(&format!("rdm_404_{}.bin", addr.port()));
+        let _ = std::fs::remove_file(&out);
+        let prog = Arc::new(Progress::new());
+
+        let e = download_with(
+            &[format!("http://{addr}/missing.zip")],
+            &out,
+            4,
+            1,
+            prog,
+            &[],
+        )
+        .await
+        .expect_err("a 404 must be an error, not a 22-byte download");
+
+        assert!(
+            e.to_string().contains("404"),
+            "the error must name the status, said: {e}"
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "one request settles it; more than one is the retry storm"
+        );
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(sidecar_path(&out));
     }

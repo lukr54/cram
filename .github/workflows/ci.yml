@@ -170,12 +170,51 @@ jobs:
           fi
           exit $fail
 
+  licences:
+    name: licence appendix is current
+    runs-on: ubuntu-latest
+    # cargo-about resolves the dependency graph and never compiles it, and about.toml pins that graph
+    # to x86_64-pc-windows-gnu on its own, so this can run anywhere. Override the workflow-level target
+    # so `cargo install` builds cargo-about for this host.
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--features cli` is not optional: cargo-about's binary carries `required-features = ["cli"]`
+      # and the feature is not on by default, so without it `cargo install` warns and installs
+      # nothing, exits 0, and the failure only surfaces one step later as "no such subcommand".
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --version 0.9.1 --features cli
+
+      # THIRD-PARTY-NOTICES.md §5 tells redistributors that the appendix carries the full licence text
+      # for every crate linked in, and that this is what discharges the MIT/BSD reproduction
+      # requirement. An appendix that has drifted from Cargo.lock is therefore a compliance failure,
+      # not a documentation nit -- it shipped once already, missing eleven crates. `--workspace` is
+      # what makes one run cover all three artifacts in the zip: cram.exe, cram-extract.exe and
+      # cram_shell.dll. The `tr -d '\r'` is not cosmetic: a few crates' own LICENSE files carry CRLF,
+      # which .gitattributes normalises to LF on the way into the repo but cargo-about reproduces
+      # verbatim, so an unnormalised comparison fails on every run.
+      - name: Regenerate the licence appendix and check the committed copy against it
+        run: |
+          cargo about generate -c about.toml about.hbs -o /tmp/regenerated.md \
+            --workspace --features "download zstd-c phash"
+          tr -d '\r' < /tmp/regenerated.md > /tmp/regenerated.lf.md
+          if ! diff -u THIRD-PARTY-LICENSES.md /tmp/regenerated.lf.md; then
+            echo "::error::THIRD-PARTY-LICENSES.md no longer matches the dependency graph. Regenerate it with the command in THIRD-PARTY-NOTICES.md and commit the result."
+            exit 1
+          fi
+
   # Runs only on a pushed `v*` tag, after test + secret-scan pass. Packages the shipped binaries with
   # the licence files and BOTH notice documents, so THIRD-PARTY-NOTICES.md's "installed alongside the
   # binaries" claim is actually true for a release download.
   release:
     name: package + publish release (windows)
-    needs: [test, test-linux, test-macos, secrets]
+    # `licences` is in here for the same reason the tests are: without it the drift gate fails the
+    # push and the tag still publishes the stale appendix, which is the case it exists to stop.
+    needs: [test, test-linux, test-macos, secrets, licences]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     permissions:
@@ -220,13 +259,17 @@ jobs:
           # needs its checksum published the same way the Linux and macOS ones do.
           sha256sum "$dist.zip" > SHA256SUMS.windows
 
-      - name: Publish the GitHub release
+      # Created as a DRAFT. `/releases/latest` — what `cram update` asks for and what the Releases
+      # page shows — skips drafts, so nobody is offered a release whose Linux and macOS artifacts are
+      # still being built. `release-publish` flips it once all three have uploaded.
+      - name: Create the GitHub release as a draft
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "Cram $GITHUB_REF_NAME" \
+            --draft \
             --generate-notes \
             cram-*-x86_64-pc-windows-gnu.zip SHA256SUMS.windows
 
@@ -236,7 +279,7 @@ jobs:
   # upload into, and writes the SHA256SUMS that install.sh verifies against.
   release-linux:
     name: package + publish release (linux)
-    needs: [release]
+    needs: [release, licences]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
@@ -280,7 +323,7 @@ jobs:
   # mean a paid Apple Developer account and only matters for a distributed .app bundle.
   release-macos:
     name: package + publish release (macos)
-    needs: [release]
+    needs: [release, licences]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     permissions:
@@ -315,3 +358,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" cram-*-aarch64-apple-darwin.tar.gz SHA256SUMS.macos --clobber
+
+  # The last step, and the only one that makes the release visible. A failure in either platform job
+  # leaves the release a draft with whatever did upload attached: nothing is offered to anyone, and
+  # re-running the tag's workflow replaces the assets rather than racing a published download.
+  release-publish:
+    name: publish the release (all platforms uploaded)
+    needs: [release, release-linux, release-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Take the release out of draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

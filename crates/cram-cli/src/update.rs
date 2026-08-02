@@ -83,7 +83,15 @@ fn target() -> Option<Target> {
 fn payload_files() -> &'static [&'static str] {
     if cfg!(windows) {
         // libwinpthread-1.dll must travel with the binaries (THIRD-PARTY-NOTICES.md section 3).
-        &["cram.exe", "cram-extract.exe", "libwinpthread-1.dll"]
+        // cram_shell.dll is the Explorer context menu, registered by absolute path from beside
+        // cram.exe, so leaving it out is what would pin an installed handler at the version the user
+        // first installed no matter how many times they update.
+        &[
+            "cram.exe",
+            "cram-extract.exe",
+            "cram_shell.dll",
+            "libwinpthread-1.dll",
+        ]
     } else {
         &["cram", "cram-extract"]
     }
@@ -277,9 +285,12 @@ fn aside_suffix(version: &str) -> String {
     format!(".old-{version}")
 }
 
-/// Delete the displaced binaries left by an earlier update. They cannot be removed at the moment
-/// they are made, the old image is still running, so the next update is the first opportunity.
+/// Delete the displaced files left by an earlier update. They cannot be removed at the moment they
+/// are made, the old image is still running, so the next update is the first opportunity.
 /// Best effort: a file still locked by another `cram` is left for the run after this one.
+///
+/// The match is against `payload_files()` rather than a `cram` prefix, because the runtime DLL that
+/// ships beside the binaries does not carry that prefix and was accumulating one orphan per update.
 fn sweep_old(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -287,7 +298,10 @@ fn sweep_old(dir: &Path) {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.contains(".old-") && name.starts_with("cram") {
+        let Some((stem, version)) = name.split_once(".old-") else {
+            continue;
+        };
+        if !version.is_empty() && payload_files().contains(&stem) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -339,7 +353,7 @@ fn install_file(src: &Path, dst: &Path, version: &str) -> Result<()> {
     if let Err(e) = std::fs::rename(dst, &aside) {
         let _ = std::fs::remove_file(&staged);
         return Err(err(format!(
-            "could not move {} aside: {e}. Nothing was changed",
+            "could not move {} aside: {e}. That file was left as it was",
             dst.display()
         )));
     }
@@ -348,11 +362,30 @@ fn install_file(src: &Path, dst: &Path, version: &str) -> Result<()> {
         let _ = std::fs::rename(&aside, dst);
         let _ = std::fs::remove_file(&staged);
         return Err(err(format!(
-            "could not put the new {} in place: {e}. The previous version was restored",
+            "could not put the new {} in place: {e}. That file was put back as it was",
             dst.display()
         )));
     }
     Ok(())
+}
+
+/// Widen a per-file install failure to the truth about the whole install.
+///
+/// `install_file`'s own messages are scoped to the one file it was handed, which reads as "nothing
+/// happened", and that is false the moment a sibling has already been swapped. There is no rollback
+/// to offer (the replaced files are the new version and are good), so the honest report is which
+/// files moved and what to run next.
+fn partial_install(e: ArchiveError, installed: &[&str], version: &str) -> ArchiveError {
+    if installed.is_empty() {
+        return e;
+    }
+    err(format!(
+        "{e}.\n  {} already {} replaced with {version}, so this install is now a mix of versions. \
+         Re-run `cram update --force`, or download the release from {}",
+        installed.join(", "),
+        if installed.len() == 1 { "was" } else { "were" },
+        releases_page()
+    ))
 }
 
 // ---- the command -----------------------------------------------------------------------------------
@@ -447,14 +480,12 @@ pub fn update_cmd(args: &[String]) -> Result<()> {
         Ok(true) => println!("ok"),
         Ok(false) => {
             println!("MISMATCH");
-            let _ = std::fs::remove_dir_all(&work);
             return Err(err(
                 "the downloaded release does not match its published SHA-256. Nothing was installed",
             ));
         }
         Err(e) => {
             println!("UNVERIFIED");
-            let _ = std::fs::remove_dir_all(&work);
             return Err(err(format!(
                 "could not verify the download ({e}). Nothing was installed"
             )));
@@ -484,7 +515,6 @@ pub fn update_cmd(args: &[String]) -> Result<()> {
         }
     };
     if !payload.join(main_binary()).is_file() {
-        let _ = std::fs::remove_dir_all(&work);
         return Err(err(format!(
             "the release archive does not contain {}; nothing was installed",
             main_binary()
@@ -497,15 +527,16 @@ pub fn update_cmd(args: &[String]) -> Result<()> {
     for name in payload_files().iter().filter(|n| **n != main_binary()) {
         let src = payload.join(name);
         if src.is_file() {
-            install_file(&src, &dir.join(name), &rel.version)?;
+            install_file(&src, &dir.join(name), &rel.version)
+                .map_err(|e| partial_install(e, &installed, &rel.version))?;
             installed.push(*name);
         }
     }
     println!("  replacing {}", exe.display());
-    install_file(&payload.join(main_binary()), &exe, &rel.version)?;
+    install_file(&payload.join(main_binary()), &exe, &rel.version)
+        .map_err(|e| partial_install(e, &installed, &rel.version))?;
     installed.push(main_binary());
 
-    let _ = std::fs::remove_dir_all(&work);
     println!("Updated to {} ({}).", rel.version, installed.join(", "));
     if cfg!(windows) {
         println!(
@@ -518,12 +549,31 @@ pub fn update_cmd(args: &[String]) -> Result<()> {
 
 /// A scratch directory beside the install, so the staged rename at the end is within one
 /// filesystem (a rename across devices fails, and `%TEMP%` is very often another device).
-fn tempdir(near: &Path) -> Result<PathBuf> {
+///
+/// It removes itself however the command ends. The name carries this process's pid, so a directory
+/// left behind by a failed run is invisible to every later run and would sit in the install folder
+/// with a partial release archive in it until someone noticed.
+struct WorkDir(PathBuf);
+
+impl std::ops::Deref for WorkDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir(near: &Path) -> Result<WorkDir> {
     let d = near.join(format!(".cram-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d)
         .map_err(|e| err(format!("could not create {}: {e}", d.display())))?;
-    Ok(d)
+    Ok(WorkDir(d))
 }
 
 /// Fetch one URL to `out` through the same segmented engine `cram dl` uses, with a progress
@@ -558,7 +608,14 @@ fn download(url: &str, out: &Path) -> Result<()> {
     let ok = source.wait();
     println!("\r  {}", render_bar(prog.total(), prog.total()));
     if !ok {
-        return Err(err("the download did not complete; re-run to resume"));
+        // No resume to offer: the partial file and its sidecar live in the scratch directory, which
+        // is removed on the way out, and a later run would not find them anyway (the name carries
+        // this process's pid). A re-run starts over.
+        return Err(err(format!(
+            "the download did not complete. Nothing was installed; re-run `cram update` to start \
+             it again, or download the release from {}",
+            releases_page()
+        )));
     }
     Ok(())
 }
@@ -696,6 +753,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A failure anywhere between the download and the last rename used to leave the scratch
+    /// directory, with a partial release archive in it, sitting in the install folder. No later run
+    /// could find it either, because its name carries the pid of the run that made it.
+    #[test]
+    fn the_scratch_directory_is_removed_when_the_update_fails() {
+        let dir = std::env::temp_dir().join(format!("cram-work-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = dir.join(format!(".cram-update-{}", std::process::id()));
+
+        let attempt = || -> Result<()> {
+            let work = tempdir(&dir)?;
+            std::fs::write(work.join("half-a-release.zip"), b"partial").unwrap();
+            assert!(
+                scratch.is_dir(),
+                "the scratch directory must exist while in use"
+            );
+            Err(err("the download did not complete"))
+        };
+        assert!(attempt().is_err());
+        assert!(
+            !scratch.exists(),
+            "the scratch directory outlived the failed update"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Not a test: the body a spawned copy of this binary runs so that it is genuinely *running*
     /// while [`a_running_binary_can_still_be_replaced`] replaces it. Ignored, so a normal run skips
     /// it; the child is invoked with `--ignored --exact`.
@@ -790,26 +875,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Driven from `payload_files()` rather than from a hand-written list, because the file the
+    /// sweep used to miss (the runtime DLL, which does not begin with `cram`) was exactly the one a
+    /// hand-written list did not think to include.
     #[test]
-    fn a_sweep_removes_displaced_binaries_and_nothing_else() {
+    fn a_sweep_removes_every_displaced_payload_file_and_nothing_else() {
         let dir = std::env::temp_dir().join(format!("cram-sweep-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for n in [
-            "cram.exe.old-1.0.0",
-            "cram-extract.exe.old-1.0.0",
-            "cram.exe",
-            "notes.old-1.0.0",
-        ] {
+        for n in payload_files() {
             std::fs::write(dir.join(n), b"x").unwrap();
+            std::fs::write(dir.join(format!("{n}.old-1.0.0")), b"x").unwrap();
         }
+        std::fs::write(dir.join("notes.old-1.0.0"), b"x").unwrap();
+
         sweep_old(&dir);
-        assert!(!dir.join("cram.exe.old-1.0.0").exists());
-        assert!(!dir.join("cram-extract.exe.old-1.0.0").exists());
-        assert!(
-            dir.join("cram.exe").exists(),
-            "the live binary must survive"
-        );
+
+        for n in payload_files() {
+            assert!(
+                !dir.join(format!("{n}.old-1.0.0")).exists(),
+                "{n}.old-1.0.0 was left behind"
+            );
+            assert!(dir.join(n).exists(), "the live {n} must survive");
+        }
         assert!(
             dir.join("notes.old-1.0.0").exists(),
             "an unrelated file must survive"
