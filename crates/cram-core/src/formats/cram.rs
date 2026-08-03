@@ -37,6 +37,7 @@ use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use aes_gcm::aead::{Aead, Payload};
@@ -487,16 +488,54 @@ pub struct CramArchiveWriter {
     /// [`VERSION_XFORM`] at `finish`, so archives that used no transform stay v1-readable.
     used_transform: bool,
     /// `Some` when the archive is encrypted: packs and the index are AES-256-GCM sealed.
-    crypter: Option<Crypter>,
+    /// Behind an `Arc` so a batch handed to the background compressor can hold it without
+    /// borrowing the writer, which stays on the chunking thread.
+    crypter: Option<Arc<Crypter>>,
     /// Id the currently-filling `pack_buf` will get (chunks reference this before the pack is written).
     next_pack_id: u32,
     /// Filled raw packs `(id, bytes)` awaiting a parallel-compression batch flush.
     pending: Vec<(u32, Vec<u8>)>,
+    /// The previous batch, compressing on a background thread while this one fills. Joined at the
+    /// next batch boundary and at `finish`, so its packs are always written before the batch after
+    /// it is even started -- `packs` therefore still grows strictly in id order.
+    inflight: Option<JoinHandle<Result<CompressedBatch>>>,
     /// How many packs to compress in parallel per batch (bounds peak memory).
     batch: usize,
     /// Use zstd for packs (a `zstd-c` build) instead of XZ. Reader decodes either via ruzstd/lzma.
     use_zstd: bool,
     start: Instant,
+    /// Phase accounting, printed at `finish` only when `CRAM_PROFILE` is set in the environment.
+    /// The create path alternates between a serial chunk phase and a parallel compress phase, and
+    /// the split between them is the thing worth knowing: a barrier shows up as a large
+    /// `flush` share with idle cores either side of it. Cost is a handful of `Instant` reads per
+    /// chunk, which is vDSO on Linux and QPC on Windows, tens of nanoseconds against chunks that
+    /// average tens of kilobytes.
+    prof: Prof,
+}
+
+/// Serial-vs-parallel accounting for one create. Nanoseconds, so a whole run cannot overflow.
+/// One compressed pack as the compressor hands it back: `(payload, raw_len, codec)`.
+type CompressedPack = (Vec<u8>, u32, u8);
+/// A whole batch of them, still in pack-id order.
+type CompressedBatch = Vec<CompressedPack>;
+
+#[derive(Default)]
+struct Prof {
+    /// Inside `chunk_stream`, excluding any nested `flush_batch`.
+    chunk_nanos: u128,
+    /// Pulling bytes from the source and running FastCDC over them.
+    read_cdc_nanos: u128,
+    /// BLAKE3 over chunk bodies.
+    hash_nanos: u128,
+    /// Wall time inside `flush_batch`: draining the previous batch plus handing off this one.
+    flush_nanos: u128,
+    /// The part of `flush_nanos` spent blocked on the background compressor. This is the number
+    /// that matters after overlapping -- it is the chunker standing still, and it should fall to
+    /// near zero whenever compression finishes before the next batch fills.
+    drain_nanos: u128,
+    flushes: u64,
+    chunks: u64,
+    dedup_hits: u64,
 }
 
 /// Compress (and, when encrypting, seal) one pack's raw bytes into its on-disk payload. Pure and
@@ -588,7 +627,7 @@ impl CramArchiveWriter {
                 out.write_all(&ARGON_M_COST.to_le_bytes())?;
                 out.write_all(&ARGON_T_COST.to_le_bytes())?;
                 out.write_all(&ARGON_P_COST.to_le_bytes())?;
-                (Some(crypter), HEADER_LEN + CRYPTO_BLOCK_LEN)
+                (Some(Arc::new(crypter)), HEADER_LEN + CRYPTO_BLOCK_LEN)
             }
         };
 
@@ -608,6 +647,7 @@ impl CramArchiveWriter {
             crypter,
             next_pack_id: 0,
             pending: Vec::new(),
+            inflight: None,
             // Compress up to this many packs in parallel; clamped so peak memory stays bounded
             // (~batch × PACK_TARGET of raw bytes buffered before a flush).
             batch: rayon::current_num_threads().clamp(1, 16),
@@ -615,22 +655,39 @@ impl CramArchiveWriter {
             // falling back to XZ's stronger ratio. A pure-Rust build always uses XZ (flag stays false).
             use_zstd: cfg!(feature = "zstd-c") && !matches!(opts.level, Level::Best),
             start: Instant::now(),
+            prof: Prof::default(),
         })
     }
 
     /// Chunk everything `src` yields into the dedup table and the current pack, returning the chunk
     /// ids. Shared by the plain path and the recompressed path so both dedup identically, two
     /// copies of one photo still collapse to a single stored copy.
-    fn chunk_stream(&mut self, src: &mut dyn Read) -> Result<Vec<u32>> {
+    fn chunk_stream(&mut self, src: &mut dyn Read) -> Result<(Vec<u32>, u64)> {
         let mut chunk_ids = Vec::new();
-        let chunker = StreamCDC::new(src, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX);
-        for chunk in chunker {
+        let mut size = 0u64;
+        let mut chunker = StreamCDC::new(src, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX);
+        // Timed as an explicit loop rather than `for chunk in chunker` so the iterator's own work
+        // -- reading from `src` and running the content-defined boundary search -- is separable from
+        // hashing and from the flush barrier. Those three are the candidates for the serial ceiling
+        // and guessing between them is what this exists to avoid.
+        let stream_t0 = Instant::now();
+        let flush_at_entry = self.prof.flush_nanos;
+        loop {
+            let cdc_t0 = Instant::now();
+            let next = chunker.next();
+            self.prof.read_cdc_nanos += cdc_t0.elapsed().as_nanos();
+            let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| ArchiveError::Backend(format!("chunker: {e}")))?;
             let data = chunk.data;
+            size += data.len() as u64;
             self.in_bytes += data.len() as u64;
+            self.prof.chunks += 1;
+            let hash_t0 = Instant::now();
             let key = *blake3::hash(&data).as_bytes();
+            self.prof.hash_nanos += hash_t0.elapsed().as_nanos();
             if let Some(&id) = self.seen.get(&key) {
                 self.dedup_saved += data.len() as u64;
+                self.prof.dedup_hits += 1;
                 chunk_ids.push(id);
                 continue;
             }
@@ -651,7 +708,14 @@ impl CramArchiveWriter {
                 }
             }
         }
-        Ok(chunk_ids)
+        // Serial time for this stream: everything above minus whatever the flush barrier consumed
+        // while nested inside it. Subtracting is what makes `chunk_nanos` and `flush_nanos` add up
+        // to the wall clock instead of double-counting the barrier.
+        self.prof.chunk_nanos += stream_t0
+            .elapsed()
+            .as_nanos()
+            .saturating_sub(self.prof.flush_nanos.saturating_sub(flush_at_entry));
+        Ok((chunk_ids, size))
     }
 
     fn write_out(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -670,23 +734,56 @@ impl CramArchiveWriter {
         self.next_pack_id += 1;
     }
 
-    /// Compress the pending batch **in parallel**, then write the results in id order (assigning
-    /// each pack's file offset as it's written). Packs are byte-identical to the serial path, only
-    /// the compression is parallelized, so the archive layout is unchanged.
+    /// Hand the pending batch to a background compressor and return, so chunking continues while it
+    /// runs. The previous batch is drained first, which is what keeps `packs` in id order.
+    ///
+    /// This used to compress synchronously, and that made it a barrier: the chunker stopped dead for
+    /// the whole batch. Measured on a 16-thread machine over the kernel tree, 44.7% of create was
+    /// spent inside this function with one thread doing nothing, against 25.5% chunking with fifteen
+    /// threads doing nothing. Neither phase overlapped the other and the total was their sum.
+    ///
+    /// Peak raw memory doubles as a result -- one batch in flight while the next fills, so
+    /// `2 x batch x PACK_TARGET` rather than one. That is the price of the overlap and it is bounded.
+    ///
+    /// The archive is unchanged byte for byte. Ids are assigned in `queue_pack`, each batch is
+    /// contiguous in id space, batch N is written before batch N+1 is spawned, and
+    /// `into_par_iter().collect()` preserves order within a batch.
     fn flush_batch(&mut self) -> Result<()> {
+        let flush_t0 = Instant::now();
+        self.drain_inflight()?;
         if self.pending.is_empty() {
+            self.prof.flush_nanos += flush_t0.elapsed().as_nanos();
             return Ok(());
         }
         let pending = std::mem::take(&mut self.pending);
         let level = self.level;
         let use_zstd = self.use_zstd;
-        let crypter = self.crypter.as_ref();
-        let results: Vec<(Vec<u8>, u32, u8)> = pending
-            .into_par_iter()
-            .map(|(id, raw)| compress_pack(raw, id, level, use_zstd, crypter))
-            .collect::<Result<Vec<_>>>()?;
-        // `pending` was id-ordered and `into_par_iter().collect()` preserves order, so `packs`
-        // grows in id order → `packs[id]` is pack `id`.
+        let crypter = self.crypter.clone();
+        self.inflight = Some(std::thread::spawn(move || {
+            pending
+                .into_par_iter()
+                .map(|(id, raw)| compress_pack(raw, id, level, use_zstd, crypter.as_deref()))
+                .collect::<Result<Vec<_>>>()
+        }));
+        self.prof.flush_nanos += flush_t0.elapsed().as_nanos();
+        self.prof.flushes += 1;
+        Ok(())
+    }
+
+    /// Join the background compressor, if one is running, and write its packs in id order.
+    ///
+    /// Time spent here is the chunker blocked: the batch that was handed off has not finished. On a
+    /// machine where compression keeps up it is near zero, and it rises as the codec gets slower
+    /// relative to the chunker, which is exactly the signal worth watching.
+    fn drain_inflight(&mut self) -> Result<()> {
+        let Some(handle) = self.inflight.take() else {
+            return Ok(());
+        };
+        let drain_t0 = Instant::now();
+        let results = handle
+            .join()
+            .map_err(|_| ArchiveError::Backend("pack compression thread panicked".into()))??;
+        self.prof.drain_nanos += drain_t0.elapsed().as_nanos();
         for (payload, raw_len, codec) in results {
             let loc = PackLoc {
                 file_offset: self.pos,
@@ -698,6 +795,55 @@ impl CramArchiveWriter {
             self.packs.push(loc);
         }
         Ok(())
+    }
+
+    /// Print the serial/parallel split to stderr when `CRAM_PROFILE` is set. Diagnostic only: no
+    /// caller parses this and nothing about the archive depends on it.
+    fn report_profile(&self) {
+        if std::env::var_os("CRAM_PROFILE").is_none() {
+            return;
+        }
+        let p = &self.prof;
+        let wall = self.start.elapsed().as_nanos().max(1);
+        let ms = |n: u128| n as f64 / 1e6;
+        let pct = |n: u128| (n as f64 / wall as f64) * 100.0;
+        eprintln!("--- cram create profile ---");
+        eprintln!("wall            {:9.1} ms", ms(wall));
+        eprintln!(
+            "chunk (serial)  {:9.1} ms  {:5.1}%   read+cdc {:.1} ms, hash {:.1} ms, other {:.1} ms",
+            ms(p.chunk_nanos),
+            pct(p.chunk_nanos),
+            ms(p.read_cdc_nanos),
+            ms(p.hash_nanos),
+            ms(p.chunk_nanos
+                .saturating_sub(p.read_cdc_nanos)
+                .saturating_sub(p.hash_nanos)),
+        );
+        eprintln!(
+            "flush           {:9.1} ms  {:5.1}%   {} flushes, batch {}, of which BLOCKED {:.1} ms ({:.1}%)",
+            ms(p.flush_nanos),
+            pct(p.flush_nanos),
+            p.flushes,
+            self.batch,
+            ms(p.drain_nanos),
+            pct(p.drain_nanos),
+        );
+        eprintln!(
+            "unaccounted     {:9.1} ms  {:5.1}%",
+            ms(wall
+                .saturating_sub(p.chunk_nanos)
+                .saturating_sub(p.flush_nanos)),
+            pct(wall
+                .saturating_sub(p.chunk_nanos)
+                .saturating_sub(p.flush_nanos)),
+        );
+        eprintln!(
+            "chunks {}  dedup hits {}  packs {}  rayon threads {}",
+            p.chunks,
+            p.dedup_hits,
+            self.packs.len(),
+            rayon::current_num_threads(),
+        );
     }
 }
 
@@ -721,7 +867,7 @@ impl ArchiveWriter for CramArchiveWriter {
             if head.len() as u64 <= MAX_XFORM_INPUT {
                 if let Some(encoded) = jpeg_recompress(&head) {
                     let original_len = head.len() as u64;
-                    let chunk_ids = self.chunk_stream(&mut Cursor::new(&encoded))?;
+                    let (chunk_ids, _) = self.chunk_stream(&mut Cursor::new(&encoded))?;
                     // Account the logical bytes, not the stored ones, so the report's ratio reflects
                     // what the user actually put in.
                     self.in_bytes += original_len.saturating_sub(encoded.len() as u64);
@@ -739,11 +885,10 @@ impl ArchiveWriter for CramArchiveWriter {
             }
             // Not transformable: chunk what was already read, then the rest of the body.
             let mut rest = Cursor::new(head).chain(body);
-            let chunk_ids = self.chunk_stream(&mut rest)?;
-            let size = chunk_ids
-                .iter()
-                .map(|&id| self.chunks[id as usize].length as u64)
-                .sum();
+            // `chunk_stream` accumulates the bytes it actually consumed. Summing the ids' recorded
+            // lengths gave the same answer, since a deduplicated id still contributes its length
+            // once per appearance, but it walked the chunk table for a figure already in hand.
+            let (chunk_ids, size) = self.chunk_stream(&mut rest)?;
             self.entries.push(EntryMeta {
                 name,
                 is_dir: false,
@@ -757,37 +902,12 @@ impl ArchiveWriter for CramArchiveWriter {
 
         // Chunk the *live* body; the stored size is the actual bytes chunked (not the plan-time
         // `entry.size`), so a source file that changed since planning can never desync the archive.
-        let mut chunk_ids = Vec::new();
-        let mut size = 0u64;
-        let chunker = StreamCDC::new(body, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX);
-        for chunk in chunker {
-            let chunk = chunk.map_err(|e| ArchiveError::Backend(format!("chunker: {e}")))?;
-            let data = chunk.data;
-            size += data.len() as u64;
-            self.in_bytes += data.len() as u64;
-            let key = *blake3::hash(&data).as_bytes();
-            if let Some(&id) = self.seen.get(&key) {
-                self.dedup_saved += data.len() as u64;
-                chunk_ids.push(id);
-                continue;
-            }
-            let id = self.chunks.len() as u32;
-            let loc = ChunkLoc {
-                pack_id: self.next_pack_id, // the pack this buffer will become
-                offset: self.pack_buf.len() as u32,
-                length: data.len() as u32,
-            };
-            self.pack_buf.extend_from_slice(&data);
-            self.chunks.push(loc);
-            self.seen.insert(key, id);
-            chunk_ids.push(id);
-            if self.pack_buf.len() >= PACK_TARGET {
-                self.queue_pack();
-                if self.pending.len() >= self.batch {
-                    self.flush_batch()?;
-                }
-            }
-        }
+        //
+        // This used to be a second copy of `chunk_stream`'s loop, byte-for-byte identical apart from
+        // accumulating `size`, while `chunk_stream`'s own doc comment claimed both paths shared it.
+        // They did not, so a change to one would silently not reach the other -- and this is the copy
+        // every ordinary file takes.
+        let (chunk_ids, size) = self.chunk_stream(body)?;
         self.entries.push(EntryMeta {
             name: cram_name(entry),
             is_dir: false,
@@ -812,9 +932,11 @@ impl ArchiveWriter for CramArchiveWriter {
     }
 
     fn finish(mut self: Box<Self>) -> Result<CreateReport> {
-        // Queue the final partial pack, then compress every remaining pack in parallel.
+        // Queue the final partial pack, hand it off, then wait for it: the index records every
+        // pack's file offset, so nothing can be serialized until the last one has been written.
         self.queue_pack();
         self.flush_batch()?;
+        self.drain_inflight()?;
         let index_offset = self.pos;
         // Only an archive that actually used a transform is written as v2; everything else stays v1
         // and remains readable by older builds.
@@ -850,6 +972,8 @@ impl ArchiveWriter for CramArchiveWriter {
             f.write_all(&[VERSION_XFORM])?;
             f.flush()?;
         }
+
+        self.report_profile();
 
         // `pos` counted every byte written (header + packs + index + trailer) = the final size.
         Ok(CreateReport {
