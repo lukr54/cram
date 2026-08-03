@@ -104,4 +104,18 @@ pub trait RandomAccessReader: Send + Sync {
     fn locality_key(&self, _index: usize) -> Option<u64> {
         None
     }
+
+    /// How many units of work can be decoded independently, when the backend knows a number the
+    /// entry list cannot express. `.cram` returns its pack count; a format whose members decode on
+    /// their own returns `None` and the planner counts entries instead.
+    ///
+    /// This is what `hw::derive_plan` fans out over, so a wrong answer here is a wrong thread count
+    /// everywhere. `codec::plan::block_count` used to answer `1` for every container it had no rule
+    /// for, `.cram` included, which made the CPU-bound plan `min(1, cores)` and put a 24-thread
+    /// machine on one worker. Extraction hid it by landing in the write-bound branch instead, and
+    /// `cram t`, which writes nothing and so is always CPU-bound, did not: it verified a 1.6 GB
+    /// archive at 96% of one core while 7-Zip used three and a half.
+    fn decode_units(&self) -> Option<usize> {
+        None
+    }
 }

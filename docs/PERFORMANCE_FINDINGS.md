@@ -332,6 +332,53 @@ which is what `hw.rs` exists for.
 
 ---
 
+## 12. `cram t` verified on one thread, because `.cram` reported one decode unit
+
+`cram t` on the 1.6 GB kernel archive took 18.10 s at **96% CPU** on a 24-thread machine, while
+7-Zip verified a comparable archive in 1.55 s at 354%. The verify loop was not the problem. The
+number it planned against was.
+
+`codec::plan::block_count` had no rule for `Container::Cram` and fell through to `1`. That count is
+what `hw::derive_plan` fans out over, and its CPU-bound branch is
+
+```rust
+blocks.max(1).min(hw.logical).max(hw.physical.min(blocks.max(1)))
+```
+
+which for `blocks = 1` is one worker, on any hardware, forever.
+
+**Extraction hid it.** An extract plan is write-bound, takes a different branch, and clamps to
+`((physical * 3) / 4).clamp(4, 8)` — those are the eight workers seen during the extraction work.
+Verify writes nothing, so it is the only verb that ever asked for the CPU-bound answer, and so the
+only one that got the truthful `1`.
+
+The fix is to let the backend report what it already knows: `RandomAccessReader::decode_units()`,
+which `.cram` answers with its pack count. Verify then fans out over the same locality-ordered
+groups extraction uses, since entries sharing a pack still have to be visited together.
+
+Measured on the 24-thread box against the archives from the same sweep:
+
+| | before | after | |
+|---|---|---|---|
+| `cram t --best`, linux | 18.10 s @ 96% | **7.24 s @ 1112%** | 2.50x |
+| `cram t` auto, linux | 3.07 s @ 99% | **1.88 s @ 1594%** | 1.63x |
+| `cram t --best`, silesia | 3.05 s | **0.99 s @ 477%** | 3.08x |
+| `cram x` auto, linux | 2.26 s | 2.00 s | within noise |
+| `cram x` auto, durable | 7.17 s | 6.92 s | within noise |
+
+Extraction is unchanged because its plan already reached the write-bound branch. Making `blocks`
+truthful removed a coin flip rather than changing a number: with `blocks = 1` the classifier compared
+a projected `1 x decode_rate` against the measured write wall, so on a drive faster than one core's
+decode rate it would have returned CPU-bound and planned **one extraction worker too**. Which branch
+an extract took depended on how fast the destination drive measured.
+
+**Still open.** `--best` verify remains 5.9x slower than 7-Zip `-mx=5` on this corpus (7.24 s against
+1.23 s) and reaches only ~1112% CPU where auto reaches ~1594%. XZ decode is intrinsically slower than
+LZMA2, but 223 MiB/s spread across eleven effective cores is ~20 MiB/s per core, well under one
+core's XZ decode rate, so the codec does not explain it on its own. The shared `Mutex<PackCache>` is
+the suspect: 24 workers each holding a decoded 8 MiB pack is 192 MiB against a 256 MiB cap, giving
+both lock contention and eviction pressure. Not measured yet.
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for
@@ -350,8 +397,9 @@ which is what `hw.rs` exists for.
   **1.31x for the pair**, 1.17x from the overlap and a further 1.11x from opening each file once.
   Peak memory rises ~190 MB, which is the double buffering and is bounded.
 
-  Note the corpus at `/scratch/bench/corpora/linux` is not the one `BENCHMARKS.md` publishes — it is
-  2.1 GB against 1.6 GB and compresses to 472 MiB against 199 MiB, so these figures are valid as an
+  Note these runs archived `/scratch/bench/corpora/linux` **including its `.git`**, which the
+  published methodology prunes: 2.1 GB against 1.6 GB, compressing to 472 MiB against 199 MiB
+  because a packfile is already compressed. It is the same checkout, so the figures are valid as an
   A/B on one machine and are **not** comparable to the published table.
 - **A duplicated chunk loop.** `add_file` carried its own copy of `chunk_stream`, identical apart
   from accumulating `size`, while `chunk_stream`'s doc comment claimed both paths shared it. The copy

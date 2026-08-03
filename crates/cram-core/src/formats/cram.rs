@@ -1520,6 +1520,14 @@ impl RandomAccessReader for CramReader {
         Some(chunk.pack_id as u64)
     }
 
+    /// One pack is one independently decodable unit, so the pack count is exactly how wide the
+    /// engine can fan out. The entry count is the wrong number here and so is `1`: a 94,753-entry
+    /// archive holds around 200 packs, and nothing is gained by asking for more workers than there
+    /// are packs to decode.
+    fn decode_units(&self) -> Option<usize> {
+        Some(self.packs.len())
+    }
+
     fn read_range(&self, index: usize, off: u64, len: u64) -> Result<Vec<u8>> {
         let ids = self
             .entry_chunks

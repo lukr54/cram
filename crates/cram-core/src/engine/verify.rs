@@ -3,12 +3,20 @@
 //! Nothing is written to disk, bodies stream through a hashing sink, so even a decompression-bombed
 //! entry is bounded (counted and discarded, never buffered whole).
 //!
-//! Dispatch mirrors [`extract`](super::extract): **random-access** formats (ZIP, `.cram`) stream each
-//! entry via `RandomAccessReader::copy_entry`; everything else uses the sequential
-//! `ArchiveReader::next_entry` stream. Using `copy_entry` for `.cram` matters, `next_entry`
-//! materializes a whole entry body in
-//! memory and refuses one past its in-RAM cap, so a large (multi-GiB) but perfectly healthy `.cram`
-//! entry would otherwise be reported as a failure even though `cram x` extracts it fine.
+//! Dispatch mirrors [`extract`](super::extract): **random-access** formats (ZIP, `.cram`) fan out
+//! across a rayon pool, each task streaming one entry through
+//! [`RandomAccessReader::copy_entry`](crate::reader::RandomAccessReader::copy_entry) on its own file
+//! handle; everything else uses the sequential `ArchiveReader::next_entry` stream. Using
+//! `copy_entry` for `.cram` matters, `next_entry` materializes a whole entry body in memory and
+//! refuses one past its in-RAM cap, so a large (multi-GiB) but perfectly healthy `.cram` entry would
+//! otherwise be reported as a failure even though `cram x` extracts it fine.
+//!
+//! **Verify is CPU-bound on every machine**, which is what separates its plan from an extraction's.
+//! It decodes every byte and writes none, so the write wall that shapes an extract plan does not
+//! apply and the only ceiling is how many units decode independently. Getting that count wrong is
+//! not academic: `.cram` reported a single decode unit until its backend learned to answer with its
+//! pack count, and this pass ran a 1.6 GB archive at 96% of one core (18.1 s) on a 24-thread
+//! machine while 7-Zip did the equivalent at 354% (1.55 s).
 //!
 //! What each format's "verified" means:
 //! - **ZIP / 7z**: a stored CRC-32 is recomputed over the decoded bytes and compared, real content
@@ -25,13 +33,21 @@
 //! This is the backup-verification workflow ("is my archive still good?") every archiver offers.
 
 use std::io::{self, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::error::Result;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+
+use crate::codec::plan::{block_count, plan_codec};
+use crate::engine::parallel::{order_groups, panic_message};
+use crate::error::{ArchiveError, Result};
+use crate::format::Format;
+use crate::hw::{self, HwProfile, Op, Rates, Topology};
 use crate::model::Entry;
 use crate::progress::ProgressSink;
-use crate::reader::EntryStream;
+use crate::reader::{EntryStream, RandomAccessReader};
 use crate::secret::PasswordProvider;
 use crate::{formats, sniff};
 
@@ -74,6 +90,35 @@ impl VerifyReport {
     }
 }
 
+/// Running tally for a pass. Distinct from [`VerifyReport`] only so a failure can carry the entry
+/// index it came from: the parallel path finishes entries in whatever order the pool happens to
+/// drain, and what `cram t` prints must not depend on that. Failures are sorted back into archive
+/// order on the way out, so the same damaged archive reports the same list every run.
+#[derive(Default)]
+struct Acc {
+    checked: u64,
+    crc_verified: u64,
+    bytes: u64,
+    failures: Vec<(usize, String, String)>,
+}
+
+impl Acc {
+    fn into_report(mut self, cancelled: bool) -> VerifyReport {
+        self.failures.sort_by_key(|f| f.0);
+        VerifyReport {
+            checked: self.checked,
+            crc_verified: self.crc_verified,
+            bytes: self.bytes,
+            failures: self
+                .failures
+                .into_iter()
+                .map(|(_, name, why)| (name, why))
+                .collect(),
+            cancelled,
+        }
+    }
+}
+
 /// A `Write` sink that CRC-32s and counts the bytes streamed through it (never buffering), reports
 /// progress, and aborts the copy on cancellation. Mirrors the engine's `ProgressWriter` cancel
 /// discipline: `Other` (not `Interrupted`) so `io::copy` unwinds at once instead of retrying.
@@ -108,25 +153,27 @@ impl Write for CrcSink<'_> {
     }
 }
 
-/// Apply the per-entry verdict to `report`: on a CRC or size mismatch, record a failure; otherwise
+/// Apply the per-entry verdict to `acc`: on a CRC or size mismatch, record a failure; otherwise
 /// count the entry as verified. `checked` is incremented **only** for a passing entry, so
 /// `checked + failures.len()` is the exact number of file entries examined (no double-counting).
 fn record(
-    report: &mut VerifyReport,
+    acc: &mut Acc,
+    index: usize,
     entry: &Entry,
     n: u64,
     crc: u32,
     meta_final: bool,
     sink: &dyn ProgressSink,
 ) {
-    report.bytes += n;
+    acc.bytes += n;
     // Length check runs INDEPENDENTLY of the CRC, never as its `else`. A crafted archive can declare
     // a 10 GiB entry, supply only a few bytes, and store the CRC *of those few bytes*; the checksum
     // then matches and, if that short-circuited the size check, `cram test` would pass a file that
     // decoded to a fraction of its declared length. `meta_final == false` means the backend deferred
     // the real size (raw single-stream sources), where a mismatch is expected.
     if meta_final && n != entry.size {
-        report.failures.push((
+        acc.failures.push((
+            index,
             entry.name().to_string(),
             format!("size mismatch (declared {}, decoded {n})", entry.size),
         ));
@@ -136,16 +183,45 @@ fn record(
     // count, the codec framing can accept a body that decoded to the wrong content.
     if let Some(stored) = entry.crc32 {
         if crc != stored {
-            report.failures.push((
+            acc.failures.push((
+                index,
                 entry.name().to_string(),
                 format!("CRC mismatch (stored {stored:08x}, computed {crc:08x})"),
             ));
             return;
         }
-        report.crc_verified += 1;
+        acc.crc_verified += 1;
     }
-    report.checked += 1;
+    acc.checked += 1;
     sink.on_file_done(entry);
+}
+
+/// How many threads to verify with.
+///
+/// The decision stays in the calibration layer rather than becoming a thread-count rule of its own
+/// here, but the inputs differ from an extraction's in one way that decides the answer: **verify
+/// writes nothing**, so its write wall is infinite. `derive_plan` reads that as unconditionally
+/// CPU-bound and hands back `min(decode units, logical cores)`, which is exactly right, and the
+/// spinning-disk guard still applies (concurrent reads thrash an HDD whether or not anything goes
+/// back). Passing a real measured wall instead would let a fast enough NVMe classify a decode-only
+/// pass as write-bound and clamp it to eight.
+///
+/// Deliberately does **not** go through `rates_and_wall`: that probes the drive by writing half a
+/// gigabyte to it, and `cram t` must not write. Under an infinite wall the measured rates cannot
+/// change the verdict, so default rates give the same plan without touching the disk.
+fn verify_workers(fmt: Format, entries: &[Entry], units: Option<usize>, path: &Path) -> usize {
+    let hw = HwProfile::detect_for(path);
+    hw::derive_plan(
+        Op::Extract,
+        plan_codec(fmt, entries),
+        // The backend's own count where it has one (`.cram` packs); the entry list otherwise.
+        units.unwrap_or_else(|| block_count(fmt, entries)),
+        &hw,
+        Topology::SameDrive,
+        &Rates::default(),
+        f64::INFINITY,
+    )
+    .workers
 }
 
 /// Decode and verify every entry of the archive at `path`. `pw` supplies passwords for encrypted
@@ -159,44 +235,27 @@ pub fn verify(
 ) -> Result<VerifyReport> {
     let fmt = sniff::sniff_path(path)?;
     let mut reader = formats::open(path, fmt, pw)?;
-    let mut report = VerifyReport::default();
 
-    // Random-access (ZIP, `.cram`) → stream each entry via `copy_entry` (its own handle, no whole-body
-    // buffering, so multi-GiB entries verify). Everything else → the sequential `next_entry` stream.
-    if let Some(ra) = reader.as_random_access() {
-        let entries = ra.entries();
-        for (i, entry) in entries.iter().enumerate() {
-            sink.wait_if_paused();
-            if sink.is_cancelled() {
-                report.cancelled = true;
-                break;
-            }
-            if entry.is_dir() {
-                continue;
-            }
-            sink.on_entry_start(entry);
-            let mut cs = CrcSink::new(sink);
-            if let Err(e) = ra.copy_entry(i, &mut cs) {
-                if sink.is_cancelled() {
-                    report.cancelled = true;
-                    break;
-                }
-                report
-                    .failures
-                    .push((entry.name().to_string(), format!("decode failed: {e}")));
-                continue;
-            }
-            let (n, crc) = (cs.n, cs.crc.finalize());
-            // Random-access entries carry authoritative metadata (`meta_final` is implicitly true).
-            record(&mut report, entry, n, crc, true, sink);
-        }
-        return Ok(report);
+    // Random-access (ZIP, `.cram`) → parallel per-entry over its own handles. Everything else →
+    // the sequential `next_entry` stream, which is one front-to-back decode and cannot fan out.
+    if reader.as_random_access().is_some() {
+        let workers = {
+            let units = reader.as_random_access().and_then(|ra| ra.decode_units());
+            verify_workers(fmt, reader.entries()?, units, path)
+        };
+        let ra = reader.as_random_access().unwrap();
+        return verify_random_access(ra, workers, sink);
     }
 
+    let mut acc = Acc::default();
+    let mut cancelled = false;
+    // Sequential entries have no stable index of their own to sort failures by, and do not need
+    // one: they are produced in archive order, so a running counter is that order.
+    let mut seq = 0usize;
     loop {
         sink.wait_if_paused();
         if sink.is_cancelled() {
-            report.cancelled = true;
+            cancelled = true;
             break;
         }
         let Some(es) = reader.next_entry()? else {
@@ -211,23 +270,96 @@ pub fn verify(
             continue;
         }
         sink.on_entry_start(&entry);
+        let i = seq;
+        seq += 1;
 
         let mut cs = CrcSink::new(sink);
         if let Err(e) = io::copy(&mut body, &mut cs) {
             drop(body); // release the reader borrow before touching `reader` again
             if sink.is_cancelled() {
-                report.cancelled = true;
+                cancelled = true;
                 break;
             }
-            report
-                .failures
-                .push((entry.name().to_string(), format!("decode failed: {e}")));
+            acc.failures
+                .push((i, entry.name().to_string(), format!("decode failed: {e}")));
             continue;
         }
         let (n, crc) = (cs.n, cs.crc.finalize());
         drop(body);
-        record(&mut report, &entry, n, crc, meta_final, sink);
+        record(&mut acc, i, &entry, n, crc, meta_final, sink);
     }
 
-    Ok(report)
+    Ok(acc.into_report(cancelled))
+}
+
+/// Verify a random-access archive across `workers` threads.
+///
+/// One task per file entry, ordered by [`order_groups`] exactly as extraction orders its writes.
+/// The clustering is not an optimisation here either: entries sharing a `.cram` pack must be
+/// visited together, or concurrent workers scatter across unrelated packs, thrash the shared cache
+/// and re-decode the same pack many times over.
+///
+/// Unlike extraction there is no destination, so nothing has to be grouped to keep two workers off
+/// one file; every entry is its own task.
+fn verify_random_access(
+    ra: &dyn RandomAccessReader,
+    workers: usize,
+    sink: &dyn ProgressSink,
+) -> Result<VerifyReport> {
+    let entries = ra.entries();
+    let groups: Vec<Vec<usize>> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_dir())
+        .map(|(i, _)| vec![i])
+        .collect();
+    let groups = order_groups(groups, entries, |i| ra.locality_key(i));
+
+    let acc = Mutex::new(Acc::default());
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(workers.max(1))
+        .build()
+        .map_err(|e| ArchiveError::Backend(e.to_string()))?;
+
+    pool.install(|| {
+        groups.par_iter().for_each(|group| {
+            for &i in group {
+                sink.wait_if_paused();
+                if sink.is_cancelled() {
+                    return;
+                }
+                let entry = &entries[i];
+                sink.on_entry_start(entry);
+                // Isolate the decode: a panic inside a codec on a malformed or pathological stream
+                // is one failed entry, not a dead process, which matters most for the GUI (it
+                // verifies in-process). The lock is taken only AFTER the catch, so a panicking
+                // decoder can never poison it and leave every later entry unwrapping an Err.
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    let mut cs = CrcSink::new(sink);
+                    let r = ra.copy_entry(i, &mut cs);
+                    (r, cs.n, cs.crc.finalize())
+                }));
+                let mut a = acc.lock().unwrap();
+                match outcome {
+                    // Random-access entries carry authoritative metadata (`meta_final` is
+                    // implicitly true).
+                    Ok((Ok(_), n, crc)) => record(&mut a, i, entry, n, crc, true, sink),
+                    // A cancelled pass fails every in-flight decode; those are not archive damage.
+                    Ok((Err(_), ..)) if sink.is_cancelled() => {}
+                    Ok((Err(e), ..)) => a.failures.push((
+                        i,
+                        entry.name().to_string(),
+                        format!("decode failed: {e}"),
+                    )),
+                    Err(p) => {
+                        a.failures
+                            .push((i, entry.name().to_string(), panic_message(p.as_ref())))
+                    }
+                }
+            }
+        });
+    });
+
+    let acc = acc.into_inner().unwrap();
+    Ok(acc.into_report(sink.is_cancelled()))
 }

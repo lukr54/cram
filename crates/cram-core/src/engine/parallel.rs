@@ -41,10 +41,12 @@ const WRITE_BUF: usize = 8 * 1024 * 1024;
 /// whose entries decode independently returns `None` for everything, which collapses to one cluster
 /// and reproduces pure LPT exactly.
 ///
-/// Separated from `run` so it can be tested without a filesystem or an archive. The scattering this
-/// prevents is not a tuning matter: it re-decoded `.cram` packs more than sixteen times each,
-/// tripped the anti-decompression-bomb budget, and failed 60,052 entries of a sound archive.
-fn order_groups(
+/// Separated from `run` so it can be tested without a filesystem or an archive, and shared with
+/// [`verify`](super::verify), which fans out over the same decode units and needs the same
+/// clustering. The scattering this prevents is not a tuning matter: it re-decoded `.cram` packs more
+/// than sixteen times each, tripped the anti-decompression-bomb budget, and failed 60,052 entries of
+/// a sound archive.
+pub(crate) fn order_groups(
     groups: Vec<Vec<usize>>,
     entries: &[Entry],
     locality: impl Fn(usize) -> Option<u64>,
@@ -237,8 +239,9 @@ pub fn run(
     Ok(r)
 }
 
-/// Best-effort human-readable text from a caught panic payload.
-fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+/// Best-effort human-readable text from a caught panic payload. Shared with
+/// [`verify`](super::verify), which isolates decoder panics the same way.
+pub(crate) fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = p.downcast_ref::<&str>() {
         format!("decoder panicked: {s}")
     } else if let Some(s) = p.downcast_ref::<String>() {

@@ -168,6 +168,7 @@ pub fn extract(
 
     // Derive the plan from the archive's codec/block shape (entries borrow ends with this block).
     let plan = {
+        let units = reader.as_random_access().and_then(|ra| ra.decode_units());
         let entries = reader.entries()?;
         // Profile the DESTINATION drive, not the process's current directory: the plan has to
         // describe the disk the bytes actually land on, which for an extraction onto another disk
@@ -177,7 +178,8 @@ pub fn extract(
         hw::derive_plan(
             Op::Extract,
             plan_codec(fmt, entries),
-            block_count(fmt, entries),
+            // The backend's own count where it has one (`.cram` packs); the entry list otherwise.
+            units.unwrap_or_else(|| block_count(fmt, entries)),
             &hw,
             Topology::SameDrive,
             &rates,
