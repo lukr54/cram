@@ -7,6 +7,7 @@
 //! emitted before their children so empty dirs are preserved.
 
 use std::fs::{self, File};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::SystemTime;
@@ -172,7 +173,17 @@ pub fn create(
     // honored by the random-access backends (ZIP, 7z); the aggregate summary lets a whole-stream
     // backend (tar.gz/xz) avoid burning CPU on a mostly-already-compressed input. An explicit
     // `--store` or a forced codec skips the probe entirely, the user has already decided.
-    if opts.level == Level::Auto && opts.codec.is_none() {
+    // The pre-pass now runs ONLY for the one thing that needs an answer before the loop starts: a
+    // whole-stream tar codec picking its level from the aggregate. Everything else is decided inline
+    // below, from the handle the loop already holds.
+    //
+    // It used to run for every format, and it classifies by opening and sampling, so every file was
+    // opened twice -- once here and once in the loop -- for a per-entry verdict the loop could have
+    // reached for free. On a 94,829-file tree that is 94,829 redundant opens at ~178 us each, and
+    // `File::open` is the largest single cost in create.
+    let adaptive = opts.level == Level::Auto && opts.codec.is_none();
+    let wants_summary = fmt.container == Container::Tar && fmt.codec != Codec::None;
+    if adaptive && wants_summary {
         let probe_t0 = std::time::Instant::now();
         let mut summary = ProbeSummary::default();
         for item in &mut items {
@@ -237,20 +248,50 @@ pub fn create(
                         .map_err(|e| ArchiveError::Backend(format!("{}: {e}", disk.display())))?;
                     super::prof::OPEN_NANOS.fetch_add(open_t0.elapsed().as_nanos() as u64, Relaxed);
                     super::prof::OPEN_COUNT.fetch_add(1, Relaxed);
-                    let mut body = CountingReader::new(file, sink);
+
+                    // Classify store-vs-compress from the handle we are already holding, then hand
+                    // the sampled bytes back to the writer ahead of the rest of the file so nothing
+                    // is read twice either.
+                    //
+                    // The decision must match `probe::classify_file` exactly, or zip and 7z archives
+                    // would change: empty is Compress, a known extension settles it outright, below
+                    // the minimum sample size is Compress, and only what is left gets sampled.
+                    // `WriteHint::default()` is Compress, which is why the untouched branches simply
+                    // fall through.
+                    let mut head = Vec::new();
+                    let mut hint = item.hint;
+                    if adaptive && !wants_summary && item.entry.size > 0 {
+                        match probe::ext_only_verdict(disk) {
+                            Some(verdict) => {
+                                hint = WriteHint {
+                                    store: verdict.is_store(),
+                                }
+                            }
+                            None if item.entry.size >= probe::PROBE_MIN_SAMPLE => {
+                                (&file)
+                                    .take(probe::PROBE_SAMPLE_BYTES)
+                                    .read_to_end(&mut head)?;
+                                if !head.is_empty() {
+                                    hint = WriteHint {
+                                        store: probe::sample_verdict(&head).is_store(),
+                                    };
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    let mut body = CountingReader::new(Cursor::new(head).chain(file), sink);
                     // A cancel that fires mid-body comes back as whatever the backend wrapped the
                     // reader's error in (`chunker: … "cancelled"` for `.cram`). Translate it back,
                     // the same way both extract paths do, so a user pressing Cancel is told the job
                     // was cancelled rather than shown what reads like archive damage.
-                    writer
-                        .add_file(&item.entry, &mut body, item.hint)
-                        .map_err(|e| {
-                            if sink.is_cancelled() {
-                                ArchiveError::Cancelled
-                            } else {
-                                e
-                            }
-                        })?;
+                    writer.add_file(&item.entry, &mut body, hint).map_err(|e| {
+                        if sink.is_cancelled() {
+                            ArchiveError::Cancelled
+                        } else {
+                            e
+                        }
+                    })?;
                 }
             }
             sink.on_file_done(&item.entry);

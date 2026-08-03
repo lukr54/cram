@@ -188,6 +188,21 @@ pub fn sample_verdict(sample: &[u8]) -> Compressibility {
 
 /// Classify a file on disk. Extension first (no I/O); for unknown extensions read a small head
 /// sample. Any I/O error falls back to `Compress` (safe: worst case we just spend the codec CPU).
+/// The verdict the extension alone settles, if it settles one.
+///
+/// [`classify_file`] consults this before opening anything, and exposing it lets a caller that has
+/// already opened the file reproduce the same decision without a second open. The create loop does
+/// exactly that: it is holding the handle, so paying for another one to ask the same question is
+/// waste, and `File::open` is the largest single cost in create.
+pub fn ext_only_verdict(path: &Path) -> Option<Compressibility> {
+    ext_verdict(&ext_of(path))
+}
+
+/// How many bytes [`classify_file`] samples, and the size below which it does not bother.
+/// Public so an inline classifier can match its behaviour exactly rather than approximate it.
+pub const PROBE_SAMPLE_BYTES: u64 = SAMPLE_BYTES;
+pub const PROBE_MIN_SAMPLE: u64 = MIN_SAMPLE;
+
 pub fn classify_file(path: &Path, size: u64) -> Compressibility {
     if size == 0 {
         return Compressibility::Compress; // empty: store/compress are equivalent; keep it simple
