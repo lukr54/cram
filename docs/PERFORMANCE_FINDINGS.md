@@ -276,6 +276,62 @@ does not affect the archive.
 
 ---
 
+## 10. Per-class pack buffers are worth nothing measurable. Built, measured, reverted
+
+**Tried and rejected 2026-08-03.**
+
+Section 8 concluded that grouping by compressibility belongs at the pack-assignment layer rather than
+in the entry list. That was built: two class buffers, ids reserved on first append so an unused class
+leaves no hole, `packs` addressed by id because the two fill out of order, and `add_file` finally
+consuming the `WriteHint` it had been discarding. 209 tests green, clippy clean.
+
+Then measured on three corpora:
+
+| corpus | delta vs single buffer |
+|---|---|
+| kernel tree, 94,778 files | **+0.038%** (worse) |
+| Silesia | 0.000%, byte-identical |
+| 194 MiB, ~60% already-compressed blobs | **-0.016%** (better) |
+
+Noise. Even a corpus that is mostly pre-compressed data gains 30 KB on 185 MB.
+
+Two things explain it. On the first two corpora the probe classified essentially **nothing** as store
+-- the kernel tree went from 222 packs to 223, Silesia stayed at 26 and produced an identical archive
+-- so there was nothing to separate and the kernel tree's +0.038% is pack-boundary reshuffling, not
+fragmentation. And where separation did happen, the gain was still negligible, because a `.cram` pack
+is only 8 MiB. Cross-file grouping pays for 7-Zip because its solid blocks are far larger; at 8 MiB
+the entropy coder adapts within a pack anyway. That is the same ceiling issue 3 measured from the
+other direction, where the whole dictionary-size question was worth 0.92%.
+
+Reverted. It added Option-indexed packs, per-class id reservation and a fallible `finish` to the core
+write path for no measured benefit. Revisit only if `PACK_TARGET` grows a lot, and note issue 9 before
+assuming more packs in flight is free.
+
+---
+
+## 11. The pack-batch cap: measured on one machine, not yet a rule
+
+Following issue 9, the cap was swept on the idle 24-thread box, kernel tree, warm cache. Archive size
+was **identical at every setting**, so batching never reaches the output.
+
+| batch cap | 4 | 8 | **12** | 16 (shipped) | 20 | 24 |
+|---|---|---|---|---|---|---|
+| wall | 12.96 s | 8.75 s | **8.32 s** | 8.40 s | 8.75 s | 9.10 s |
+
+The optimum is 12, exactly half the logical cores, and the basin is broad: 8 through 16 all sit within
+5%. The shipped `clamp(1, 16)` is 1% off optimum here.
+
+It is **not** 1% off everywhere. On 16-thread Windows, 11 beat 16 by 13%. So the same constant is
+near-perfect on one machine and materially wrong on another, which is the argument for deriving it.
+
+**No change shipped, deliberately.** Half-the-cores fits both data points loosely, but that is one
+clean sweep and one noisy one, and fitting a cross-machine constant to a single machine is the exact
+mistake sections 4, 7 and 8 each record a version of. What is needed is the same sweep on a second
+machine, and then a rule -- or a calibration step that sweeps it once per host and stores the answer,
+which is what `hw.rs` exists for.
+
+---
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for
