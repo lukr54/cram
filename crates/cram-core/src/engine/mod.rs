@@ -15,6 +15,27 @@ use crate::progress::ProgressSink;
 use crate::secret::PasswordProvider;
 use crate::{formats, sniff};
 
+/// Diagnostic counters read back by the `.cram` writer when `CRAM_PROFILE` is set.
+///
+/// Create's per-file costs are invisible to the format writer: opening the source, walking the tree
+/// and the store-vs-compress probe all happen out here, before or between the `add_file` calls the
+/// writer can time. On a 94k-file tree that turned out to be about half of create's wall clock and
+/// it was reaching the profile only as an unexplained residual.
+///
+/// Diagnostics only. Nothing reads these except the profile print, they are `Relaxed`, and they are
+/// process-global rather than per-create, which is fine for one CLI invocation and would need
+/// revisiting if a caller ever ran two creates at once.
+pub mod prof {
+    use std::sync::atomic::AtomicU64;
+    /// Time in `File::open` on source files, and how many were opened.
+    pub static OPEN_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
+    /// Time walking the inputs into the entry list.
+    pub static WALK_NANOS: AtomicU64 = AtomicU64::new(0);
+    /// Time in the adaptive store-vs-compress probe, which reads every file before create starts.
+    pub static PROBE_NANOS: AtomicU64 = AtomicU64::new(0);
+}
+
 pub mod convert;
 pub mod create;
 pub mod dedup;

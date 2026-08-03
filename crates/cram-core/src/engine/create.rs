@@ -8,6 +8,7 @@
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::SystemTime;
 
 use crate::error::{ArchiveError, Result};
@@ -149,10 +150,12 @@ pub fn create(
     }
 
     // Plan the full member list up front (also sizes the progress bar).
+    let walk_t0 = std::time::Instant::now();
     let mut items = Vec::new();
     for input in inputs {
         collect_input(input, &mut items)?;
     }
+    super::prof::WALK_NANOS.store(walk_t0.elapsed().as_nanos() as u64, Relaxed);
     // Sizing hook for a caller-supplied Progress. Accumulated over the plan in place: handing
     // `model::totals` a slice meant cloning every Entry (144 bytes plus two heap allocations each)
     // into a Vec that outlived the whole create for two numbers.
@@ -170,6 +173,7 @@ pub fn create(
     // backend (tar.gz/xz) avoid burning CPU on a mostly-already-compressed input. An explicit
     // `--store` or a forced codec skips the probe entirely, the user has already decided.
     if opts.level == Level::Auto && opts.codec.is_none() {
+        let probe_t0 = std::time::Instant::now();
         let mut summary = ProbeSummary::default();
         for item in &mut items {
             if let Some(disk) = &item.disk_path {
@@ -188,6 +192,7 @@ pub fn create(
         {
             opts.level = Level::Fastest;
         }
+        super::prof::PROBE_NANOS.store(probe_t0.elapsed().as_nanos() as u64, Relaxed);
     }
 
     // Build in a sibling staging file and rename over `archive` only after a successful finish,
@@ -212,8 +217,11 @@ pub fn create(
                     // Name the file. One locked or unreadable source aborts the whole create, and
                     // `io::Error` from `File::open` carries no path, so on a 100 000-file backup the
                     // operator could not tell what to exclude.
+                    let open_t0 = std::time::Instant::now();
                     let file = File::open(disk)
                         .map_err(|e| ArchiveError::Backend(format!("{}: {e}", disk.display())))?;
+                    super::prof::OPEN_NANOS.fetch_add(open_t0.elapsed().as_nanos() as u64, Relaxed);
+                    super::prof::OPEN_COUNT.fetch_add(1, Relaxed);
                     let mut body = CountingReader::new(file, sink);
                     // A cancel that fires mid-body comes back as whatever the backend wrapped the
                     // reader's error in (`chunker: … "cancelled"` for `.cram`). Translate it back,

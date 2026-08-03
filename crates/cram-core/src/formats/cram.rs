@@ -536,6 +536,9 @@ struct Prof {
     flushes: u64,
     chunks: u64,
     dedup_hits: u64,
+    /// Serialising the index and writing it, at `finish`. Grows with entry and chunk count rather
+    /// than with bytes, so it is the tail a many-small-files corpus pays.
+    index_nanos: u128,
 }
 
 /// Compress (and, when encrypting, seal) one pack's raw bytes into its on-disk payload. Pure and
@@ -828,14 +831,45 @@ impl CramArchiveWriter {
             ms(p.drain_nanos),
             pct(p.drain_nanos),
         );
+        // Costs the writer cannot see: the source files are opened by `engine::create`, and the tree
+        // walk and the store-vs-compress probe both run to completion before this writer exists, so
+        // those two sit outside `wall` entirely rather than inside the residual.
+        use crate::engine::prof as eprof;
+        use std::sync::atomic::Ordering::Relaxed;
+        let open = eprof::OPEN_NANOS.load(Relaxed) as u128;
+        let opens = eprof::OPEN_COUNT.load(Relaxed);
+        let walk = eprof::WALK_NANOS.load(Relaxed) as u128;
+        let probe = eprof::PROBE_NANOS.load(Relaxed) as u128;
         eprintln!(
-            "unaccounted     {:9.1} ms  {:5.1}%",
-            ms(wall
-                .saturating_sub(p.chunk_nanos)
-                .saturating_sub(p.flush_nanos)),
-            pct(wall
-                .saturating_sub(p.chunk_nanos)
-                .saturating_sub(p.flush_nanos)),
+            "open (serial)   {:9.1} ms  {:5.1}%   {} files, {:.1} us each",
+            ms(open),
+            pct(open),
+            opens,
+            if opens > 0 {
+                open as f64 / opens as f64 / 1e3
+            } else {
+                0.0
+            },
+        );
+        eprintln!(
+            "index+trailer   {:9.1} ms  {:5.1}%",
+            ms(p.index_nanos),
+            pct(p.index_nanos)
+        );
+        let residual = wall
+            .saturating_sub(p.chunk_nanos)
+            .saturating_sub(p.flush_nanos)
+            .saturating_sub(open)
+            .saturating_sub(p.index_nanos);
+        eprintln!(
+            "residual        {:9.1} ms  {:5.1}%",
+            ms(residual),
+            pct(residual)
+        );
+        eprintln!(
+            "before the writer existed: walk {:.1} ms, probe {:.1} ms  (outside `wall`)",
+            ms(walk),
+            ms(probe),
         );
         eprintln!(
             "chunks {}  dedup hits {}  packs {}  rayon threads {}",
@@ -937,6 +971,7 @@ impl ArchiveWriter for CramArchiveWriter {
         self.queue_pack();
         self.flush_batch()?;
         self.drain_inflight()?;
+        let index_t0 = Instant::now();
         let index_offset = self.pos;
         // Only an archive that actually used a transform is written as v2; everything else stays v1
         // and remains readable by older builds.
@@ -973,6 +1008,7 @@ impl ArchiveWriter for CramArchiveWriter {
             f.flush()?;
         }
 
+        self.prof.index_nanos = index_t0.elapsed().as_nanos();
         self.report_profile();
 
         // `pos` counted every byte written (header + packs + index + trailer) = the final size.
