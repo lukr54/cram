@@ -248,20 +248,41 @@ appear, with their own notices, in `THIRD-PARTY-LICENSES.md`.)
 ## 5. Rust dependencies
 
 Cram statically links a large graph of third-party Rust crates. **There is no GPL, AGPL, LGPL or MPL
-anywhere in the graph**, every dependency is permissive. The licences the resolved graph actually uses
-are MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, Unicode-3.0, bzip2-1.0.6 and CC0-1.0. `about.toml`
-additionally permits ISC, 0BSD, Unlicense, Zlib and Unicode-DFS-2016, all of which are permissive and
-any of which a future dependency may resolve to; nothing outside that list can enter without failing
+anywhere in the graph**, every dependency is permissive. The licences the resolved graph actually uses,
+with the crate count behind each, are MIT (247), Unicode-3.0 (19), Apache-2.0 (11), BSD-3-Clause (8),
+BSD-2-Clause (3), ISC (3), CC0-1.0 (1), CDLA-Permissive-2.0 (1) and bzip2-1.0.6 (1). `about.toml`
+additionally permits 0BSD, Unlicense, Zlib and Unicode-DFS-2016, all of which are permissive and any of
+which a future dependency may resolve to; nothing outside that list can enter without failing
 generation, which is what keeps the sentence above true rather than merely asserted.
+
+The single CDLA-Permissive-2.0 crate is `webpki-roots`, Mozilla's CA certificate bundle. The Community
+Data License Agreement is written for data rather than code, which is what that crate is. It is
+permissive, carries no copyleft, and the obligation is to preserve the disclaimers.
 
 The **full copyright notice and licence text for every one of these crates** is reproduced in the
 companion [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md), generated from each crate's own
 `LICENSE` file and distributed alongside the binaries. That appendix, not a summary, is what discharges
-the reproduction requirement the MIT, BSD-2/3-Clause, ISC, Unicode-3.0 and bzip2 licences place on
-binary distributions.
+the reproduction requirement the MIT, BSD-2/3-Clause, ISC, Unicode-3.0, CDLA and bzip2 licences place on
+binary distributions. `ring` is the one to note: it descends from BoringSSL and therefore OpenSSL, so it
+carries a bespoke composite licence with an explicit reproduction requirement, satisfied by its entry in
+the appendix.
 
-**Regenerating the appendix** after any dependency change, for the shipped `x86_64-pc-windows-gnu`
-build (`about.toml` and `about.hbs` in this repo drive it):
+### The appendix covers all three shipped platforms, not just Windows
+
+The dependency graph genuinely differs by platform, and for a while this appendix did not account for
+that. On `x86_64-pc-windows-gnu` the downloader uses SChannel, so no TLS stack is statically linked. On
+Linux and macOS there is no OS stack to borrow, so the build pulls in rustls, `ring`, `webpki-roots`,
+`rustix` and the rest — twenty-five crates in total that a Windows-only appendix omits, including the
+`security-framework` and `openssl` binding crates. Until 2026-08-02 `about.toml` pinned generation to
+Windows while `ci.yml` copied the result verbatim into the Linux tarball and the macOS tarball, so the
+paragraph above was false on two of the three platforms it was shipped with.
+
+`about.toml` now resolves the **union** of all three shipped triples. One appendix, identical in every
+archive. A Windows reader therefore receives notices for a few crates their binary does not contain,
+which violates nothing; omitting one is the violation, and the asymmetry says err inclusive. The
+`targets` list must stay in step with the release jobs in `ci.yml`, where macOS ships **aarch64**.
+
+**Regenerating the appendix** after any dependency change (`about.toml` and `about.hbs` drive it):
 
 ```bash
 cargo install cargo-about --locked --version 0.9.1 --features cli
@@ -269,9 +290,10 @@ cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
   --workspace --features "download zstd-c phash"
 ```
 
-`--workspace` rather than `-m crates/cram-cli/Cargo.toml`: the zip ships three artifacts and only one
-of them is the CLI. Resolving the whole workspace is the only single command that also covers
+No `--target` flag: `about.toml` pins the triples itself, which is also why the check runs on any
+runner. `--workspace` rather than `-m crates/cram-cli/Cargo.toml`: the zip ships three artifacts and
+only one of them is the CLI. Resolving the whole workspace is the only single command that also covers
 `cram-extract.exe` and `cram_shell.dll`. On Windows, convert the result to LF before committing
 (`.gitattributes` stores it that way, and a handful of crates' own LICENSE files carry CRLF). CI
-regenerates and diffs on every push, so an appendix that has drifted from `Cargo.lock` fails the build
-instead of shipping.
+regenerates and diffs on every push, and the release job will not run unless that check passes, so an
+appendix that has drifted from `Cargo.lock` fails the build instead of shipping.

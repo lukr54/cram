@@ -14,11 +14,32 @@ accepted = [
     "0BSD",
     "CC0-1.0",
     "Unlicense",
+    # webpki-roots, which is Mozilla's CA certificate bundle and therefore data rather than code —
+    # which is what CDLA is written for. Permissive, no copyleft, obligation is to keep the
+    # disclaimers. Reached the graph when the Linux and macOS targets were added below, because
+    # rustls needs a root store and SChannel does not.
+    "CDLA-Permissive-2.0",
 ]
 # MPL-2.0 is deliberately absent. THIRD-PARTY-NOTICES.md §5 tells redistributors there is no copyleft
 # in the graph; leaving MPL accepted here would let a weak-copyleft crate in and make that claim false
 # with no CI signal. Anything not on this list fails generation, which is the point.
 
-# The one platform the binaries are shipped for. Filtering to it keeps the appendix to what actually
-# links (e.g. on windows-gnu reqwest uses SChannel, so rustls/ring are not pulled in).
-targets = ["x86_64-pc-windows-gnu"]
+# EVERY platform a release archive is published for, not just the one the appendix used to cover.
+#
+# The graph genuinely differs per platform: on windows-gnu reqwest uses SChannel, so nothing TLS is
+# statically linked, while Linux and macOS have no OS stack to borrow and pull in rustls, ring,
+# webpki-roots and the rest. Pinning to Windows alone meant `ci.yml` copied a Windows appendix into
+# the Linux tarball and the macOS tarball, omitting twelve crates those binaries actually link. That
+# is a reproduction-requirement failure, and worse, THIRD-PARTY-NOTICES.md §5 asserts the appendix is
+# complete, so the claim was false on two of three platforms.
+#
+# One union appendix rather than three per-platform files. Over-inclusion is harmless — a Windows
+# reader gets notices for crates their binary does not contain — whereas omission is the violation.
+# The asymmetry says err inclusive, and it keeps one generated file, one CI check and one command.
+#
+# These must stay in step with the release jobs in ci.yml. macOS ships aarch64, not x86_64.
+targets = [
+    "x86_64-pc-windows-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]

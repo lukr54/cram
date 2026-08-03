@@ -173,9 +173,10 @@ jobs:
   licences:
     name: licence appendix is current
     runs-on: ubuntu-latest
-    # cargo-about resolves the dependency graph and never compiles it, and about.toml pins that graph
-    # to x86_64-pc-windows-gnu on its own, so this can run anywhere. Override the workflow-level target
-    # so `cargo install` builds cargo-about for this host.
+    # cargo-about resolves the dependency graph and never compiles it, and about.toml pins the triples
+    # on its own -- all three shipped platforms since 2026-08-02, not just Windows -- so this can run
+    # anywhere and needs no `--target`. Override the workflow-level target so `cargo install` builds
+    # cargo-about for this host.
     env:
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
