@@ -31,6 +31,50 @@ const WRITE_BUF: usize = 8 * 1024 * 1024;
 /// Write a probe file, then ask for the same name in flipped case: getting it back means the lookup
 /// ignored case. If the probe cannot run at all (read-only destination), fall back to the platform's
 /// usual default, which is the answer for the overwhelming majority of volumes on each OS.
+/// Order destination groups for the pool, balancing two concerns that pull opposite ways.
+///
+/// Load balance wants longest-processing-time-first, so the heaviest work is handed out early and
+/// the pool does not finish on one straggler. Locality wants groups sharing a decode unit adjacent,
+/// so concurrent workers land on the same pack rather than scattering across unrelated ones.
+///
+/// So: cluster by locality key, order clusters heaviest-first, keep LPT inside a cluster. A format
+/// whose entries decode independently returns `None` for everything, which collapses to one cluster
+/// and reproduces pure LPT exactly.
+///
+/// Separated from `run` so it can be tested without a filesystem or an archive. The scattering this
+/// prevents is not a tuning matter: it re-decoded `.cram` packs more than sixteen times each,
+/// tripped the anti-decompression-bomb budget, and failed 60,052 entries of a sound archive.
+fn order_groups(
+    groups: Vec<Vec<usize>>,
+    entries: &[Entry],
+    locality: impl Fn(usize) -> Option<u64>,
+) -> Vec<Vec<usize>> {
+    let weight = |g: &Vec<usize>| -> u64 {
+        g.iter()
+            .fold(0u64, |acc, &i| acc.saturating_add(entries[i].size))
+    };
+    let mut clusters: Vec<(Option<u64>, Vec<Vec<usize>>)> = Vec::new();
+    let mut cluster_of: std::collections::HashMap<Option<u64>, usize> =
+        std::collections::HashMap::new();
+    for g in groups {
+        // A group's members run in sequence on one worker, so its first member decides where it
+        // belongs.
+        let key = g.first().copied().and_then(&locality);
+        match cluster_of.get(&key) {
+            Some(&c) => clusters[c].1.push(g),
+            None => {
+                cluster_of.insert(key, clusters.len());
+                clusters.push((key, vec![g]));
+            }
+        }
+    }
+    for (_, gs) in &mut clusters {
+        gs.sort_by_key(|g| Reverse(weight(g)));
+    }
+    clusters.sort_by_key(|(_, gs)| Reverse(gs.iter().map(weight).fold(0u64, u64::saturating_add)));
+    clusters.into_iter().flat_map(|(_, gs)| gs).collect()
+}
+
 fn dest_is_case_insensitive(dir: &Path) -> bool {
     let name = format!(".cram-case-probe-{}", std::process::id());
     let lower = dir.join(&name);
@@ -128,14 +172,20 @@ pub fn run(
             }
         }
     }
-    // Longest-processing-time-first: schedule the heaviest group first to keep the pool balanced.
-    // A group's weight is its total, not its largest entry, because its members run in sequence.
-    groups.sort_by_key(|g| {
-        Reverse(
-            g.iter()
-                .fold(0u64, |acc, &i| acc.saturating_add(entries[i].size)),
-        )
-    });
+    // Order the groups. Two competing concerns, and both matter.
+    //
+    // LOAD BALANCE wants longest-processing-time-first: hand the pool its heaviest work early so it
+    // drains evenly rather than finishing with one long straggler.
+    //
+    // LOCALITY wants groups that share a decode unit adjacent, so concurrent workers land on the
+    // same pack instead of scattering across unrelated ones. Ignoring this is what made extracting a
+    // 94,778-file `.cram` fail: workers thrashed the 32-slot pack cache, packs were re-decoded well
+    // over sixteen times each, and the anti-bomb budget tripped on 60,052 entries of a sound archive.
+    //
+    // So: cluster by locality key, order clusters heaviest-first, and keep LPT inside a cluster.
+    // Formats whose entries decode independently report `None` for every entry, which collapses to a
+    // single cluster and leaves the old pure-LPT behaviour exactly as it was.
+    let groups = order_groups(groups, entries, |i| ra.locality_key(i));
 
     let report = Mutex::new(Report::default());
     let pool = ThreadPoolBuilder::new()
@@ -267,6 +317,56 @@ mod dest_race_tests {
     use crate::progress::NullSink;
     use crate::secret::NoPassword;
     use std::sync::Arc;
+
+    fn sized_entries(sizes: &[u64]) -> Vec<Entry> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Entry {
+                index: i,
+                path: crate::model::EntryPath::from_raw(&format!("f{i}")).unwrap(),
+                kind: crate::model::EntryKind::File,
+                size,
+                compressed_size: None,
+                modified: None,
+                unix_mode: None,
+                crc32: None,
+                encrypted: false,
+            })
+            .collect()
+    }
+
+    /// Groups sharing a decode unit must come out adjacent, or concurrent workers scatter across
+    /// unrelated packs, thrash the cache and re-decode enough to trip the anti-bomb budget. That is
+    /// not hypothetical: it failed 60,052 entries of a sound 94,778-file archive.
+    ///
+    /// Entry sizes are chosen so pure weight ordering would interleave the two packs (30, 25, 20,
+    /// 15), which is exactly the arrangement that broke.
+    #[test]
+    fn groups_sharing_a_pack_are_scheduled_together() {
+        let entries = sized_entries(&[30, 25, 20, 15]);
+        // Entries 0 and 2 live in pack 7; entries 1 and 3 live in pack 3.
+        let key = |i: usize| Some(if i.is_multiple_of(2) { 7u64 } else { 3u64 });
+        let ordered = order_groups(vec![vec![0], vec![1], vec![2], vec![3]], &entries, key);
+        let keys: Vec<u64> = ordered.iter().map(|g| key(g[0]).unwrap()).collect();
+        assert_eq!(
+            keys,
+            vec![7, 7, 3, 3],
+            "each pack's groups must be contiguous, heavier pack first"
+        );
+        // And LPT is preserved inside a cluster.
+        assert_eq!(ordered[0], vec![0], "heaviest of pack 7 leads it");
+        assert_eq!(ordered[2], vec![1], "heaviest of pack 3 leads it");
+    }
+
+    /// A format whose entries decode independently reports no key, and must keep the pure
+    /// longest-processing-time-first order it had before locality existed.
+    #[test]
+    fn no_locality_key_is_plain_lpt() {
+        let entries = sized_entries(&[10, 40, 20, 30]);
+        let ordered = order_groups(vec![vec![0], vec![1], vec![2], vec![3]], &entries, |_| None);
+        assert_eq!(ordered, vec![vec![1], vec![3], vec![2], vec![0]]);
+    }
 
     /// Case-variant names (`A.txt` / `a.txt`) resolve to ONE file on a case-insensitive filesystem,
     /// so both must run on ONE task in archive order: that is what stops two workers racing the same

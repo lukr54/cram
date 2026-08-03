@@ -1508,6 +1508,18 @@ impl RandomAccessReader for CramReader {
         self.reconstruct(ids, out)
     }
 
+    /// The entry's FIRST pack. An entry large enough to span several packs still reports one key,
+    /// which is fine: the point is that the many small entries sharing a pack are visited together,
+    /// and a multi-pack entry decodes its packs consecutively on one worker regardless.
+    ///
+    /// An entry with no chunks -- an empty file -- has no pack and returns `None`, so it is not
+    /// clustered with pack 0 for no reason.
+    fn locality_key(&self, index: usize) -> Option<u64> {
+        let first = self.entry_chunks.get(index)?.first()?;
+        let chunk = self.chunks.get(*first as usize)?;
+        Some(chunk.pack_id as u64)
+    }
+
     fn read_range(&self, index: usize, off: u64, len: u64) -> Result<Vec<u8>> {
         let ids = self
             .entry_chunks

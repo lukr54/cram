@@ -82,4 +82,26 @@ pub trait RandomAccessReader: Send + Sync {
     /// A random byte-range `[off, off+len)` of an entry's *uncompressed* stream; the mount /
     /// on-access primitive. For a non-seekable inner codec this may decode from the entry start.
     fn read_range(&self, index: usize, off: u64, len: u64) -> Result<Vec<u8>>;
+
+    /// Where entry `index`'s bytes physically live, when the format stores many entries inside one
+    /// shared decode unit. Entries sharing a key should be extracted together.
+    ///
+    /// `None`, the default, means entries are independent: ZIP, tar and RAR decode each member on
+    /// its own, so any order costs the same. `.cram` returns the entry's first pack, because a pack
+    /// is decompressed whole and holds chunks from many files.
+    ///
+    /// This is not a nicety. Extracting a 94,778-file `.cram` while scheduling purely by entry
+    /// weight scattered concurrent workers across unrelated packs, thrashed the 32-slot pack cache,
+    /// and re-decoded packs so many times that the anti-decompression-bomb budget tripped: `cram x`
+    /// failed on 60,052 entries of an archive `cram t` verifies completely in 3.15 s. Ordering by
+    /// this key means each shared unit is decoded about once, which fixes the throughput and the
+    /// false positive together -- and makes the amplification attack the budget guards against
+    /// structurally impossible, since no arrangement of chunks can force a re-decode of a unit that
+    /// is visited once.
+    ///
+    /// 7z solid blocks have the same shape and should adopt this; they are believed to suffer the
+    /// same way and it has not been measured.
+    fn locality_key(&self, _index: usize) -> Option<u64> {
+        None
+    }
 }
