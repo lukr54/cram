@@ -168,6 +168,85 @@ configuration worth putting in front of users.
 
 ---
 
+---
+
+## 7. `File::open` is the largest single cost in create
+
+**Severity: highest for create. Cause confirmed 2026-08-03, unfixed.**
+
+Create was instrumented per phase (`CRAM_PROFILE=1`). On the 94,829-file kernel tree, 16-thread
+Windows, default level:
+
+```
+open (serial)     16837.8 ms   52.4%   94,829 files, 177.6 us each
+chunk (serial)     9895.5 ms   30.8%   read+cdc 7239, hash 722, other 1935
+residual           5049.1 ms   15.7%
+flush                321.2 ms    1.0%   blocked 1135 ms
+index+trailer         12.0 ms    0.0%
+walk 1531 ms, probe 2327 ms  (both before the writer exists)
+```
+
+Opening the source files costs more than chunking them and twenty times more than compressing them.
+177 us per open against 5–20 us for a warm one, which is Defender in the path.
+
+Three things follow.
+
+- **Every file is opened twice.** `probe::classify_file` takes a path, so the store-vs-compress
+  pre-pass opens and reads all 94,829 files, then the create loop opens all 94,829 again. Adding
+  `walk`'s `fs::metadata`, the filesystem is touched three times per entry before a byte is
+  compressed.
+- **For `.cram` the probe is pure waste.** `CramArchiveWriter::add_file` takes `_hint: WriteHint`
+  and ignores it, where `zip_write.rs:172` and `sevenz_write.rs:156` both consume it. The pass costs
+  its 2.33 s and every one of those extra opens, and the `.cram` writer discards the verdict.
+- **Hashing is not the bottleneck and never was.** BLAKE3 is 722 ms against read+CDC's 7239 ms,
+  running at ~3.2 GiB/s. Parallelising it would buy almost nothing.
+
+Absolute numbers move by nearly 2x with machine state — the same work measured 19 s and 36 s an hour
+apart — so the proportions are the finding. Nothing here belongs in `BENCHMARKS.md`.
+
+The fix is to prefetch opens on a small pool while the current file chunks, and to stop opening
+twice. Neither touches the dedup table or pack ordering, so determinism should survive, but verify
+by hash rather than assume.
+
+---
+
+## 8. Grouping the entry list by file type is 25x slower. Do not retry it as written
+
+**Tried and rejected 2026-08-03. Negative result, recorded so it is not rediscovered.**
+
+`.cram` compresses each ~8 MiB pack as one standalone stream, so what shares a pack decides how well
+that pack compresses. Sorting the entry list by `(store, extension, path)` before the create loop —
+the same reason 7-Zip sorts into its solid blocks — looked like a free ratio win, and determinism
+survives it because the order stays a reproducible function of the input.
+
+Measured: the kernel tree ran roughly **25x slower**. Killed after ten minutes having written 150 MB
+of a 191 MB archive, against 20–36 s in tree order. The ratio benefit was never measured because no
+run finished.
+
+The cause is that the entry list is also the **read order**. In tree order a directory's metadata is
+warm while its files are opened. Sorted by extension, every consecutive open lands in a different
+directory, and issue 7 has already established that `File::open` is the dominant cost. Reordering
+multiplies the one thing that was already worst.
+
+The idea is still right; the layer was wrong. Read in tree order and route chunks to a per-class pack
+buffer at assignment time, so locality and pack homogeneity are decided independently. That needs
+pack ids reserved per buffer rather than a single `next_pack_id`, since two buffers fill at once and
+`packs[id]` must stay addressable by id.
+
+---
+
+## Fixed since this document was written
+
+- **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for
+  44.7% of create while sixteen threads worked, then fifteen threads idled while one chunked.
+  Batches now compress on a background thread. Blocked time fell to ~1 s in 17, output is unchanged
+  byte for byte, and the win was 19.51 s to 16.57 s — smaller than the phase split implied, because
+  what it exposed is that ~95% of create is single-threaded.
+- **A duplicated chunk loop.** `add_file` carried its own copy of `chunk_stream`, identical apart
+  from accumulating `size`, while `chunk_stream`'s doc comment claimed both paths shared it. The copy
+  was the one every ordinary file took.
+
 ## Reproducing
 
 Corpora, hashes, exact invocations and the full result tables are in `BENCHMARKS.md`.
+Per-phase create timings: `CRAM_PROFILE=1 cram a out.cram <inputs>`.

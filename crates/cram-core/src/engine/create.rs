@@ -195,6 +195,21 @@ pub fn create(
         super::prof::PROBE_NANOS.store(probe_t0.elapsed().as_nanos() as u64, Relaxed);
     }
 
+    // DO NOT sort `items` by type here. It was tried on 2026-08-03 and measured: grouping the
+    // entry list by `(store, extension, path)` before this loop, so that a `.cram` pack would hold
+    // one kind of file, ran the 94,829-file kernel tree roughly 25x slower. Killed after ten
+    // minutes having written 150 MB of a 191 MB archive, against 20-36 s in tree order.
+    //
+    // The cause is that this list is also the read order. In tree order a directory's metadata is
+    // warm while its files are opened; sorted by extension every consecutive open lands in a
+    // different directory, and `File::open` is already the single largest cost in create at 52% and
+    // ~178 us per file. Reordering multiplies the one thing that was already dominant.
+    //
+    // The idea itself is sound -- what shares a pack decides how well that pack compresses, which is
+    // why 7-Zip sorts into its solid blocks. It belongs at the pack-assignment layer, not here:
+    // read in tree order, route chunks to a per-class pack buffer. That keeps the locality and
+    // still gets homogeneous packs. See docs/PERFORMANCE_FINDINGS.md.
+
     // Build in a sibling staging file and rename over `archive` only after a successful finish,
     // writing directly to `archive` truncated any pre-existing archive at that path the moment the
     // writer opened, so a create that then failed (unreadable input, disk full, ZIP64 overflow)
