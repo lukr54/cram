@@ -170,9 +170,15 @@ configuration worth putting in front of users.
 
 ---
 
-## 7. `File::open` is the largest single cost in create
+## 7. `File::open` dominates create on Windows, and is nearly free on Linux
 
-**Severity: highest for create. Cause confirmed 2026-08-03, unfixed.**
+**Severity: high on Windows only. Confirmed 2026-08-03. Partially fixed.**
+
+> **Corrected 2026-08-03, later the same day.** This section originally read "`File::open` is the
+> largest single cost in create" without qualification. Measured on the idle Linux box it is
+> **4.1 us per file and 4.8% of create**, against **177.6 us and 52.4%** on Windows — a factor of 43,
+> and it is Defender in the open path, not the code. The Windows figures below stand; the headline
+> did not. Anything measured on that Windows machine describes Defender as much as it describes cram.
 
 Create was instrumented per phase (`CRAM_PROFILE=1`). On the 94,829-file kernel tree, 16-thread
 Windows, default level:
@@ -235,13 +241,62 @@ pack ids reserved per buffer rather than a single `next_pack_id`, since two buff
 
 ---
 
+---
+
+## 9. Raising the pack-batch clamp makes create SLOWER. Measured, not assumed
+
+**Tried and rejected 2026-08-03. This contradicts issue 4, which is corrected below.**
+
+`formats/cram.rs` sets `batch: rayon::current_num_threads().clamp(1, 16)`, so a 24-thread machine
+compresses at most 16 packs at once. Issue 4 called that a defect and proposed wiring `derive_plan`
+in, which returns `workers: hw.logical` for create. Both were wrong, and the measurement is
+unambiguous. On the idle 24-thread box, kernel tree, default level:
+
+| build | wall | peak RSS | chunk | flush | blocked |
+|---|---|---|---|---|---|
+| clamp 16 (shipped) | **8.36 s** | 1.22 GB | 3975 ms | 1862 ms | 2033 ms |
+| clamp 64, batch 24 | 8.96 s | 1.62 GB | 5079 ms | 1328 ms | 1346 ms |
+
+Compression did get faster: blocked fell 2033 -> 1346 ms, exactly as predicted. But chunking rose
+3975 -> 5079 ms, and the loss is larger than the gain. Peak memory rose 400 MB as well, because
+`batch x PACK_TARGET` is buffered twice under the overlap.
+
+The chunker is a single thread on the critical path, and every extra compression worker takes cores
+away from it. The same effect was measured independently on 16-thread Windows, where 11 rayon threads
+beat 16 by 13%.
+
+**So the optimum compression concurrency is BELOW the core count, not equal to it.** `derive_plan`'s
+`workers: hw.logical` for `Op::Create` is the wrong answer, and wiring it in unchanged would make
+create slower on every machine with more cores than the current clamp. Whatever replaces the clamp
+has to reserve headroom for the producer, and the right reserve is a thing to measure per machine
+rather than guess — which is an argument for calibration, just not the one issue 4 made.
+
+Output was byte-identical across clamp 16, clamp 24, and both earlier revisions, so pack batching
+does not affect the archive.
+
+---
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for
   44.7% of create while sixteen threads worked, then fifteen threads idled while one chunked.
-  Batches now compress on a background thread. Blocked time fell to ~1 s in 17, output is unchanged
-  byte for byte, and the win was 19.51 s to 16.57 s — smaller than the phase split implied, because
-  what it exposed is that ~95% of create is single-threaded.
+  Batches now compress on a background thread, and output is unchanged byte for byte.
+
+  **Measured on the idle 24-thread Linux box** — the Windows numbers taken the same day are
+  worthless, that machine varying 19 s to 202 s for identical work:
+
+  | | wall | peak RSS |
+  |---|---|---|
+  | `2f90515` before | 10.92 s | 1.03 GB |
+  | `ebf73d5` overlap | 9.32 s | 1.20 GB |
+  | `a7b88c3` single-open | **8.36 s** | 1.22 GB |
+
+  **1.31x for the pair**, 1.17x from the overlap and a further 1.11x from opening each file once.
+  Peak memory rises ~190 MB, which is the double buffering and is bounded.
+
+  Note the corpus at `/scratch/bench/corpora/linux` is not the one `BENCHMARKS.md` publishes — it is
+  2.1 GB against 1.6 GB and compresses to 472 MiB against 199 MiB, so these figures are valid as an
+  A/B on one machine and are **not** comparable to the published table.
 - **A duplicated chunk loop.** `add_file` carried its own copy of `chunk_stream`, identical apart
   from accumulating `size`, while `chunk_stream`'s doc comment claimed both paths shared it. The copy
   was the one every ordinary file took.
