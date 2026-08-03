@@ -331,9 +331,17 @@ mod dest_race_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `K` (U+212A KELVIN SIGN) and `k` fold to one key under Rust's full-Unicode `to_lowercase`
-    /// but are two distinct files on NTFS, which folds through the fixed `$UpCase` table. They must
-    /// both survive: the fold decides scheduling, never which file is worth keeping.
+    /// `K` (U+212A KELVIN SIGN) and `k` fold to one key under Rust's full-Unicode `to_lowercase`,
+    /// and whether they are one file or two is the *filesystem's* decision, not ours. They must
+    /// both survive wherever they are two: the fold decides scheduling, never which file is worth
+    /// keeping. Where they are genuinely one file, archive order decides the winner, which is what
+    /// sequential extraction does.
+    ///
+    /// The probe below asks that exact question rather than asking whether the destination is
+    /// case-insensitive, because those are different questions and conflating them is what made this
+    /// test fail on macOS. NTFS is case-insensitive through the fixed `$UpCase` table and still keeps
+    /// these two apart; APFS applies full Unicode folding and does not. `dest_is_case_insensitive`
+    /// answers `true` on both and would predict the wrong outcome on one of them.
     #[test]
     fn unicode_fold_collision_writes_both_files() {
         use zip::write::SimpleFileOptions;
@@ -351,6 +359,12 @@ mod dest_race_tests {
         let zip_path = dir.join("fold.zip");
         fs::write(&zip_path, &bytes).unwrap();
 
+        // Ask this filesystem directly whether U+212A and `k` are one name or two.
+        let probe = dir.join("\u{212A}-probe");
+        fs::write(&probe, b"").unwrap();
+        let folds_kelvin = dir.join("k-probe").exists();
+        let _ = fs::remove_file(&probe);
+
         let reader = crate::formats::open(
             &zip_path,
             crate::format::Format::zip(),
@@ -362,10 +376,20 @@ mod dest_race_tests {
         let report = run(ra, &out, 4, false, &NullSink).unwrap();
 
         assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
-        assert_eq!(report.extracted, 2, "both distinct files are written");
+        // Both entries are written either way. Where they land on one file the group is serialised
+        // and the later one wins; nothing is ever dropped, which is the property under test.
+        assert_eq!(report.extracted, 2, "both entries are written");
         assert_eq!(report.skipped, 0, "neither is discarded as a duplicate");
-        assert_eq!(fs::read(out.join("\u{212A}.txt")).unwrap(), b"KELVIN");
-        assert_eq!(fs::read(out.join("k.txt")).unwrap(), b"ascii-k");
+        if folds_kelvin {
+            assert_eq!(
+                fs::read(out.join("k.txt")).unwrap(),
+                b"ascii-k",
+                "one file here, and archive order picks the winner"
+            );
+        } else {
+            assert_eq!(fs::read(out.join("\u{212A}.txt")).unwrap(), b"KELVIN");
+            assert_eq!(fs::read(out.join("k.txt")).unwrap(), b"ascii-k");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

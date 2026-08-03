@@ -406,7 +406,13 @@ mod tests {
         }
     }
 
+    /// Windows only, because the behaviour is. `model::mangle_dos_device` is a no-op off Windows by
+    /// design -- there `NUL` is an ordinary filename and mangling it to `_NUL` would corrupt it --
+    /// so this asserts a rule that does not exist on the platform CI also runs on. Unlike the
+    /// case-folding test in `cram-core`, a `cfg` gate is right here: reserved device names are an
+    /// OS rule, not a filesystem property, so there is nothing to probe at runtime.
     #[test]
+    #[cfg(windows)]
     fn reserved_device_names_are_projected_mangled() {
         // An archive entry literally named `NUL` (legal in Unix-authored archives) must be served
         // under its mangled `_NUL` name, projecting the raw name binds the Win32 null device and
