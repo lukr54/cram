@@ -172,10 +172,50 @@ before trusting it in any budget calculation.
     extracted) rather than rejecting the archive.
 - `size`, the reconstructed file length in bytes. Invariant: `size == Σ length` over the entry's
   `chunk_ids` (§8). Directories have `size == 0` and no chunks.
-- `mode`, Unix permission bits, or `0` if unknown/not applicable.
+- `mode`, Unix permission bits, or `0` if unknown/not applicable. **The file-type bits of `st_mode`
+  are reserved, not spare** (see "Symbolic links" below); do not repurpose them.
 - `chunk_ids`, the ordered list of chunk-table indices whose bytes, concatenated in this order,
   reconstruct the file body. Ids may repeat (in-file dedup); the same id may appear in many entries
   (cross-file dedup).
+
+### Symbolic links (not representable in v1)
+
+A v1 archive **cannot** hold a symbolic link: there is no field for a target, and `mode` carries
+permission bits only. The writer therefore does not archive them, and `cram a` reports every one it
+left out, by name, on stderr. Saying nothing was a real defect: a Linux kernel tree went in with 99
+links and came out with none while `cram t` called the archive clean, because by its own index it
+was.
+
+**The intended mechanism, when this is implemented**, so that nothing else claims the space:
+
+- Set the file-type bits of `mode` to `S_IFLNK` (`0o120000`). This is why those bits are reserved
+  above.
+- Store the target path as the entry's ordinary body, so `size` is the target's byte length and the
+  chunk/dedup machinery carries it unchanged.
+
+This needs **no layout change**, which is the point: it can land in any later version without a
+format break, and a reader that predates it writes a small regular file containing the target text
+rather than rejecting anything or corrupting anything. There is consequently no advantage to
+rushing it in before the layout is fixed.
+
+**A conforming reader must not create a symlink until it enforces all of the following.** A stored
+symlink is a write primitive aimed outside the extraction directory, and it is where tar, ZIP
+(Zip-Slip) and 7-Zip have each shipped remote-code-execution bugs. These belong in §9 when the
+feature lands:
+
+1. Reject an absolute target, and on Windows any target carrying a drive letter or UNC prefix.
+2. Resolve the target against the link's own parent directory and reject it if the result escapes
+   the extraction root. Checking for a leading `..` is not sufficient.
+3. Never write **through** an existing symlink. `evil -> /etc` and `evil/passwd` are two entries that
+   are each individually harmless, and that is the whole attack; every path component of every entry
+   must be verified not to be a link at the moment it is written.
+4. Refuse to follow a link chain while extracting, and bound any resolution that does.
+5. On a platform where creating a symlink needs a privilege the process lacks (Windows without
+   Developer Mode), report the entry as skipped rather than silently writing its target as a file.
+
+Dereferencing instead — writing the target's contents in the link's place — is **not** the safer
+option it appears to be. It is what 7-Zip and WinRAR do, and on that same kernel tree it duplicated
+8,011 files behind twelve directory symlinks and would not terminate at all on a link cycle.
 
 ---
 
