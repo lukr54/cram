@@ -1439,7 +1439,36 @@ fn create(args: &[String]) -> Result<()> {
         ratio * 100.0,
         secs,
     );
+    warn_skipped_links(&report.skipped_links);
     Ok(())
+}
+
+/// Say out loud what did not go into the archive.
+///
+/// No format cram writes can currently record a symbolic link, so the walk leaves them out. Saying
+/// nothing was the bug: a Linux kernel tree went in carrying 99 symlinks and came out with none,
+/// and `cram t` pronounced the result perfectly clean, because by the archive's own index it is.
+/// An archive that holds less than the directory it was made from has to say so at the moment it is
+/// made, since that is the last point where the source is still there to go back to.
+///
+/// stderr, so a script capturing the success line still sees this, and a few names rather than all
+/// of them because a tree can hold thousands.
+fn warn_skipped_links(skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    const SHOWN: usize = 5;
+    eprintln!(
+        "warning: {} symbolic link{} not archived; the archive is not a complete copy of the source",
+        skipped.len(),
+        if skipped.len() == 1 { " was" } else { "s were" },
+    );
+    for name in skipped.iter().take(SHOWN) {
+        eprintln!("  {name}");
+    }
+    if skipped.len() > SHOWN {
+        eprintln!("  ... and {} more", skipped.len() - SHOWN);
+    }
 }
 
 /// `cram conv <in> <out> [-p <src-pw>] [--encrypt <dst-pw>] [--best|--fast|--store]`, re-export any

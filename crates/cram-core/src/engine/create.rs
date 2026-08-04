@@ -56,7 +56,12 @@ fn make_entry(
 }
 
 /// Recurse a directory, emitting its own entry first, then its children under `prefix`.
-fn collect_dir(dir: &Path, prefix: &str, items: &mut Vec<CreateItem>) -> Result<()> {
+fn collect_dir(
+    dir: &Path,
+    prefix: &str,
+    items: &mut Vec<CreateItem>,
+    skipped: &mut Vec<String>,
+) -> Result<()> {
     let dir_mtime = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
     if let Some(entry) = make_entry(prefix, 0, true, dir_mtime) {
         items.push(CreateItem {
@@ -83,8 +88,24 @@ fn collect_dir(dir: &Path, prefix: &str, items: &mut Vec<CreateItem>) -> Result<
         };
         let child_name = format!("{prefix}/{name}");
         let ft = child.file_type()?;
+        if ft.is_symlink() {
+            // NOT archived, and the caller is told so. The `.cram` index has no field for a link
+            // target -- `EntryMeta` is `is_dir | name | size | mode | chunk_ids` and `mode` is
+            // defined as permission bits only -- so representing one is a v1 format change, not a
+            // code change. Until that is decided, the honest behaviour is to say what was left out.
+            //
+            // Dropping them in silence was the actual bug: a kernel tree went in with 99 symlinks
+            // and came out with none, while `cram t` called the archive clean. For something sold on
+            // backup integrity, unreported loss is the worst failure mode there is.
+            //
+            // Dereferencing instead is not the safe default it looks like. 7-Zip and WinRAR do it,
+            // and on that same tree it silently duplicated 8,011 files behind twelve directory
+            // symlinks -- and it turns a link cycle into an unbounded walk.
+            skipped.push(child_name);
+            continue;
+        }
         if ft.is_dir() {
-            collect_dir(&child.path(), &child_name, items)?;
+            collect_dir(&child.path(), &child_name, items, skipped)?;
         } else if ft.is_file() {
             let md = child.metadata()?;
             let size = md.len();
@@ -96,13 +117,18 @@ fn collect_dir(dir: &Path, prefix: &str, items: &mut Vec<CreateItem>) -> Result<
                 });
             }
         }
-        // Symlinks and other special files are skipped for now (classic-container create).
+        // Anything else (fifo, socket, device) has no archive representation either and is
+        // simply not a file; it is left out without comment.
     }
     Ok(())
 }
 
 /// Expand one CLI input (file or directory) into archive members, rooted at its base name.
-fn collect_input(input: &Path, items: &mut Vec<CreateItem>) -> Result<()> {
+fn collect_input(
+    input: &Path,
+    items: &mut Vec<CreateItem>,
+    skipped: &mut Vec<String>,
+) -> Result<()> {
     // `.`, `./` and `..` have no `file_name`, and they are how people actually spell "this
     // directory". Resolve them to the directory they name, so `cram a out.zip .` roots the archive
     // exactly as naming that directory would. Only the filesystem root is left with no answer.
@@ -116,9 +142,18 @@ fn collect_input(input: &Path, items: &mut Vec<CreateItem>) -> Result<()> {
             .map(str::to_owned)
             .ok_or_else(|| ArchiveError::Backend(format!("cannot derive a name for {input:?}")))?,
     };
+    // A named input that is itself a symlink. `fs::metadata` follows it, so without this check a
+    // symlinked directory passed on the command line would be walked and archived as a real one.
+    if fs::symlink_metadata(input)
+        .map(|m| m.is_symlink())
+        .unwrap_or(false)
+    {
+        skipped.push(base);
+        return Ok(());
+    }
     let meta = fs::metadata(input)?;
     if meta.is_dir() {
-        collect_dir(input, &base, items)?;
+        collect_dir(input, &base, items, skipped)?;
     } else if meta.is_file() {
         if let Some(entry) = make_entry(&base, meta.len(), false, meta.modified().ok()) {
             items.push(CreateItem {
@@ -153,8 +188,11 @@ pub fn create(
     // Plan the full member list up front (also sizes the progress bar).
     let walk_t0 = std::time::Instant::now();
     let mut items = Vec::new();
+    // Names the walk refused to archive. Surfaced in the report rather than dropped in silence:
+    // see the symlink arm of `collect_dir`.
+    let mut skipped: Vec<String> = Vec::new();
     for input in inputs {
-        collect_input(input, &mut items)?;
+        collect_input(input, &mut items, &mut skipped)?;
     }
     super::prof::WALK_NANOS.store(walk_t0.elapsed().as_nanos() as u64, Relaxed);
     // Sizing hook for a caller-supplied Progress. Accumulated over the plan in place: handing
@@ -299,7 +337,10 @@ pub fn create(
         writer.finish()
     })();
     match result {
-        Ok(report) => {
+        Ok(mut report) => {
+            // What the walk refused to archive travels back with the result. A caller that prints
+            // only `entries` would otherwise have no way to know the archive is not the tree.
+            report.skipped_links = skipped;
             if let Err(e) = fs::rename(&staging, archive) {
                 // Couldn't take the destination (e.g. the old archive is open in another program):
                 // remove the staging file so nothing new is left behind; the old archive survives.

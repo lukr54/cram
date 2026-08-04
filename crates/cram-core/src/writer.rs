@@ -102,6 +102,17 @@ pub struct CreateReport {
     /// Bytes eliminated by cross-file dedup (`.cram` only; 0 for classic containers).
     pub dedup_saved: u64,
     pub elapsed: Duration,
+    /// Archive names of symbolic links the walk found and did **not** archive.
+    ///
+    /// The `.cram` v1 index has nowhere to record a link target (`EntryMeta` carries `is_dir`, name,
+    /// size, `mode` and chunk ids, and `mode` is specified as permission bits), so a symlink cannot
+    /// be represented and is left out. Every caller that reports a successful create **must** report
+    /// this too when it is non-empty: an archive that quietly contains less than the tree it was
+    /// made from is the failure a backup tool cannot afford, and `cram t` will call such an archive
+    /// perfectly clean because by its own index it is.
+    ///
+    /// Empty for every archive without symlinks, which is the overwhelming majority.
+    pub skipped_links: Vec<String>,
 }
 
 /// Builds an archive incrementally from on-disk sources. Only writable containers implement this.

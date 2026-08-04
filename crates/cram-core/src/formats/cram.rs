@@ -1137,6 +1137,8 @@ impl ArchiveWriter for CramArchiveWriter {
             stored: 0,
             dedup_saved: self.dedup_saved,
             elapsed: self.start.elapsed(),
+            // Filled in by the engine walk, which is the only thing that sees the source tree.
+            skipped_links: Vec::new(),
         })
     }
 }

@@ -200,6 +200,8 @@ impl ArchiveWriter for SevenZArchiveWriter {
             stored: self.stored,
             dedup_saved: 0,
             elapsed: self.start.elapsed(),
+            // Filled in by the engine walk, which is the only thing that sees the source tree.
+            skipped_links: Vec::new(),
         })
     }
 }
