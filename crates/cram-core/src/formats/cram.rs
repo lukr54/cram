@@ -677,8 +677,7 @@ impl PackQueue {
         workers: usize,
         capacity: usize,
         level: u32,
-        use_zstd: bool,
-        store: bool,
+        policy: PackPolicy,
         crypter: Option<Arc<Crypter>>,
     ) -> Self {
         let (work_tx, work_rx) = sync_channel::<(u32, Vec<u8>)>(capacity.max(1));
@@ -699,14 +698,15 @@ impl PackQueue {
                     };
                     let Ok((id, raw)) = job else { break };
                     let t0 = Instant::now();
-                    let out = compress_pack(raw, id, level, use_zstd, store, crypter.as_deref())
-                        .map(|(payload, raw_len, codec)| DonePack {
+                    let out = compress_pack(raw, id, level, policy, crypter.as_deref()).map(
+                        |(payload, raw_len, codec)| DonePack {
                             id,
                             payload,
                             raw_len,
                             codec,
                             nanos: t0.elapsed().as_nanos(),
-                        });
+                        },
+                    );
                     // A closed receiver means the writer is gone (an error elsewhere); stop quietly.
                     if tx.send(out).is_err() {
                         break;
@@ -824,12 +824,11 @@ fn compress_pack(
     raw: Vec<u8>,
     pack_id: u32,
     level: u32,
-    use_zstd: bool,
-    store: bool,
+    policy: PackPolicy,
     crypter: Option<&Crypter>,
 ) -> Result<(Vec<u8>, u32, u8)> {
     let raw_len = raw.len() as u32;
-    let (codec, plaintext) = pack_compress(raw, level, use_zstd, store)?;
+    let (codec, plaintext) = pack_compress(raw, level, policy)?;
     // Encrypt AFTER compression (compress-then-encrypt); AAD binds the pack to its id.
     let payload = match crypter {
         Some(cr) => cr.seal(&plaintext, &pack_id.to_le_bytes())?,
@@ -838,17 +837,37 @@ fn compress_pack(
     Ok((payload, raw_len, codec))
 }
 
+/// How hard to try on one pack. Three levels of effort rather than a pair of booleans, because the
+/// difference between them is intent -- what the user asked for -- not a pair of independent knobs.
+#[derive(Clone, Copy)]
+enum PackPolicy {
+    /// `--store`: never compress. Dedup still runs; "do not compress this" is not "do not notice I
+    /// gave you the same file twice".
+    Store,
+    /// One codec, one attempt, skipped entirely when a cheap sample says it will not shrink.
+    Single { zstd: bool },
+    /// `--best`: every codec, no sampling shortcut, smallest result wins.
+    Exhaustive,
+}
+
 /// Codec choice for one pack: zstd (fast, `zstd-c` build only) or XZ (default, best ratio). Returns
 /// `(codec, bytes)`; stores raw if compression didn't shrink it.
-fn pack_compress(raw: Vec<u8>, level: u32, use_zstd: bool, store: bool) -> Result<(u8, Vec<u8>)> {
-    // `--store` asked for no compression, so do none. This used to fall through to the codec and
-    // produce an archive byte-identical to the default at full XZ cost, because `--store` sets
-    // `format::Codec::None` -- the *stream wrapper* codec, which `.cram` never consults, since it
-    // compresses per pack rather than wrapping a stream. Measured on the mixed corpus: `--store`
-    // took 53.52 s and returned ratio 0.635, which is not storing anything.
-    if store {
-        return Ok((CODEC_STORE, raw));
+fn pack_compress(raw: Vec<u8>, level: u32, policy: PackPolicy) -> Result<(u8, Vec<u8>)> {
+    match policy {
+        // `--store` asked for no compression, so do none. This used to fall through to the codec
+        // and produce an archive byte-identical to the default at full XZ cost, because `--store`
+        // sets `format::Codec::None` -- the *stream wrapper* codec, which `.cram` never consults,
+        // since it compresses per pack rather than wrapping a stream.
+        PackPolicy::Store => Ok((CODEC_STORE, raw)),
+        PackPolicy::Single { zstd } => pack_compress_single(raw, level, zstd),
+        PackPolicy::Exhaustive => pack_compress_exhaustive(raw, level),
     }
+}
+
+/// One codec, one attempt, and a cheap up-front verdict that skips it entirely on data that will
+/// not shrink. This is the shape every level except `--best` wants: nearly all of the ratio for a
+/// small fraction of the time.
+fn pack_compress_single(raw: Vec<u8>, level: u32, use_zstd: bool) -> Result<(u8, Vec<u8>)> {
     #[cfg(feature = "zstd-c")]
     if use_zstd {
         let comp = zstd::bulk::compress(&raw, zstd_level(level))
@@ -874,15 +893,49 @@ fn pack_compress(raw: Vec<u8>, level: u32, use_zstd: bool, store: bool) -> Resul
     if crate::probe::spread_verdict(&raw).is_store() {
         return Ok((CODEC_STORE, raw));
     }
-
-    let mut w = XzWriter::new(Vec::new(), XzOptions::with_preset(level))?;
-    w.write_all(&raw)?;
-    let comp = w.finish()?;
-    Ok(if comp.len() < raw.len() {
-        (CODEC_XZ, comp)
-    } else {
-        (CODEC_STORE, raw)
+    Ok(match xz_compress(&raw, level)? {
+        Some(comp) => (CODEC_XZ, comp),
+        None => (CODEC_STORE, raw),
     })
+}
+
+/// `--best`: try everything, keep whichever is smallest, and do not care what it cost.
+///
+/// Two things the single-codec path gives up for speed, both of which `--best` should not:
+///
+/// The store verdict is a *sample*. Four windows decide the fate of a whole pack, and on a pack
+/// that mixes an incompressible file with a compressible one that guess can be wrong -- with the
+/// wrong answer costing real bytes rather than time. At `--best` there is no reason to guess:
+/// compress it and let the byte count decide.
+///
+/// And one codec is not always the smaller codec. XZ usually wins, which is why `--best` picks it,
+/// but not on every pack -- zstd's entropy stage takes some packs that LZMA's match finder does
+/// not. Running both and keeping the winner is by construction no worse than either alone, and it
+/// is what let `--best` stop losing to the default level on a mixed corpus.
+fn pack_compress_exhaustive(raw: Vec<u8>, level: u32) -> Result<(u8, Vec<u8>)> {
+    let mut best: Option<(u8, Vec<u8>)> = xz_compress(&raw, level)?.map(|c| (CODEC_XZ, c));
+
+    #[cfg(feature = "zstd-c")]
+    {
+        let floor = best.as_ref().map_or(raw.len(), |(_, c)| c.len());
+        let zc = zstd::bulk::compress(&raw, zstd_level(level))
+            .map_err(|e| ArchiveError::Backend(format!("zstd encode: {e}")))?;
+        if zc.len() < floor {
+            best = Some((CODEC_ZSTD, zc));
+        }
+    }
+    // Nothing beat leaving it alone, so leave it alone. A pack can never grow.
+    Ok(best.unwrap_or((CODEC_STORE, raw)))
+}
+
+/// XZ over a whole pack. `None` means it didn't shrink and the caller should store instead.
+/// Borrows rather than consuming so the exhaustive path can also hand the same bytes to zstd, and
+/// keep them, without a copy of the pack per attempt.
+fn xz_compress(raw: &[u8], level: u32) -> Result<Option<Vec<u8>>> {
+    let mut w = XzWriter::new(Vec::new(), XzOptions::with_preset(level))?;
+    w.write_all(raw)?;
+    let comp = w.finish()?;
+    Ok((comp.len() < raw.len()).then_some(comp))
 }
 
 impl CramArchiveWriter {
@@ -939,14 +992,17 @@ impl CramArchiveWriter {
         // means "no wrapper"; for `.cram`, which compresses per pack, nothing consulted it at all
         // and the flag did nothing. It now means what it says.
         let store_packs = matches!(opts.codec, Some(crate::format::Codec::None));
-        let queue = PackQueue::new(
-            slots,
-            slots,
-            preset(opts.level),
-            use_zstd,
-            store_packs,
-            crypter.clone(),
-        );
+        // `--best` means smallest, not fastest, so it runs every codec over every pack and skips
+        // the sampling shortcut entirely. `CRAM_FORCE_ZSTD` still pins it to one codec, since that
+        // knob exists precisely to measure zstd alone against XZ alone.
+        let policy = if store_packs {
+            PackPolicy::Store
+        } else if matches!(opts.level, Level::Best) && env_i32("CRAM_FORCE_ZSTD") != Some(1) {
+            PackPolicy::Exhaustive
+        } else {
+            PackPolicy::Single { zstd: use_zstd }
+        };
+        let queue = PackQueue::new(slots, slots, preset(opts.level), policy, crypter.clone());
         let prof = Prof {
             workers: slots,
             ..Prof::default()
@@ -2054,7 +2110,8 @@ mod tests {
     #[test]
     fn zstd_pack_compress_selects_codec_and_never_grows() {
         let compressible = b"the quick brown fox ".repeat(5000);
-        let (codec, comp) = pack_compress(compressible.clone(), 6, true, false).unwrap();
+        let (codec, comp) =
+            pack_compress(compressible.clone(), 6, PackPolicy::Single { zstd: true }).unwrap();
         assert_eq!(codec, CODEC_ZSTD, "zstd-c build uses the zstd pack codec");
         assert!(
             comp.len() < compressible.len(),
@@ -2070,12 +2127,63 @@ mod tests {
             x ^= x << 5;
             incompressible.push((x >> 24) as u8);
         }
-        let (codec2, comp2) = pack_compress(incompressible.clone(), 6, true, false).unwrap();
+        let (codec2, comp2) =
+            pack_compress(incompressible.clone(), 6, PackPolicy::Single { zstd: true }).unwrap();
         assert_eq!(
             codec2, CODEC_STORE,
             "incompressible pack is stored, not grown"
         );
         assert_eq!(comp2, incompressible);
+    }
+
+    /// `--best` must never come out larger than a cheaper level. It is the setting whose entire
+    /// purpose is to trade time for size, so a bigger archive than the default is a contradiction
+    /// -- and it was a real one: on a 5.15 GB mixed corpus `--best` returned 3,431,807,646 bytes
+    /// against the default level's 3,429,626,885, because it committed to XZ up front and trusted a
+    /// sampled store verdict over four windows.
+    ///
+    /// `Exhaustive` makes that impossible by construction rather than by measurement: it runs every
+    /// codec and takes the smallest, so it can only match or beat any single-codec path. This
+    /// asserts the property directly, on the mixed content that made the sampled verdict wrong.
+    #[test]
+    fn exhaustive_never_loses_to_a_single_codec() {
+        let mut x = 0x9e37_79b9u32;
+        let mut noise = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x >> 24) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let text = b"a line that repeats and repeats and therefore compresses\n".repeat(6000);
+
+        let mut mixed = noise(300_000);
+        mixed.extend_from_slice(&text);
+        mixed.extend(noise(300_000));
+        let mut tail_only = noise(700_000);
+        tail_only.extend_from_slice(&text[..40_000]);
+
+        for (tag, raw) in [
+            ("compressible", text.clone()),
+            ("incompressible", noise(400_000)),
+            ("mixed", mixed),
+            ("compressible tail", tail_only),
+        ] {
+            let best = pack_compress(raw.clone(), 9, PackPolicy::Exhaustive).unwrap();
+            assert!(best.1.len() <= raw.len(), "{tag}: --best grew the pack");
+            for zstd in [false, true] {
+                let single = pack_compress(raw.clone(), 9, PackPolicy::Single { zstd }).unwrap();
+                assert!(
+                    best.1.len() <= single.1.len(),
+                    "{tag}: --best produced {} bytes, a single codec (zstd={zstd}) produced {}",
+                    best.1.len(),
+                    single.1.len(),
+                );
+            }
+        }
     }
 
     fn tmp(bytes: &[u8]) -> PathBuf {
