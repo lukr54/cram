@@ -192,6 +192,30 @@ pub(crate) const CHUNK_AVG: u32 = 64 * 1024;
 pub(crate) const CHUNK_MAX: u32 = 256 * 1024;
 /// Flush a pack once its raw contents reach this size (it may overshoot by up to one chunk).
 const PACK_TARGET: usize = 8 * 1024 * 1024;
+
+/// The pack size this writer will actually use.
+///
+/// [`PACK_TARGET`] unless `CRAM_PACK_TARGET` (in MiB) says otherwise. The pack is the compressor's
+/// whole world, so this is the archive's match window: raising it is the only lever `.cram` has
+/// against a solid-block LZMA archive that can match across hundreds of megabytes. It is a tuning
+/// knob rather than a shipped rule because the trade is real in both directions — a larger pack is
+/// a coarser random-access unit for the mount and for selective extract, and fewer packs means less
+/// to fan out over.
+///
+/// **Clamped so a pack can never break the format.** §9 check 5 of `docs/CRAM_FORMAT.md` makes
+/// `raw_len <= 64 MiB` mandatory reader validation, and `cram-extract` enforces it separately, so an
+/// archive above that bound would be rejected as hostile by every conforming reader including our
+/// own. The ceiling here leaves a whole `CHUNK_MAX` of headroom for the overshoot.
+fn pack_target() -> usize {
+    let Some(raw) = std::env::var_os("CRAM_PACK_TARGET") else {
+        return PACK_TARGET;
+    };
+    let Some(mib) = raw.to_str().and_then(|s| s.trim().parse::<usize>().ok()) else {
+        return PACK_TARGET;
+    };
+    mib.saturating_mul(1024 * 1024)
+        .clamp(1024 * 1024, MAX_PACK_RAW - CHUNK_MAX as usize)
+}
 /// Defensive ceiling on a single pack's raw size when reading an untrusted archive (guards the
 /// decompression buffer against a corrupt/hostile `raw_len`). Comfortably above `PACK_TARGET`.
 const MAX_PACK_RAW: usize = 64 * 1024 * 1024;
@@ -214,8 +238,26 @@ const MAX_PACK_RAW: usize = 64 * 1024 * 1024;
 /// would re-open the amplification DoS, so the bound is kept.
 const RE_DECODE_FACTOR: u64 = 16;
 const MIN_DECOMP_BUDGET: u64 = 256 * 1024 * 1024;
-/// Total bytes of decompressed packs kept in the shared cross-worker cache (see [`PackCache`]).
+/// Floor on the bytes of decompressed packs kept in the shared cross-worker cache (see
+/// [`PackCache`]), and the exact figure for a default 8 MiB-pack archive: room for 32 of them.
 const PACK_CACHE_CAP: usize = 256 * 1024 * 1024;
+
+/// Size the decompressed-pack cache to the archive that was just opened.
+///
+/// A fixed byte cap is really a *pack* cap, and the two stop agreeing as soon as an archive is
+/// written with a larger pack target: 256 MiB holds thirty-two 8 MiB packs but only eight 32 MiB
+/// ones, against as many workers as the machine has threads. The read paths give one pack to one
+/// worker, so a cache too small to hold one per worker evicts packs that are still in use and they
+/// are decompressed again.
+///
+/// So keep the ratio the byte cap already implied -- room for 32 packs -- with the old constant as
+/// the floor, so a default archive caches exactly what it always did. The ceiling stops a
+/// pathological `raw_len` from making this the thing that exhausts memory.
+fn pack_cache_cap(packs: &[PackLoc]) -> usize {
+    const CEILING: usize = 1024 * 1024 * 1024;
+    let largest = packs.iter().map(|p| p.raw_len as usize).max().unwrap_or(0);
+    largest.saturating_mul(32).clamp(PACK_CACHE_CAP, CEILING)
+}
 
 /// Read-side pack accounting, printed when `CRAM_PROFILE` is set.
 ///
@@ -521,6 +563,9 @@ pub struct CramArchiveWriter {
     inflight: Option<JoinHandle<Result<CompressedBatch>>>,
     /// How many packs to compress in parallel per batch (bounds peak memory).
     batch: usize,
+    /// Raw bytes to accumulate before sealing a pack. Resolved once at construction rather than
+    /// read per chunk (see [`pack_target`]).
+    pack_target: usize,
     /// Use zstd for packs (a `zstd-c` build) instead of XZ. Reader decodes either via ruzstd/lzma.
     use_zstd: bool,
     start: Instant,
@@ -603,8 +648,10 @@ fn pack_compress(raw: Vec<u8>, level: u32, use_zstd: bool) -> Result<(u8, Vec<u8
     // cheap sample verdict (entropy + a fast-deflate trial) catches that up front and stores
     // immediately, turning an incompressible `.cram` create from LZMA-bound into read-bound. (Same
     // store-the-incompressible policy the zip/7z auto-codec already applies per entry.)
-    let sample = &raw[..raw.len().min(64 * 1024)];
-    if crate::probe::sample_verdict(sample).is_store() {
+    //
+    // Sampled ACROSS the pack, not from its head: a pack that only begins with high-entropy bytes
+    // was being stored whole, which cost 14 MB on one silesia pack. See `probe::spread_verdict`.
+    if crate::probe::spread_verdict(&raw).is_store() {
         return Ok((CODEC_STORE, raw));
     }
 
@@ -672,8 +719,9 @@ impl CramArchiveWriter {
             pending: Vec::new(),
             inflight: None,
             // Compress up to this many packs in parallel; clamped so peak memory stays bounded
-            // (~batch × PACK_TARGET of raw bytes buffered before a flush).
+            // (~batch × pack_target of raw bytes buffered before a flush).
             batch: rayon::current_num_threads().clamp(1, 16),
+            pack_target: pack_target(),
             // In a `zstd-c` build, use the fast C zstd for packs by default, but honor `--best` by
             // falling back to XZ's stronger ratio. A pure-Rust build always uses XZ (flag stays false).
             use_zstd: cfg!(feature = "zstd-c") && !matches!(opts.level, Level::Best),
@@ -724,7 +772,7 @@ impl CramArchiveWriter {
             self.chunks.push(loc);
             self.seen.insert(key, id);
             chunk_ids.push(id);
-            if self.pack_buf.len() >= PACK_TARGET {
+            if self.pack_buf.len() >= self.pack_target {
                 self.queue_pack();
                 if self.pending.len() >= self.batch {
                     self.flush_batch()?;
@@ -1321,13 +1369,13 @@ impl CramReader {
         Ok(Self {
             path: path.to_path_buf(),
             pack_locks: (0..packs.len()).map(|_| Mutex::new(())).collect(),
+            pack_cache: Mutex::new(PackCache::new(pack_cache_cap(&packs))),
             packs,
             chunks,
             entries,
             entry_chunks,
             entry_transforms,
             crypter,
-            pack_cache: Mutex::new(PackCache::new(PACK_CACHE_CAP)),
             budget,
             decompressed: AtomicU64::new(0),
             cursor: 0,
@@ -1395,6 +1443,26 @@ impl CramReader {
             "cache hits        {h:9}   {:.1}% of {} requests",
             (h as f64 / (h + d).max(1) as f64) * 100.0,
             h + d,
+        );
+        // How each pack was actually encoded. A pack the writer judged incompressible is kept raw,
+        // and pack sizing changes that judgement: on silesia a 16 MiB target produced an archive 26%
+        // larger than either 8 or 32 MiB, which a shift toward STORE would explain and nothing about
+        // window size would.
+        let (mut store, mut xz, mut zstd) = (0usize, 0usize, 0usize);
+        let mut store_raw = 0u64;
+        for p in &self.packs {
+            match p.codec {
+                CODEC_STORE => {
+                    store += 1;
+                    store_raw += p.raw_len as u64;
+                }
+                CODEC_XZ => xz += 1,
+                _ => zstd += 1,
+            }
+        }
+        eprintln!(
+            "pack codecs       store {store}, xz {xz}, zstd {zstd}   ({:.0} MiB stored raw)",
+            store_raw as f64 / (1024.0 * 1024.0),
         );
     }
 

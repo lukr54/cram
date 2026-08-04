@@ -203,6 +203,40 @@ pub fn ext_only_verdict(path: &Path) -> Option<Compressibility> {
 pub const PROBE_SAMPLE_BYTES: u64 = SAMPLE_BYTES;
 pub const PROBE_MIN_SAMPLE: u64 = MIN_SAMPLE;
 
+/// Windows [`spread_verdict`] examines across a buffer.
+const SPREAD_WINDOWS: usize = 4;
+
+/// Judge a whole in-memory buffer by sampling several windows spread across it, rather than
+/// trusting its head.
+///
+/// [`sample_verdict`] answers for exactly the bytes it is handed, and it is the caller who decides
+/// what those bytes stand for. Handing it a head sample and applying the answer to a multi-megabyte
+/// `.cram` pack was the mistake: a pack that merely *begins* with high-entropy bytes -- the tail of
+/// a JPEG, a run of already-compressed data -- was stored whole no matter how compressible the rest
+/// of it was. On silesia that stored one 16 MiB pack raw and cost 14 MB, an archive 26% larger than
+/// the same corpus at either 8 or 32 MiB packs. The head is 0.78% of an 8 MiB pack and 0.11% of a
+/// 56 MiB one, so the error grows with pack size while the evidence behind it does not.
+///
+/// Store only when **every** window agrees. The asymmetry is deliberate: guessing "compress" wrongly
+/// costs codec CPU once, during create, while guessing "store" wrongly costs the user bytes in an
+/// archive they keep. Total bytes examined are fixed, so this does not get more expensive as packs
+/// grow.
+pub fn spread_verdict(buf: &[u8]) -> Compressibility {
+    let win = SAMPLE_BYTES as usize;
+    // Small enough to read whole: judging all of it beats sampling part of it.
+    if buf.len() <= win * SPREAD_WINDOWS {
+        return sample_verdict(buf);
+    }
+    let stride = (buf.len() - win) / (SPREAD_WINDOWS - 1);
+    for k in 0..SPREAD_WINDOWS {
+        let start = k * stride;
+        if !sample_verdict(&buf[start..(start + win).min(buf.len())]).is_store() {
+            return Compressibility::Compress;
+        }
+    }
+    Compressibility::Store
+}
+
 pub fn classify_file(path: &Path, size: u64) -> Compressibility {
     if size == 0 {
         return Compressibility::Compress; // empty: store/compress are equivalent; keep it simple
@@ -294,6 +328,54 @@ mod tests {
         let data = noise(64 * 1024);
         assert!(shannon_bits(&data) >= HIGH_ENTROPY_BITS);
         assert_eq!(sample_verdict(&data), Compressibility::Store);
+    }
+
+    /// Text repeated to `len` bytes; compresses hard.
+    fn prose(len: usize) -> Vec<u8> {
+        let unit = b"the quick brown fox jumps over the lazy dog. ";
+        unit.iter().copied().cycle().take(len).collect()
+    }
+
+    /// A buffer that only *begins* with incompressible bytes must still be compressed.
+    ///
+    /// This is the bug that cost 14 MB: the `.cram` writer judged a whole pack from its first
+    /// 64 KiB, so a pack whose head happened to be the tail of already-compressed data was stored
+    /// raw however compressible its remaining megabytes were. The head is 0.78% of an 8 MiB pack.
+    #[test]
+    fn a_compressible_body_behind_an_incompressible_head_is_compressed() {
+        let mut buf = noise(128 * 1024);
+        buf.extend_from_slice(&prose(4 * 1024 * 1024));
+
+        // The head really does look incompressible, so this is the case that used to misfire.
+        assert_eq!(
+            sample_verdict(&buf[..64 * 1024]),
+            Compressibility::Store,
+            "the head is genuinely high-entropy"
+        );
+        assert_eq!(
+            spread_verdict(&buf),
+            Compressibility::Compress,
+            "one incompressible window must not condemn the whole buffer"
+        );
+    }
+
+    /// The saving the probe exists for must survive: a wholly incompressible buffer is still stored
+    /// rather than handed to LZMA to search it exhaustively for matches that are not there.
+    #[test]
+    fn wholly_incompressible_is_still_stored() {
+        assert_eq!(
+            spread_verdict(&noise(4 * 1024 * 1024)),
+            Compressibility::Store
+        );
+    }
+
+    /// And a buffer that turns incompressible only at the very end is compressed too, i.e. the
+    /// windows really are spread rather than clustered at the front.
+    #[test]
+    fn an_incompressible_tail_does_not_condemn_the_buffer() {
+        let mut buf = prose(4 * 1024 * 1024);
+        buf.extend_from_slice(&noise(128 * 1024));
+        assert_eq!(spread_verdict(&buf), Compressibility::Compress);
     }
 
     #[test]
