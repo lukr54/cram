@@ -993,6 +993,46 @@ pub fn classify(
     }
 }
 
+/// How many packs the `.cram` writer may have in flight at once, given the pack size it is writing.
+///
+/// This is the create path's memory knob, and the **only** one that may depend on the machine. Pack
+/// size is a property of the archive and must not: an unencrypted `.cram` is guaranteed
+/// byte-for-byte identical from the same inputs (see `tests/reproducible.rs`), which is what lets it
+/// be content-addressed, checked against a published hash, and signed. Deriving pack size from RAM
+/// would make the same folder compress differently on a laptop and a workstation, and would leave a
+/// small machine with a permanently worse archive that copying to a big machine could never undo.
+/// Batch has no such problem: it is invisible in the output, and was measured that way on the kernel
+/// tree at 32 MiB packs, where batches of 16, 8 and 4 all produced byte-identical archives while
+/// peak RSS fell 4952 -> 3251 -> 1734 MB.
+///
+/// The multiplier is empirical and deliberately conservative. A slot holds the raw pack waiting to
+/// be sealed, the copy the background compressor is working through, the compressed output, and the
+/// codec's own state; the three points above imply somewhere between 6.6x and 11.8x the pack size
+/// per slot, and they do not fit a clean line (freed memory the allocator has not returned inflates
+/// peak RSS at the top end). Taking the worst observed rather than fitting a curve is the honest
+/// reading, so 12x, and half of available RAM as the budget.
+pub fn create_batch(pack_bytes: usize, hw: &HwProfile) -> usize {
+    const SLOT_MULTIPLE: usize = 12;
+    // Ceiling regardless of RAM: past 16 the compressor stops being the wall (measured), and there
+    // is no point holding more packs than there are threads to compress them.
+    let ceiling = hw.logical.clamp(1, 16);
+    // `CRAM_BATCH` forces the value. This exists so the property the whole split rests on -- that
+    // batch cannot change the archive -- is testable on one machine, since batch is otherwise a
+    // function of installed RAM and there is no other way to vary it in a test.
+    if let Some(n) = std::env::var_os("CRAM_BATCH")
+        .and_then(|v| v.to_str()?.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n.min(64);
+    }
+    if hw.ram_avail == 0 {
+        return ceiling; // couldn't read memory; behave exactly as before rather than guess low
+    }
+    let budget = hw.ram_avail / 2;
+    let per_slot = (pack_bytes * SLOT_MULTIPLE).max(1) as u64;
+    ((budget / per_slot) as usize).clamp(1, ceiling)
+}
+
 /// Approx. per-thread compressor memory (MiB), the LZMA/xz RAM trap. zstd is far cheaper.
 fn codec_mem_per_thread_mib(codec: Codec) -> f64 {
     match codec {

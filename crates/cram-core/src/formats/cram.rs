@@ -50,6 +50,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{ArchiveError, Result};
 use crate::format::Format;
+use crate::hw::{self, HwProfile};
 use crate::model::{Entry, EntryKind, EntryPath};
 use crate::reader::{ArchiveReader, EntryStream, RandomAccessReader};
 use crate::secret::{PasswordProvider, PasswordRequest};
@@ -190,34 +191,60 @@ impl Crypter {
 pub(crate) const CHUNK_MIN: u32 = 16 * 1024;
 pub(crate) const CHUNK_AVG: u32 = 64 * 1024;
 pub(crate) const CHUNK_MAX: u32 = 256 * 1024;
-/// Flush a pack once its raw contents reach this size (it may overshoot by up to one chunk).
-const PACK_TARGET: usize = 8 * 1024 * 1024;
-
-/// The pack size this writer will actually use.
+/// The pack size this writer will use, chosen by **effort level and nothing else**. A pack is
+/// flushed once its raw contents reach this size, so it may overshoot by up to one chunk.
 ///
-/// [`PACK_TARGET`] unless `CRAM_PACK_TARGET` (in MiB) says otherwise. The pack is the compressor's
-/// whole world, so this is the archive's match window: raising it is the only lever `.cram` has
-/// against a solid-block LZMA archive that can match across hundreds of megabytes. It is a tuning
-/// knob rather than a shipped rule because the trade is real in both directions — a larger pack is
-/// a coarser random-access unit for the mount and for selective extract, and fewer packs means less
-/// to fan out over.
+/// The pack is the compressor's whole world, so it is the archive's match window, and raising it is
+/// the only lever `.cram` has against a solid-block LZMA archive that matches across hundreds of
+/// megabytes. Measured on the kernel tree at `--best`, 8 -> 32 MiB takes the archive from 172.37 MB
+/// to 164.61 MB, which is smaller than `7z -mx=5` produces, and drives pack decodes to exactly 1.00
+/// per pack so verify and extract roughly triple in speed.
+///
+/// **Level, not hardware.** This value shapes the bytes on disk, and an unencrypted `.cram` is
+/// guaranteed byte-for-byte identical from the same inputs (`tests/reproducible.rs`) so that it can
+/// be content-addressed, checked against a published hash, and signed. Deriving it from the
+/// machine's RAM would break that, and would leave a small machine with a permanently worse archive
+/// no amount of later copying could improve. The machine's constraint is answered by
+/// [`hw::create_batch`], which decides how many of these are in flight at once and provably does not
+/// change the output.
+///
+/// The curve flattens here: past 32 MiB, ratio gains fall to 1.5% while create costs 18% more time
+/// and 58% more memory, verify stops improving, and extract gets *worse* as too few packs balance
+/// unevenly across the workers. `Best` therefore stops at 32 rather than running to the format's
+/// limit.
+fn pack_target_for(level: Level) -> usize {
+    const MIB: usize = 1024 * 1024;
+    if let Some(v) = pack_target_override() {
+        return v;
+    }
+    match level {
+        // Speed is the whole point; a bigger window buys ratio these levels did not ask for.
+        Level::Fastest => 8 * MIB,
+        Level::Auto | Level::Balanced | Level::Explicit(_) => 16 * MIB,
+        Level::Best => 32 * MIB,
+    }
+}
+
+/// `CRAM_PACK_TARGET` (in MiB), for sweeping the choice above without a rebuild.
 ///
 /// **Clamped so a pack can never break the format.** §9 check 5 of `docs/CRAM_FORMAT.md` makes
 /// `raw_len <= 64 MiB` mandatory reader validation, and `cram-extract` enforces it separately, so an
 /// archive above that bound would be rejected as hostile by every conforming reader including our
-/// own. The ceiling here leaves a whole `CHUNK_MAX` of headroom for the overshoot.
-fn pack_target() -> usize {
-    let Some(raw) = std::env::var_os("CRAM_PACK_TARGET") else {
-        return PACK_TARGET;
-    };
-    let Some(mib) = raw.to_str().and_then(|s| s.trim().parse::<usize>().ok()) else {
-        return PACK_TARGET;
-    };
-    mib.saturating_mul(1024 * 1024)
-        .clamp(1024 * 1024, MAX_PACK_RAW - CHUNK_MAX as usize)
+/// own. The ceiling leaves a whole `CHUNK_MAX` of headroom for the one-chunk overshoot.
+fn pack_target_override() -> Option<usize> {
+    let mib = std::env::var_os("CRAM_PACK_TARGET")?
+        .to_str()?
+        .trim()
+        .parse::<usize>()
+        .ok()?;
+    Some(
+        mib.saturating_mul(1024 * 1024)
+            .clamp(1024 * 1024, MAX_PACK_RAW - CHUNK_MAX as usize),
+    )
 }
 /// Defensive ceiling on a single pack's raw size when reading an untrusted archive (guards the
-/// decompression buffer against a corrupt/hostile `raw_len`). Comfortably above `PACK_TARGET`.
+/// decompression buffer against a corrupt/hostile `raw_len`). This is the format's bound, not a
+/// tuning choice: see `docs/CRAM_FORMAT.md` §9 check 5.
 const MAX_PACK_RAW: usize = 64 * 1024 * 1024;
 /// Anti-amplification: total decompression WORK for a whole extraction may be at most
 /// `max(MIN_DECOMP_BUDGET, RE_DECODE_FACTOR × total_output)`, where `total_output` is the sum of the
@@ -253,10 +280,25 @@ const PACK_CACHE_CAP: usize = 256 * 1024 * 1024;
 /// So keep the ratio the byte cap already implied -- room for 32 packs -- with the old constant as
 /// the floor, so a default archive caches exactly what it always did. The ceiling stops a
 /// pathological `raw_len` from making this the thing that exhausts memory.
+/// The ceiling is the machine's rather than a constant: a quarter of available RAM, capped at 1 GiB.
+/// That is the read-side half of the principle the writer follows, where the archive's shape is
+/// fixed by the level that made it and only the memory spent handling it bends to the hardware. A
+/// 4 GB machine reading a 32 MiB-pack archive caches less and re-decodes a little more; it still
+/// reads the archive, and it reads exactly the same archive a large machine does.
 fn pack_cache_cap(packs: &[PackLoc]) -> usize {
     const CEILING: usize = 1024 * 1024 * 1024;
     let largest = packs.iter().map(|p| p.raw_len as usize).max().unwrap_or(0);
-    largest.saturating_mul(32).clamp(PACK_CACHE_CAP, CEILING)
+    let ram_avail = HwProfile::detect().ram_avail;
+    // A machine that will not report its memory keeps the old fixed ceiling rather than a guess.
+    let ceiling = if ram_avail > 0 {
+        ((ram_avail / 4) as usize).min(CEILING)
+    } else {
+        CEILING
+    };
+    // Room for one pack always wins: a cache too small to hold the pack being decoded would make
+    // every single entry a fresh decompression.
+    let floor = PACK_CACHE_CAP.min(ceiling).max(largest);
+    largest.saturating_mul(32).clamp(floor, ceiling.max(floor))
 }
 
 /// Read-side pack accounting, printed when `CRAM_PROFILE` is set.
@@ -701,6 +743,11 @@ impl CramArchiveWriter {
             }
         };
 
+        // Two separate questions, deliberately answered by two separate inputs: how big a pack is
+        // (the archive's match window, decided by the level the user asked for) and how many are in
+        // flight (this machine's memory, invisible in the output).
+        let pack_target = pack_target_for(opts.level);
+
         Ok(Self {
             out,
             pos,
@@ -718,10 +765,12 @@ impl CramArchiveWriter {
             next_pack_id: 0,
             pending: Vec::new(),
             inflight: None,
-            // Compress up to this many packs in parallel; clamped so peak memory stays bounded
-            // (~batch × pack_target of raw bytes buffered before a flush).
-            batch: rayon::current_num_threads().clamp(1, 16),
-            pack_target: pack_target(),
+            // How many packs compress in parallel. This is the create path's memory knob and the
+            // only setting here allowed to depend on the machine, because it is invisible in the
+            // output: batches of 16, 8 and 4 produce byte-identical archives while peak RSS falls
+            // from 4952 to 1734 MB.
+            batch: hw::create_batch(pack_target, &HwProfile::detect()),
+            pack_target,
             // In a `zstd-c` build, use the fast C zstd for packs by default, but honor `--best` by
             // falling back to XZ's stronger ratio. A pure-Rust build always uses XZ (flag stays false).
             use_zstd: cfg!(feature = "zstd-c") && !matches!(opts.level, Level::Best),
@@ -814,7 +863,8 @@ impl CramArchiveWriter {
     /// threads doing nothing. Neither phase overlapped the other and the total was their sum.
     ///
     /// Peak raw memory doubles as a result -- one batch in flight while the next fills, so
-    /// `2 x batch x PACK_TARGET` rather than one. That is the price of the overlap and it is bounded.
+    /// `2 x batch x pack_target` rather than one. That is the price of the overlap, it is bounded, and
+    /// `hw::create_batch` sizes `batch` so the product fits the machine.
     ///
     /// The archive is unchanged byte for byte. Ids are assigned in `queue_pack`, each batch is
     /// contiguous in id space, batch N is written before batch N+1 is spawned, and

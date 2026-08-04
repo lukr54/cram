@@ -120,18 +120,22 @@ fn unencrypted_cram_is_byte_identical_across_paths_and_runs() {
     let _ = fs::remove_dir_all(&dir_b);
 }
 
-/// exercises the MULTI-PACK parallel-compression path: > 16 MiB of INCOMPRESSIBLE data so
-/// the writer crosses the ~8 MiB raw pack boundary twice (≥ 2 packs) and `flush_batch` runs on
-/// multi-element batches, and so the archive is large (STORE codec); proving the size is real
-/// multi-pack, not a compression artifact. Two builds must be byte-identical; this is what would catch
-/// a regression making pack write-order depend on thread/batch completion order.
+/// exercises the MULTI-PACK parallel-compression path: 36 MB of INCOMPRESSIBLE data so the writer
+/// crosses the raw pack boundary several times and `flush_batch` runs on multi-element batches. Two
+/// builds must be byte-identical; this is what would catch a regression making pack write-order
+/// depend on thread/batch completion order.
 ///
-/// Marked `#[ignore]` because it feeds > 16 MiB through the pure-Rust XZ compressor, which is ~15×
-/// slower in a debug build (tens of seconds), too slow for the default `cargo test` gate. Run it
-/// explicitly with `cargo test -- --ignored`. (The same property was also verified directly against a
-/// release build: two independent builds of 18 MiB of random data hash-identically.)
+/// The pack count is asserted **directly**, from the reader, rather than inferred from the archive
+/// being bigger than some multiple of the pack size. That proxy was silently invalidated the moment
+/// the default pack target moved from 8 to 16 MiB: an 18 MB fixture went from three packs to two,
+/// and the `> 12 MiB` size check it rested on would have passed just as happily on a single 16 MiB
+/// pack. A test that names a property should assert that property.
+///
+/// Marked `#[ignore]` for the cost of generating and chunking 36 MB twice, which is slow in a debug
+/// build, not for the compressor: the fixture is incompressible, so the probe stores each pack raw
+/// and XZ is never entered. Run it with `cargo test -- --ignored`.
 #[test]
-#[ignore = "heavy: >16 MiB through XZ; run with --ignored"]
+#[ignore = "heavy: 36 MB fixture; run with --ignored"]
 fn unencrypted_multipack_build_is_byte_identical() {
     let dir = scratch("mp");
     let proj = dir.join("proj");
@@ -139,9 +143,9 @@ fn unencrypted_multipack_build_is_byte_identical() {
     for f in 0..6u32 {
         // Deterministic xorshift byte stream, incompressible, so each pack is stored raw and the
         // archive is ~= the input size (a genuine multi-pack layout, not a heavily-compressed blob).
-        let mut v = Vec::with_capacity(3_000_000);
+        let mut v = Vec::with_capacity(6_000_000);
         let mut x = 0x9E37_79B9u32 ^ f.wrapping_mul(0x0100_0193);
-        for _ in 0..3_000_000 {
+        for _ in 0..6_000_000 {
             x ^= x << 13;
             x ^= x >> 17;
             x ^= x << 5;
@@ -155,8 +159,23 @@ fn unencrypted_multipack_build_is_byte_identical() {
     create_cram(&proj, &a, CreateOptions::default());
     create_cram(&proj, &b, CreateOptions::default());
     let (ba, bb) = (fs::read(&a).unwrap(), fs::read(&b).unwrap());
-    // Incompressible input ⇒ the archive is far bigger than one 8 MiB pack ⇒ multi-pack.
-    assert!(ba.len() > 12 * 1024 * 1024, "archive spans multiple packs");
+    // Ask the archive how many packs it has rather than guessing from its size.
+    let reader = cram_core::formats::open(
+        &a,
+        Format::cram(Codec::None),
+        std::sync::Arc::new(cram_core::secret::NoPassword),
+    )
+    .unwrap();
+    let packs = reader
+        .as_random_access()
+        .expect("cram is random-access")
+        .decode_units()
+        .expect("cram reports its pack count");
+    drop(reader);
+    assert!(
+        packs >= 2,
+        "fixture must span several packs to exercise multi-element batches, got {packs}"
+    );
     assert_eq!(
         ba, bb,
         "multi-pack builds must be byte-identical (order-preserving parallel compression)"
