@@ -436,6 +436,50 @@ close to one per boundary. Closing it needs either a larger `PACK_CACHE_CAP` (pe
 2.2 GB at `--best`, which is the XZ dictionary per worker rather than the cache) or grouping a
 straddling entry by every pack it touches. Worth perhaps 20-30% of the remaining decode CPU.
 
+## 14. Pack size is the match window. 32 MiB is the knee, and the spec caps it anyway
+
+`.cram` compresses each pack independently, so the pack **is** the archive's match window. 8 MiB of
+context against LZMA's whole-archive solid block is why `7z -mx=5` beat `--best` on the kernel tree
+on both axes at once, the only cell in `BENCHMARKS.md` where a competitor dominated outright.
+
+Swept with `CRAM_PACK_TARGET`, linux tree, `--best`, 24 threads:
+
+| pack | output | create | create RSS | verify | extract | packs | decodes/pack |
+|---|---|---|---|---|---|---|---|
+| 8 MiB | 172.37 MB | 47.28 s | 2431 MB | 4.41 s | 7.49 s | 186 | 1.47 |
+| 16 MiB | 167.90 MB | 49.33 s | 3550 MB | 2.55 s | 4.38 s | 94 | 1.33 |
+| **32 MiB** | **164.61 MB** | 53.83 s | 4870 MB | **1.30 s** | **2.94 s** | 47 | **1.00** |
+| 56 MiB | 162.09 MB | 63.48 s | 7715 MB | 1.31 s | 3.45 s | 27 | 1.00 |
+| *7z -mx=5* | *165.23 MB* | *40.93 s* | *5828 MB* | *1.08 s* | — | — | — |
+
+**32 MiB is the knee on every axis simultaneously**, which was not the expected shape. Ratio gains
+fall to 1.5% past it, create costs 18% more time and 58% more memory, verify stops improving
+(1.31 s against 1.30 s), and extract gets *worse* (3.45 s against 2.94 s) because 27 packs across 24
+workers balances less evenly than 47 do. The read-side was expected to keep improving with fewer,
+larger packs and it does not.
+
+At 32 MiB `--best` produces a **smaller archive than `7z -mx=5`** (164.61 MB against 165.23 MB) using
+16% less memory, for 31% more create time. Neither dominates the other any more, and cram takes two
+of the four frontier points at the high-ratio end where it previously held none.
+
+It also drives decodes-per-pack to exactly 1.00, closing the straddling-entry residue from §13 as a
+side effect: eight times fewer pack boundaries.
+
+**No format change is justified.** The spec caps a pack's decompressed size at 64 MiB (§9 check 5,
+enforced independently by `cram-extract`), so 56 MiB is the largest legal target once the one-chunk
+overshoot is allowed for. Since the curve has already flattened at 32 MiB, that ceiling is not
+binding and a v2 bump buys nothing. The question is closed rather than deferred.
+
+**Not shipped as a default.** The knob exists; `PACK_TARGET` is still 8 MiB. Doubling create memory
+to ~4.9 GB is a real cost on a 16 GB machine and that trade belongs to the product, not to this
+document.
+
+**The `--auto` arm of this sweep was invalid** and is not reported above: the dev-box build lacked
+the `zstd-c` feature, so "auto" ran XZ preset 6 rather than the zstd path that ships. The `--best`
+rows are unaffected, and were confirmed byte-identical across two independent runs. Auto still needs
+measuring with the feature enabled, and it matters more than `--best` does, being what anyone gets
+without passing a flag.
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for
