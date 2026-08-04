@@ -31,11 +31,12 @@
 //! too (the listing needs the password), the ContentsOnly/NamesToo split isn't exposed yet. A ProjFS
 //! mount builds on `read_range`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -45,7 +46,6 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use fastcdc::v2020::StreamCDC;
 use lzma_rust2::{XzOptions, XzReader, XzWriter};
-use rayon::prelude::*;
 use zeroize::Zeroizing;
 
 use crate::error::{ArchiveError, Result};
@@ -591,8 +591,6 @@ pub struct CramArchiveWriter {
     out: BufWriter<File>,
     /// Bytes written so far = current file offset (header is written up front).
     pos: u64,
-    /// XZ preset for pack compression.
-    level: u32,
     /// Dedup table: BLAKE3 chunk hash → chunk id.
     seen: HashMap<[u8; 32], u32>,
     packs: Vec<PackLoc>,
@@ -615,19 +613,12 @@ pub struct CramArchiveWriter {
     crypter: Option<Arc<Crypter>>,
     /// Id the currently-filling `pack_buf` will get (chunks reference this before the pack is written).
     next_pack_id: u32,
-    /// Filled raw packs `(id, bytes)` awaiting a parallel-compression batch flush.
-    pending: Vec<(u32, Vec<u8>)>,
-    /// The previous batch, compressing on a background thread while this one fills. Joined at the
-    /// next batch boundary and at `finish`, so its packs are always written before the batch after
-    /// it is even started -- `packs` therefore still grows strictly in id order.
-    inflight: Option<JoinHandle<Result<(CompressedBatch, BatchStat)>>>,
-    /// How many packs to compress in parallel per batch (bounds peak memory).
-    batch: usize,
+    /// The compressors, running continuously. Sealed packs go in as they are produced and come back
+    /// out strictly in id order, with no batch boundary in between (see [`PackQueue`]).
+    queue: PackQueue,
     /// Raw bytes to accumulate before sealing a pack. Resolved once at construction rather than
     /// read per chunk (see [`pack_target`]).
     pack_target: usize,
-    /// Use zstd for packs (a `zstd-c` build) instead of XZ. Reader decodes either via ruzstd/lzma.
-    use_zstd: bool,
     start: Instant,
     /// Phase accounting, printed at `finish` only when `CRAM_PROFILE` is set in the environment.
     /// The create path alternates between a serial chunk phase and a parallel compress phase, and
@@ -641,24 +632,159 @@ pub struct CramArchiveWriter {
 /// Serial-vs-parallel accounting for one create. Nanoseconds, so a whole run cannot overflow.
 /// One compressed pack as the compressor hands it back: `(payload, raw_len, codec)`.
 type CompressedPack = (Vec<u8>, u32, u8);
-/// A whole batch of them, still in pack-id order.
-type CompressedBatch = Vec<CompressedPack>;
+/// One pack as a worker hands it back, with what it cost to produce.
+struct DonePack {
+    id: u32,
+    payload: Vec<u8>,
+    raw_len: u32,
+    codec: u8,
+    nanos: u128,
+}
 
-/// What one batch of packs cost, measured from inside the background compressor.
+/// The pack compressor: a fixed set of worker threads pulling from one bounded queue, with no batch
+/// boundary anywhere.
 ///
-/// A batch ends at a barrier -- `into_par_iter().collect()` returns only once its slowest pack is
-/// done -- so any core that finished early sits idle until then. `wall x lanes - busy` is exactly
-/// that waste, in core-time, and it is the number that says whether the barrier is worth removing.
-#[derive(Clone, Copy, Default)]
-struct BatchStat {
-    packs: usize,
-    /// Handoff to last-pack-done. The barrier's own length.
-    wall_nanos: u128,
-    /// Sum of the per-pack compress times: real work, ignoring how it was scheduled.
-    busy_nanos: u128,
-    /// The straggler every other core waits for.
-    slowest_nanos: u128,
-    fastest_nanos: u128,
+/// Packs used to compress a batch at a time under `into_par_iter().collect()`, which is a barrier --
+/// the batch ends only when its slowest pack does. Packs are equal in raw size and unequal in
+/// compress time (6.9 s against 18.9 s inside a single batch on the kernel tree), so a worker that
+/// drew an easy pack idled until the straggler landed: 196 core-seconds of it, about a fifth of the
+/// pool's time. Which batch size won was also an accident of arithmetic rather than a property of
+/// the machine -- 47 packs split 24+23 beat both 20+20+7 and 32+15 on the same corpus at identical
+/// output bytes, because a short final batch leaves most of the pool with nothing to do.
+///
+/// A queue has no such quantisation: a worker that finishes early takes the next pack immediately,
+/// and the only idle left is at the very end of the job.
+///
+/// **The archive does not change.** Ids are assigned in `queue_pack` in chunk order, and packs leave
+/// through `pop_in_order` strictly by id out of a reorder buffer, so completion order -- the one
+/// thing scheduling actually varies -- never reaches the file. `tests/batch_invariance.rs` is what
+/// holds this down.
+struct PackQueue {
+    /// Bounded, so a chunker that outruns the compressors blocks rather than buffering the whole
+    /// archive into memory. This is the cap on raw packs in flight, and with it the cap on `ready`:
+    /// at most `capacity + workers` packs can be outstanding, so neither can grow without limit.
+    work: Option<SyncSender<(u32, Vec<u8>)>>,
+    done: Receiver<Result<DonePack>>,
+    workers: Vec<JoinHandle<()>>,
+    /// Packs that finished ahead of their turn, waiting on the ids in front of them.
+    ready: BTreeMap<u32, CompressedPack>,
+    /// The next id the file expects.
+    next_write: u32,
+}
+
+impl PackQueue {
+    fn new(
+        workers: usize,
+        capacity: usize,
+        level: u32,
+        use_zstd: bool,
+        crypter: Option<Arc<Crypter>>,
+    ) -> Self {
+        let (work_tx, work_rx) = sync_channel::<(u32, Vec<u8>)>(capacity.max(1));
+        let (done_tx, done_rx) = sync_channel::<Result<DonePack>>(capacity.max(1) + workers);
+        // One receiver shared by every worker. Contention is a lock per pack against a pack that
+        // takes whole seconds to compress, so it never shows up.
+        let work_rx = Arc::new(Mutex::new(work_rx));
+
+        let handles = (0..workers.max(1))
+            .map(|_| {
+                let rx = Arc::clone(&work_rx);
+                let tx = done_tx.clone();
+                let crypter = crypter.clone();
+                std::thread::spawn(move || loop {
+                    let job = {
+                        let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.recv()
+                    };
+                    let Ok((id, raw)) = job else { break };
+                    let t0 = Instant::now();
+                    let out = compress_pack(raw, id, level, use_zstd, crypter.as_deref()).map(
+                        |(payload, raw_len, codec)| DonePack {
+                            id,
+                            payload,
+                            raw_len,
+                            codec,
+                            nanos: t0.elapsed().as_nanos(),
+                        },
+                    );
+                    // A closed receiver means the writer is gone (an error elsewhere); stop quietly.
+                    if tx.send(out).is_err() {
+                        break;
+                    }
+                })
+            })
+            .collect();
+
+        Self {
+            work: Some(work_tx),
+            done: done_rx,
+            workers: handles,
+            ready: BTreeMap::new(),
+            next_write: 0,
+        }
+    }
+
+    /// Hand a raw pack over, blocking while the queue is full. Blocking here is the backpressure
+    /// that bounds memory, and the time spent in it is the chunker waiting on the compressors.
+    fn send(&mut self, id: u32, raw: Vec<u8>) -> Result<()> {
+        let Some(tx) = self.work.as_ref() else {
+            return Err(ArchiveError::Backend("pack queue already closed".into()));
+        };
+        // Try first so the common case never touches the clock, then fall back to a blocking send.
+        match tx.try_send((id, raw)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full((id, raw))) => tx
+                .send((id, raw))
+                .map_err(|_| ArchiveError::Backend("pack compression workers died".into())),
+            Err(TrySendError::Disconnected(_)) => Err(ArchiveError::Backend(
+                "pack compression workers died".into(),
+            )),
+        }
+    }
+
+    /// Absorb every completion that is already waiting, without blocking.
+    fn collect_available(&mut self, prof: &mut Prof) -> Result<()> {
+        while let Ok(done) = self.done.try_recv() {
+            self.absorb(done?, prof);
+        }
+        Ok(())
+    }
+
+    /// Block for one completion. `Ok(false)` means every worker has finished and hung up.
+    fn collect_one(&mut self, prof: &mut Prof) -> Result<bool> {
+        match self.done.recv() {
+            Ok(done) => {
+                self.absorb(done?, prof);
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn absorb(&mut self, d: DonePack, prof: &mut Prof) {
+        prof.pack_nanos.push(d.nanos);
+        prof.last_complete = Some(Instant::now());
+        self.ready.insert(d.id, (d.payload, d.raw_len, d.codec));
+    }
+
+    /// The next pack in file order, if it has arrived. Returning owned bytes keeps the borrow off
+    /// the writer, which needs `&mut self` to write them.
+    fn pop_in_order(&mut self) -> Option<CompressedPack> {
+        let out = self.ready.remove(&self.next_write)?;
+        self.next_write += 1;
+        Some(out)
+    }
+
+    /// Stop accepting work. Workers drain what is queued, then exit on the closed channel.
+    fn close(&mut self) {
+        self.work = None;
+    }
+
+    fn join(&mut self) {
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -669,20 +795,26 @@ struct Prof {
     read_cdc_nanos: u128,
     /// BLAKE3 over chunk bodies.
     hash_nanos: u128,
-    /// Wall time inside `flush_batch`: draining the previous batch plus handing off this one.
+    /// Writing completed packs out in id order, on the chunking thread.
     flush_nanos: u128,
-    /// The part of `flush_nanos` spent blocked on the background compressor. This is the number
-    /// that matters after overlapping -- it is the chunker standing still, and it should fall to
-    /// near zero whenever compression finishes before the next batch fills.
+    /// The part of `flush_nanos` spent standing still: backpressure on a full work queue, plus
+    /// blocking waits for a pack the file needs next. Near zero means the compressors keep up.
     drain_nanos: u128,
-    flushes: u64,
+    /// How many times the chunker had to block rather than find the work already done.
+    stalls: u64,
     chunks: u64,
     dedup_hits: u64,
     /// Serialising the index and writing it, at `finish`. Grows with entry and chunk count rather
     /// than with bytes, so it is the tail a many-small-files corpus pays.
     index_nanos: u128,
-    /// One entry per batch that reached the compressor. Diagnostic only.
-    batches: Vec<BatchStat>,
+    /// Every pack's compress time. The spread across these is what made the old batch barrier
+    /// expensive, and it is worth watching whether the queue actually absorbs it.
+    pack_nanos: Vec<u128>,
+    /// First pack handed to a worker, and the last one handed back: the compress phase's wall.
+    first_dispatch: Option<Instant>,
+    last_complete: Option<Instant>,
+    /// How many workers were running, so idle core-time can be read off the two above.
+    workers: usize,
 }
 
 /// Compress (and, when encrypting, seal) one pack's raw bytes into its on-disk payload. Pure and
@@ -784,11 +916,25 @@ impl CramArchiveWriter {
         // (the archive's match window, decided by the level the user asked for) and how many are in
         // flight (this machine's memory, invisible in the output).
         let pack_target = pack_target_for(opts.level);
+        // One worker per slot the machine can afford, and the same number again queued behind them,
+        // so the outstanding-pack ceiling matches what the old two-batch scheme held.
+        let slots = hw::create_batch(pack_target, &HwProfile::detect());
+        // In a `zstd-c` build, use the fast C zstd for packs by default, but honor `--best` by
+        // falling back to XZ's stronger ratio. A pure-Rust build always uses XZ (flag stays false).
+        // `CRAM_FORCE_ZSTD=1` overrides that, to test whether zstd at --ultra over a 32 MiB pack
+        // lands near XZ's size for a fraction of the encode time -- a different point on the
+        // frontier rather than a cheaper route to the same one.
+        let use_zstd = cfg!(feature = "zstd-c")
+            && (!matches!(opts.level, Level::Best) || env_i32("CRAM_FORCE_ZSTD") == Some(1));
+        let queue = PackQueue::new(slots, slots, preset(opts.level), use_zstd, crypter.clone());
+        let prof = Prof {
+            workers: slots,
+            ..Prof::default()
+        };
 
         Ok(Self {
             out,
             pos,
-            level: preset(opts.level),
             seen: HashMap::new(),
             packs: Vec::new(),
             chunks: Vec::new(),
@@ -800,23 +946,10 @@ impl CramArchiveWriter {
             used_transform: false,
             crypter,
             next_pack_id: 0,
-            pending: Vec::new(),
-            inflight: None,
-            // How many packs compress in parallel. This is the create path's memory knob and the
-            // only setting here allowed to depend on the machine, because it is invisible in the
-            // output: batches of 16, 8 and 4 produce byte-identical archives while peak RSS falls
-            // from 4952 to 1734 MB.
-            batch: hw::create_batch(pack_target, &HwProfile::detect()),
+            queue,
             pack_target,
-            // In a `zstd-c` build, use the fast C zstd for packs by default, but honor `--best` by
-            // falling back to XZ's stronger ratio. A pure-Rust build always uses XZ (flag stays false).
-            // `--best` picks XZ for its ratio. `CRAM_FORCE_ZSTD=1` overrides that, to test whether
-            // zstd at --ultra over a 32 MiB pack lands near XZ's size for a fraction of the encode
-            // time -- a different point on the frontier rather than a cheaper route to the same one.
-            use_zstd: cfg!(feature = "zstd-c")
-                && (!matches!(opts.level, Level::Best) || env_i32("CRAM_FORCE_ZSTD") == Some(1)),
             start: Instant::now(),
-            prof: Prof::default(),
+            prof,
         })
     }
 
@@ -833,6 +966,7 @@ impl CramArchiveWriter {
         // and guessing between them is what this exists to avoid.
         let stream_t0 = Instant::now();
         let flush_at_entry = self.prof.flush_nanos;
+        let drain_at_entry = self.prof.drain_nanos;
         loop {
             let cdc_t0 = Instant::now();
             let next = chunker.next();
@@ -863,19 +997,16 @@ impl CramArchiveWriter {
             self.seen.insert(key, id);
             chunk_ids.push(id);
             if self.pack_buf.len() >= self.pack_target {
-                self.queue_pack();
-                if self.pending.len() >= self.batch {
-                    self.flush_batch()?;
-                }
+                self.queue_pack()?;
             }
         }
-        // Serial time for this stream: everything above minus whatever the flush barrier consumed
-        // while nested inside it. Subtracting is what makes `chunk_nanos` and `flush_nanos` add up
-        // to the wall clock instead of double-counting the barrier.
-        self.prof.chunk_nanos += stream_t0
-            .elapsed()
-            .as_nanos()
-            .saturating_sub(self.prof.flush_nanos.saturating_sub(flush_at_entry));
+        // Serial time for this stream: everything above, minus the pack handling nested inside it.
+        // Both parts have to come out -- writing packs out, and blocking on a full queue -- or
+        // `chunk_nanos` absorbs the wait and reads as though FastCDC had got slower, which is
+        // exactly how a 3.1 s chunk phase first appeared as 26.7 s.
+        let nested = self.prof.flush_nanos.saturating_sub(flush_at_entry)
+            + self.prof.drain_nanos.saturating_sub(drain_at_entry);
+        self.prof.chunk_nanos += stream_t0.elapsed().as_nanos().saturating_sub(nested);
         Ok((chunk_ids, size))
     }
 
@@ -886,87 +1017,44 @@ impl CramArchiveWriter {
     }
 
     /// Move the filled `pack_buf` into the pending batch under its id.
-    fn queue_pack(&mut self) {
+    fn queue_pack(&mut self) -> Result<()> {
         if self.pack_buf.is_empty() {
-            return;
-        }
-        self.pending
-            .push((self.next_pack_id, std::mem::take(&mut self.pack_buf)));
-        self.next_pack_id += 1;
-    }
-
-    /// Hand the pending batch to a background compressor and return, so chunking continues while it
-    /// runs. The previous batch is drained first, which is what keeps `packs` in id order.
-    ///
-    /// This used to compress synchronously, and that made it a barrier: the chunker stopped dead for
-    /// the whole batch. Measured on a 16-thread machine over the kernel tree, 44.7% of create was
-    /// spent inside this function with one thread doing nothing, against 25.5% chunking with fifteen
-    /// threads doing nothing. Neither phase overlapped the other and the total was their sum.
-    ///
-    /// Peak raw memory doubles as a result -- one batch in flight while the next fills, so
-    /// `2 x batch x pack_target` rather than one. That is the price of the overlap, it is bounded, and
-    /// `hw::create_batch` sizes `batch` so the product fits the machine.
-    ///
-    /// The archive is unchanged byte for byte. Ids are assigned in `queue_pack`, each batch is
-    /// contiguous in id space, batch N is written before batch N+1 is spawned, and
-    /// `into_par_iter().collect()` preserves order within a batch.
-    fn flush_batch(&mut self) -> Result<()> {
-        let flush_t0 = Instant::now();
-        self.drain_inflight()?;
-        if self.pending.is_empty() {
-            self.prof.flush_nanos += flush_t0.elapsed().as_nanos();
             return Ok(());
         }
-        let pending = std::mem::take(&mut self.pending);
-        let level = self.level;
-        let use_zstd = self.use_zstd;
-        let crypter = self.crypter.clone();
-        self.inflight = Some(std::thread::spawn(move || {
-            // Each pack is timed on its own so the batch can report its spread. Two `Instant` reads
-            // against a pack that takes whole seconds to compress; nothing about the output moves.
-            let batch_t0 = Instant::now();
-            let timed = pending
-                .into_par_iter()
-                .map(|(id, raw)| {
-                    let pack_t0 = Instant::now();
-                    let out = compress_pack(raw, id, level, use_zstd, crypter.as_deref())?;
-                    Ok((out, pack_t0.elapsed().as_nanos()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut stat = BatchStat {
-                packs: timed.len(),
-                wall_nanos: batch_t0.elapsed().as_nanos(),
-                fastest_nanos: u128::MAX,
-                ..BatchStat::default()
-            };
-            for (_, nanos) in &timed {
-                stat.busy_nanos += nanos;
-                stat.slowest_nanos = stat.slowest_nanos.max(*nanos);
-                stat.fastest_nanos = stat.fastest_nanos.min(*nanos);
-            }
-            Ok((timed.into_iter().map(|(out, _)| out).collect(), stat))
-        }));
-        self.prof.flush_nanos += flush_t0.elapsed().as_nanos();
-        self.prof.flushes += 1;
+        let id = self.next_pack_id;
+        self.next_pack_id += 1;
+        if self.prof.first_dispatch.is_none() {
+            self.prof.first_dispatch = Some(Instant::now());
+        }
+        // A full queue blocks here, and that block is the chunker waiting on the compressors, so it
+        // is charged as such instead of disappearing into the chunk phase.
+        let send_t0 = Instant::now();
+        self.queue.send(id, std::mem::take(&mut self.pack_buf))?;
+        self.prof.drain_nanos += send_t0.elapsed().as_nanos();
+        self.pump()
+    }
+
+    /// Take back whatever the compressors have finished and write everything the file can now write.
+    ///
+    /// Called after every pack is queued, and it never blocks: what has not arrived is left for the
+    /// next call, so chunking continues while compression runs behind it. Peak raw memory is bounded
+    /// by the queue rather than by a batch -- at most `capacity + workers` packs are outstanding, and
+    /// `hw::create_batch` sizes both so the product fits the machine.
+    fn pump(&mut self) -> Result<()> {
+        let t0 = Instant::now();
+        self.queue.collect_available(&mut self.prof)?;
+        self.write_ready()?;
+        self.prof.flush_nanos += t0.elapsed().as_nanos();
         Ok(())
     }
 
-    /// Join the background compressor, if one is running, and write its packs in id order.
+    /// Write every pack whose turn has come, in id order, and stop at the first gap.
     ///
-    /// Time spent here is the chunker blocked: the batch that was handed off has not finished. On a
-    /// machine where compression keeps up it is near zero, and it rises as the codec gets slower
-    /// relative to the chunker, which is exactly the signal worth watching.
-    fn drain_inflight(&mut self) -> Result<()> {
-        let Some(handle) = self.inflight.take() else {
-            return Ok(());
-        };
-        let drain_t0 = Instant::now();
-        let (results, stat) = handle
-            .join()
-            .map_err(|_| ArchiveError::Backend("pack compression thread panicked".into()))??;
-        self.prof.drain_nanos += drain_t0.elapsed().as_nanos();
-        self.prof.batches.push(stat);
-        for (payload, raw_len, codec) in results {
+    /// The gap is the whole point: a pack that finished early waits in the reorder buffer until the
+    /// ids in front of it land, so what reaches the file is a function of the input alone and never
+    /// of which worker happened to finish first.
+    fn write_ready(&mut self) -> Result<()> {
+        while let Some((payload, raw_len, codec)) = self.queue.pop_in_order() {
             let loc = PackLoc {
                 file_offset: self.pos,
                 comp_len: payload.len() as u64,
@@ -976,6 +1064,32 @@ impl CramArchiveWriter {
             self.write_out(&payload)?;
             self.packs.push(loc);
         }
+        Ok(())
+    }
+
+    /// Close the queue and block until every pack has come back and been written.
+    ///
+    /// Only `finish` needs this: the index records each pack's file offset, so nothing can be
+    /// serialized until the last one is on disk. Time spent here is the chunker with no work left,
+    /// waiting on compressors that are still going, which is the tail of the job and nothing else.
+    fn drain_all(&mut self) -> Result<()> {
+        self.queue.close();
+        while self.queue.next_write < self.next_pack_id {
+            let drain_t0 = Instant::now();
+            let alive = self.queue.collect_one(&mut self.prof)?;
+            self.prof.drain_nanos += drain_t0.elapsed().as_nanos();
+            self.prof.stalls += 1;
+            self.write_ready()?;
+            // Every worker hung up with packs still missing: one of them died without reporting.
+            // Failing here rather than serializing an index is deliberate -- the trailer would
+            // otherwise point at pack offsets for packs that were never written.
+            if !alive && self.queue.next_write < self.next_pack_id {
+                return Err(ArchiveError::Backend(
+                    "pack compression ended before every pack was returned".into(),
+                ));
+            }
+        }
+        self.queue.join();
         Ok(())
     }
 
@@ -1002,13 +1116,13 @@ impl CramArchiveWriter {
                 .saturating_sub(p.hash_nanos)),
         );
         eprintln!(
-            "flush           {:9.1} ms  {:5.1}%   {} flushes, batch {}, of which BLOCKED {:.1} ms ({:.1}%)",
+            "write packs     {:9.1} ms  {:5.1}%   {} workers, of which BLOCKED {:.1} ms ({:.1}%) over {} stalls",
             ms(p.flush_nanos),
             pct(p.flush_nanos),
-            p.flushes,
-            self.batch,
+            p.workers,
             ms(p.drain_nanos),
             pct(p.drain_nanos),
+            p.stalls,
         );
         // Costs the writer cannot see: the source files are opened by `engine::create`, and the tree
         // walk and the store-vs-compress probe both run to completion before this writer exists, so
@@ -1057,78 +1171,57 @@ impl CramArchiveWriter {
             self.packs.len(),
             rayon::current_num_threads(),
         );
-        self.report_barrier();
+        self.report_queue();
     }
 
-    /// What the batch barrier costs, in core-time.
+    /// How well the pack workers were kept fed.
     ///
-    /// A batch compresses under `into_par_iter().collect()`, which returns only when its slowest
-    /// pack does. Packs are equal in raw size and unequal in compress time -- one that trips the
-    /// store-the-incompressible probe finishes at memcpy speed, one of dense source code runs a full
-    /// LZMA search -- so a core that draws an easy pack finishes early and then waits. Two separate
-    /// losses fall out of that, and they want different fixes.
-    ///
-    /// `tail` is lanes that had work, finished it, and idled until the straggler landed; it goes
-    /// away by removing the barrier, not by scheduling harder. `unused` is lanes that never got a
-    /// pack at all, because the batch held fewer packs than the pool has threads; that one is
-    /// [`hw::create_batch`]'s ceiling and nothing else.
-    fn report_barrier(&self) {
-        let batches = &self.prof.batches;
-        if batches.is_empty() {
+    /// The batch scheme this replaced ended each batch at a barrier, and per-pack times spanning
+    /// 6.9 s to 18.9 s inside one batch made that expensive: 196 core-seconds of workers sitting on
+    /// a finished pack waiting for a straggler, on the kernel tree alone. A queue can only leave
+    /// idle at the tail of the whole job, so occupancy is the number worth watching -- busy
+    /// core-time against what the pool had available between first dispatch and last completion.
+    fn report_queue(&self) {
+        let p = &self.prof;
+        let (Some(t0), Some(t1)) = (p.first_dispatch, p.last_complete) else {
+            return;
+        };
+        if p.pack_nanos.is_empty() {
             return;
         }
-        let pool = rayon::current_num_threads().max(1);
         let ms = |n: u128| n as f64 / 1e6;
-        eprintln!("--- batch barrier ---");
+        let wall = t1.duration_since(t0).as_nanos().max(1);
+        let busy: u128 = p.pack_nanos.iter().sum();
+        let workers = p.workers.max(1) as u128;
+        let capacity = wall * workers;
+        let mut sorted = p.pack_nanos.clone();
+        sorted.sort_unstable();
+        let (fastest, slowest) = (sorted[0], sorted[sorted.len() - 1]);
+        let median = sorted[sorted.len() / 2];
+        eprintln!("--- pack queue ---");
         eprintln!(
-            "{:>3}  {:>5} {:>9} {:>9} {:>9} {:>9} {:>7}",
-            "#", "packs", "wall ms", "busy ms", "slow ms", "fast ms", "occ"
+            "{} packs over {} workers: slowest {:.1} ms, median {:.1} ms, fastest {:.1} ms",
+            p.pack_nanos.len(),
+            p.workers,
+            ms(slowest),
+            ms(median),
+            ms(fastest),
         );
-        let (mut tail, mut unused, mut total_wall) = (0u128, 0u128, 0u128);
-        for (i, b) in batches.iter().enumerate() {
-            let lanes = b.packs.min(pool) as u128;
-            let capacity = b.wall_nanos * lanes;
-            tail += capacity.saturating_sub(b.busy_nanos);
-            unused += b.wall_nanos * (pool as u128 - lanes);
-            total_wall += b.wall_nanos;
-            eprintln!(
-                "{:>3}  {:>5} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>6.1}%",
-                i,
-                b.packs,
-                ms(b.wall_nanos),
-                ms(b.busy_nanos),
-                ms(b.slowest_nanos),
-                ms(b.fastest_nanos),
-                if capacity > 0 {
-                    (b.busy_nanos as f64 / capacity as f64) * 100.0
-                } else {
-                    0.0
-                },
-            );
-        }
-        let capacity = total_wall * pool as u128;
         eprintln!(
-            "idle core-time: tail {:.1} ms, unused lanes {:.1} ms, of {:.1} ms available ({} threads x {:.1} ms compressing)",
-            ms(tail),
-            ms(unused),
+            "compress wall {:.1} ms, busy {:.1} ms of {:.1} ms available -- occupancy {:.1}%, idle {:.1} ms",
+            ms(wall),
+            ms(busy),
             ms(capacity),
-            pool,
-            ms(total_wall),
+            (busy as f64 / capacity as f64) * 100.0,
+            ms(capacity.saturating_sub(busy)),
         );
-        // What the perfect scheduler would get: the same work spread over every thread with no
-        // barrier anywhere. Compression is not the whole job, so this is a ceiling on the win, not
-        // a prediction of it.
-        let busy: u128 = batches.iter().map(|b| b.busy_nanos).sum();
+        // The floor nothing can go under: the work spread perfectly across the pool, or the single
+        // longest pack, whichever is larger. When the longest pack is the larger of the two, more
+        // workers cannot help and only a smaller pack can.
         eprintln!(
-            "compress wall {:.1} ms; perfectly balanced over {} threads it would be {:.1} ms (best case {:.2}x)",
-            ms(total_wall),
-            pool,
-            ms(busy / pool as u128),
-            if busy > 0 {
-                total_wall as f64 / (busy as f64 / pool as f64)
-            } else {
-                1.0
-            },
+            "floor {:.1} ms balanced / {:.1} ms longest pack, whichever is larger",
+            ms(busy / workers),
+            ms(slowest),
         );
     }
 }
@@ -1220,9 +1313,8 @@ impl ArchiveWriter for CramArchiveWriter {
     fn finish(mut self: Box<Self>) -> Result<CreateReport> {
         // Queue the final partial pack, hand it off, then wait for it: the index records every
         // pack's file offset, so nothing can be serialized until the last one has been written.
-        self.queue_pack();
-        self.flush_batch()?;
-        self.drain_inflight()?;
+        self.queue_pack()?;
+        self.drain_all()?;
         let index_t0 = Instant::now();
         let index_offset = self.pos;
         // Only an archive that actually used a transform is written as v2; everything else stays v1
