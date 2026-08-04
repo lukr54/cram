@@ -265,8 +265,9 @@ usage: cram <command> …
   l  <archive>                        list entries
   x  <archive> [-o <dir>] [-p <pw>]   extract [--skip]
   a  <archive> <input...> [-p <pw>]   create [--store|--fast|--best] [--encrypt-names]
-       .cram losslessly recompresses JPEGs (~23%, exact originals restored on extract);
-       --no-recompress stores them as-is instead
+       --recompress losslessly recompresses JPEGs, ~23% off each one with the exact
+       originals restored on extract. It is slow -- roughly 4x the create time -- so it
+       is on only with --best or when asked for by name; --no-recompress overrides both
        --overwrite (-y) replaces an existing <archive>; without it cram refuses, because
        `a` creates a new archive rather than adding to one
   t  <archive> [-p <pw>]              test integrity (decode + checksums, no extract)
@@ -1290,6 +1291,23 @@ fn thousands(n: u64) -> String {
 /// input: rejecting every `-`-prefixed arg as an option would silently drop any file whose name
 /// starts with `-` from the archive, which is data loss with no warning. Unknown dash-args that name
 /// nothing get a loud warning.
+/// Whether to spend a Lepton pass on JPEGs.
+///
+/// It is worth having and it is a bad default. Measured three times -- on a photo folder, on a
+/// 5.15 GB mixed corpus, and again at `--store` -- it costs about four times the create time to
+/// save around 1.4% of the archive, because the 23% it takes off a JPEG only applies to the JPEG
+/// share of the bytes, and that is small on anything but a photo library. Off by default takes
+/// create from 53 s to 12 s on the mixed corpus while still finishing 9.6% smaller than `7z -mx=5`.
+///
+/// So: on when `--best` asks for every last byte, on when `--recompress` asks for it by name, off
+/// otherwise. `--no-recompress` still wins over both, because an explicit no should always work.
+fn recompress_choice(args: &[String]) -> bool {
+    if has(args, "--no-recompress") {
+        return false;
+    }
+    has(args, "--recompress") || has(args, "--best")
+}
+
 fn create_inputs(args: &[String]) -> Vec<PathBuf> {
     const CREATE_FLAGS: &[&str] = &[
         "--best",
@@ -1297,6 +1315,8 @@ fn create_inputs(args: &[String]) -> Vec<PathBuf> {
         "--store",
         "--encrypt-names",
         "--overwrite",
+        "--recompress",
+        "--no-recompress",
         "-y",
     ];
     let mut out = Vec::new();
@@ -1398,8 +1418,7 @@ fn create(args: &[String]) -> Result<()> {
         codec: has(args, "--store").then_some(Codec::None),
         solid: false,
         threads: None,
-        // Lossless JPEG recompression is on unless explicitly turned off.
-        recompress_images: !has(args, "--no-recompress"),
+        recompress_images: recompress_choice(args),
     };
 
     let t0 = Instant::now();
@@ -1483,6 +1502,7 @@ fn convert_cmd(args: &[String]) -> Result<()> {
             "--fast",
             "--store",
             "--encrypt-names",
+            "--recompress",
             "--no-recompress",
             "--overwrite",
             "-y",
@@ -1522,8 +1542,7 @@ fn convert_cmd(args: &[String]) -> Result<()> {
         codec: has(args, "--store").then_some(Codec::None),
         solid: false,
         threads: None,
-        // Lossless JPEG recompression is on unless explicitly turned off.
-        recompress_images: !has(args, "--no-recompress"),
+        recompress_images: recompress_choice(args),
     };
 
     let t0 = Instant::now();

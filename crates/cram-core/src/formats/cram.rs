@@ -678,6 +678,7 @@ impl PackQueue {
         capacity: usize,
         level: u32,
         use_zstd: bool,
+        store: bool,
         crypter: Option<Arc<Crypter>>,
     ) -> Self {
         let (work_tx, work_rx) = sync_channel::<(u32, Vec<u8>)>(capacity.max(1));
@@ -698,15 +699,14 @@ impl PackQueue {
                     };
                     let Ok((id, raw)) = job else { break };
                     let t0 = Instant::now();
-                    let out = compress_pack(raw, id, level, use_zstd, crypter.as_deref()).map(
-                        |(payload, raw_len, codec)| DonePack {
+                    let out = compress_pack(raw, id, level, use_zstd, store, crypter.as_deref())
+                        .map(|(payload, raw_len, codec)| DonePack {
                             id,
                             payload,
                             raw_len,
                             codec,
                             nanos: t0.elapsed().as_nanos(),
-                        },
-                    );
+                        });
                     // A closed receiver means the writer is gone (an error elsewhere); stop quietly.
                     if tx.send(out).is_err() {
                         break;
@@ -825,10 +825,11 @@ fn compress_pack(
     pack_id: u32,
     level: u32,
     use_zstd: bool,
+    store: bool,
     crypter: Option<&Crypter>,
 ) -> Result<(Vec<u8>, u32, u8)> {
     let raw_len = raw.len() as u32;
-    let (codec, plaintext) = pack_compress(raw, level, use_zstd)?;
+    let (codec, plaintext) = pack_compress(raw, level, use_zstd, store)?;
     // Encrypt AFTER compression (compress-then-encrypt); AAD binds the pack to its id.
     let payload = match crypter {
         Some(cr) => cr.seal(&plaintext, &pack_id.to_le_bytes())?,
@@ -839,7 +840,15 @@ fn compress_pack(
 
 /// Codec choice for one pack: zstd (fast, `zstd-c` build only) or XZ (default, best ratio). Returns
 /// `(codec, bytes)`; stores raw if compression didn't shrink it.
-fn pack_compress(raw: Vec<u8>, level: u32, use_zstd: bool) -> Result<(u8, Vec<u8>)> {
+fn pack_compress(raw: Vec<u8>, level: u32, use_zstd: bool, store: bool) -> Result<(u8, Vec<u8>)> {
+    // `--store` asked for no compression, so do none. This used to fall through to the codec and
+    // produce an archive byte-identical to the default at full XZ cost, because `--store` sets
+    // `format::Codec::None` -- the *stream wrapper* codec, which `.cram` never consults, since it
+    // compresses per pack rather than wrapping a stream. Measured on the mixed corpus: `--store`
+    // took 53.52 s and returned ratio 0.635, which is not storing anything.
+    if store {
+        return Ok((CODEC_STORE, raw));
+    }
     #[cfg(feature = "zstd-c")]
     if use_zstd {
         let comp = zstd::bulk::compress(&raw, zstd_level(level))
@@ -926,7 +935,18 @@ impl CramArchiveWriter {
         // frontier rather than a cheaper route to the same one.
         let use_zstd = cfg!(feature = "zstd-c")
             && (!matches!(opts.level, Level::Best) || env_i32("CRAM_FORCE_ZSTD") == Some(1));
-        let queue = PackQueue::new(slots, slots, preset(opts.level), use_zstd, crypter.clone());
+        // `--store` reaches here as `format::Codec::None`. For a container that wraps a stream that
+        // means "no wrapper"; for `.cram`, which compresses per pack, nothing consulted it at all
+        // and the flag did nothing. It now means what it says.
+        let store_packs = matches!(opts.codec, Some(crate::format::Codec::None));
+        let queue = PackQueue::new(
+            slots,
+            slots,
+            preset(opts.level),
+            use_zstd,
+            store_packs,
+            crypter.clone(),
+        );
         let prof = Prof {
             workers: slots,
             ..Prof::default()
@@ -942,7 +962,9 @@ impl CramArchiveWriter {
             pack_buf: Vec::new(),
             in_bytes: 0,
             dedup_saved: 0,
-            recompress_images: opts.recompress_images,
+            // Storing and transforming are contradictory instructions: a Lepton pass is the most
+            // expensive thing this writer does, and `--store` is a request not to spend that.
+            recompress_images: opts.recompress_images && !store_packs,
             used_transform: false,
             crypter,
             next_pack_id: 0,
@@ -2032,7 +2054,7 @@ mod tests {
     #[test]
     fn zstd_pack_compress_selects_codec_and_never_grows() {
         let compressible = b"the quick brown fox ".repeat(5000);
-        let (codec, comp) = pack_compress(compressible.clone(), 6, true).unwrap();
+        let (codec, comp) = pack_compress(compressible.clone(), 6, true, false).unwrap();
         assert_eq!(codec, CODEC_ZSTD, "zstd-c build uses the zstd pack codec");
         assert!(
             comp.len() < compressible.len(),
@@ -2048,7 +2070,7 @@ mod tests {
             x ^= x << 5;
             incompressible.push((x >> 24) as u8);
         }
-        let (codec2, comp2) = pack_compress(incompressible.clone(), 6, true).unwrap();
+        let (codec2, comp2) = pack_compress(incompressible.clone(), 6, true, false).unwrap();
         assert_eq!(
             codec2, CODEC_STORE,
             "incompressible pack is stored, not grown"
