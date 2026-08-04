@@ -1013,9 +1013,18 @@ pub fn classify(
 /// reading, so 12x, and half of available RAM as the budget.
 pub fn create_batch(pack_bytes: usize, hw: &HwProfile) -> usize {
     const SLOT_MULTIPLE: usize = 12;
-    // Ceiling regardless of RAM: past 16 the compressor stops being the wall (measured), and there
-    // is no point holding more packs than there are threads to compress them.
-    let ceiling = hw.logical.clamp(1, 16);
+    // One slot per thread, and no more: a batch compresses under `into_par_iter`, so packs beyond
+    // the thread count only queue, while packs short of it leave threads with nothing to do at all.
+    //
+    // This was a flat 16 until it was measured against the threads it was starving. On the kernel
+    // tree at 32 MiB packs on 24 threads, `--best` produced a byte-identical archive in 51.8 s at
+    // 16 and 42.2 s at 24 -- the eight idle threads were a fifth of the run. Peak RSS goes 5.1 ->
+    // 8.5 GB with them, which is what the budget below is for; it predicted 9.2 GB, so it holds.
+    //
+    // Neither is the floor. A batch ends when its slowest pack does, and packs are equal in raw
+    // size but not in compress time (6.9 s to 18.9 s across one batch here), so ~19% of the lanes'
+    // time is still spent waiting at the barrier. Removing the barrier is a separate change.
+    let ceiling = hw.logical.max(1);
     // `CRAM_BATCH` forces the value. This exists so the property the whole split rests on -- that
     // batch cannot change the archive -- is testable on one machine, since batch is otherwise a
     // function of installed RAM and there is no other way to vary it in a test.
@@ -1026,7 +1035,9 @@ pub fn create_batch(pack_bytes: usize, hw: &HwProfile) -> usize {
         return n.min(64);
     }
     if hw.ram_avail == 0 {
-        return ceiling; // couldn't read memory; behave exactly as before rather than guess low
+        // Couldn't read memory. One slot per thread is only safe because the budget below vetoes
+        // it on a small machine, and here there is no budget, so fall back to the old flat cap.
+        return ceiling.min(16);
     }
     let budget = hw.ram_avail / 2;
     let per_slot = (pack_bytes * SLOT_MULTIPLE).max(1) as u64;

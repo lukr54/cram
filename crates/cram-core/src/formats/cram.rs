@@ -94,7 +94,18 @@ const CODEC_ZSTD: u8 = 2;
 /// Map the abstract 0–9 preset onto a zstd compression level (1–19; higher = smaller/slower).
 #[cfg(feature = "zstd-c")]
 fn zstd_level(preset: u32) -> i32 {
+    // `CRAM_ZSTD_LEVEL` reaches the --ultra range (20-22), which the preset mapping cannot: it
+    // tops out at 19 because that is the last level zstd will use without an explicit opt-in to
+    // the larger window and memory. Experiment knob, same footing as CRAM_PACK_TARGET.
+    if let Some(n) = env_i32("CRAM_ZSTD_LEVEL") {
+        return n.clamp(1, 22);
+    }
     (preset as i32 * 2).clamp(1, 19)
+}
+
+/// Read a small signed integer from the environment, for the tuning knobs.
+fn env_i32(key: &str) -> Option<i32> {
+    std::env::var_os(key)?.to_str()?.trim().parse::<i32>().ok()
 }
 
 // --- encryption: per-pack AES-256-GCM, key = Argon2id(password, salt) ---
@@ -400,6 +411,13 @@ fn jpeg_restore(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Map the abstract [`Level`] onto the XZ 0–9 preset used for packs.
 fn preset(level: Level) -> u32 {
+    // `CRAM_XZ_PRESET` overrides the level's preset. This is the knob for the open question of
+    // whether `--best` still needs preset 9 now that a pack is 32 MiB rather than 8: ratio bought
+    // by a wider window is ratio the match search no longer has to earn, and nothing had re-tuned
+    // the search after the window moved.
+    if let Some(n) = env_i32("CRAM_XZ_PRESET") {
+        return n.clamp(0, 9) as u32;
+    }
     match level {
         Level::Auto | Level::Balanced => 6,
         Level::Fastest => 1,
@@ -602,7 +620,7 @@ pub struct CramArchiveWriter {
     /// The previous batch, compressing on a background thread while this one fills. Joined at the
     /// next batch boundary and at `finish`, so its packs are always written before the batch after
     /// it is even started -- `packs` therefore still grows strictly in id order.
-    inflight: Option<JoinHandle<Result<CompressedBatch>>>,
+    inflight: Option<JoinHandle<Result<(CompressedBatch, BatchStat)>>>,
     /// How many packs to compress in parallel per batch (bounds peak memory).
     batch: usize,
     /// Raw bytes to accumulate before sealing a pack. Resolved once at construction rather than
@@ -626,6 +644,23 @@ type CompressedPack = (Vec<u8>, u32, u8);
 /// A whole batch of them, still in pack-id order.
 type CompressedBatch = Vec<CompressedPack>;
 
+/// What one batch of packs cost, measured from inside the background compressor.
+///
+/// A batch ends at a barrier -- `into_par_iter().collect()` returns only once its slowest pack is
+/// done -- so any core that finished early sits idle until then. `wall x lanes - busy` is exactly
+/// that waste, in core-time, and it is the number that says whether the barrier is worth removing.
+#[derive(Clone, Copy, Default)]
+struct BatchStat {
+    packs: usize,
+    /// Handoff to last-pack-done. The barrier's own length.
+    wall_nanos: u128,
+    /// Sum of the per-pack compress times: real work, ignoring how it was scheduled.
+    busy_nanos: u128,
+    /// The straggler every other core waits for.
+    slowest_nanos: u128,
+    fastest_nanos: u128,
+}
+
 #[derive(Default)]
 struct Prof {
     /// Inside `chunk_stream`, excluding any nested `flush_batch`.
@@ -646,6 +681,8 @@ struct Prof {
     /// Serialising the index and writing it, at `finish`. Grows with entry and chunk count rather
     /// than with bytes, so it is the tail a many-small-files corpus pays.
     index_nanos: u128,
+    /// One entry per batch that reached the compressor. Diagnostic only.
+    batches: Vec<BatchStat>,
 }
 
 /// Compress (and, when encrypting, seal) one pack's raw bytes into its on-disk payload. Pure and
@@ -773,7 +810,11 @@ impl CramArchiveWriter {
             pack_target,
             // In a `zstd-c` build, use the fast C zstd for packs by default, but honor `--best` by
             // falling back to XZ's stronger ratio. A pure-Rust build always uses XZ (flag stays false).
-            use_zstd: cfg!(feature = "zstd-c") && !matches!(opts.level, Level::Best),
+            // `--best` picks XZ for its ratio. `CRAM_FORCE_ZSTD=1` overrides that, to test whether
+            // zstd at --ultra over a 32 MiB pack lands near XZ's size for a fraction of the encode
+            // time -- a different point on the frontier rather than a cheaper route to the same one.
+            use_zstd: cfg!(feature = "zstd-c")
+                && (!matches!(opts.level, Level::Best) || env_i32("CRAM_FORCE_ZSTD") == Some(1)),
             start: Instant::now(),
             prof: Prof::default(),
         })
@@ -881,10 +922,29 @@ impl CramArchiveWriter {
         let use_zstd = self.use_zstd;
         let crypter = self.crypter.clone();
         self.inflight = Some(std::thread::spawn(move || {
-            pending
+            // Each pack is timed on its own so the batch can report its spread. Two `Instant` reads
+            // against a pack that takes whole seconds to compress; nothing about the output moves.
+            let batch_t0 = Instant::now();
+            let timed = pending
                 .into_par_iter()
-                .map(|(id, raw)| compress_pack(raw, id, level, use_zstd, crypter.as_deref()))
-                .collect::<Result<Vec<_>>>()
+                .map(|(id, raw)| {
+                    let pack_t0 = Instant::now();
+                    let out = compress_pack(raw, id, level, use_zstd, crypter.as_deref())?;
+                    Ok((out, pack_t0.elapsed().as_nanos()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut stat = BatchStat {
+                packs: timed.len(),
+                wall_nanos: batch_t0.elapsed().as_nanos(),
+                fastest_nanos: u128::MAX,
+                ..BatchStat::default()
+            };
+            for (_, nanos) in &timed {
+                stat.busy_nanos += nanos;
+                stat.slowest_nanos = stat.slowest_nanos.max(*nanos);
+                stat.fastest_nanos = stat.fastest_nanos.min(*nanos);
+            }
+            Ok((timed.into_iter().map(|(out, _)| out).collect(), stat))
         }));
         self.prof.flush_nanos += flush_t0.elapsed().as_nanos();
         self.prof.flushes += 1;
@@ -901,10 +961,11 @@ impl CramArchiveWriter {
             return Ok(());
         };
         let drain_t0 = Instant::now();
-        let results = handle
+        let (results, stat) = handle
             .join()
             .map_err(|_| ArchiveError::Backend("pack compression thread panicked".into()))??;
         self.prof.drain_nanos += drain_t0.elapsed().as_nanos();
+        self.prof.batches.push(stat);
         for (payload, raw_len, codec) in results {
             let loc = PackLoc {
                 file_offset: self.pos,
@@ -995,6 +1056,79 @@ impl CramArchiveWriter {
             p.dedup_hits,
             self.packs.len(),
             rayon::current_num_threads(),
+        );
+        self.report_barrier();
+    }
+
+    /// What the batch barrier costs, in core-time.
+    ///
+    /// A batch compresses under `into_par_iter().collect()`, which returns only when its slowest
+    /// pack does. Packs are equal in raw size and unequal in compress time -- one that trips the
+    /// store-the-incompressible probe finishes at memcpy speed, one of dense source code runs a full
+    /// LZMA search -- so a core that draws an easy pack finishes early and then waits. Two separate
+    /// losses fall out of that, and they want different fixes.
+    ///
+    /// `tail` is lanes that had work, finished it, and idled until the straggler landed; it goes
+    /// away by removing the barrier, not by scheduling harder. `unused` is lanes that never got a
+    /// pack at all, because the batch held fewer packs than the pool has threads; that one is
+    /// [`hw::create_batch`]'s ceiling and nothing else.
+    fn report_barrier(&self) {
+        let batches = &self.prof.batches;
+        if batches.is_empty() {
+            return;
+        }
+        let pool = rayon::current_num_threads().max(1);
+        let ms = |n: u128| n as f64 / 1e6;
+        eprintln!("--- batch barrier ---");
+        eprintln!(
+            "{:>3}  {:>5} {:>9} {:>9} {:>9} {:>9} {:>7}",
+            "#", "packs", "wall ms", "busy ms", "slow ms", "fast ms", "occ"
+        );
+        let (mut tail, mut unused, mut total_wall) = (0u128, 0u128, 0u128);
+        for (i, b) in batches.iter().enumerate() {
+            let lanes = b.packs.min(pool) as u128;
+            let capacity = b.wall_nanos * lanes;
+            tail += capacity.saturating_sub(b.busy_nanos);
+            unused += b.wall_nanos * (pool as u128 - lanes);
+            total_wall += b.wall_nanos;
+            eprintln!(
+                "{:>3}  {:>5} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>6.1}%",
+                i,
+                b.packs,
+                ms(b.wall_nanos),
+                ms(b.busy_nanos),
+                ms(b.slowest_nanos),
+                ms(b.fastest_nanos),
+                if capacity > 0 {
+                    (b.busy_nanos as f64 / capacity as f64) * 100.0
+                } else {
+                    0.0
+                },
+            );
+        }
+        let capacity = total_wall * pool as u128;
+        eprintln!(
+            "idle core-time: tail {:.1} ms, unused lanes {:.1} ms, of {:.1} ms available ({} threads x {:.1} ms compressing)",
+            ms(tail),
+            ms(unused),
+            ms(capacity),
+            pool,
+            ms(total_wall),
+        );
+        // What the perfect scheduler would get: the same work spread over every thread with no
+        // barrier anywhere. Compression is not the whole job, so this is a ceiling on the win, not
+        // a prediction of it.
+        let busy: u128 = batches.iter().map(|b| b.busy_nanos).sum();
+        eprintln!(
+            "compress wall {:.1} ms; perfectly balanced over {} threads it would be {:.1} ms (best case {:.2}x)",
+            ms(total_wall),
+            pool,
+            ms(busy / pool as u128),
+            if busy > 0 {
+                total_wall as f64 / (busy as f64 / pool as f64)
+            } else {
+                1.0
+            },
         );
     }
 }
