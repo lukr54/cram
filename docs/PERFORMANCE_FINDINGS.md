@@ -372,12 +372,69 @@ a projected `1 x decode_rate` against the measured write wall, so on a drive fas
 decode rate it would have returned CPU-bound and planned **one extraction worker too**. Which branch
 an extract took depended on how fast the destination drive measured.
 
-**Still open.** `--best` verify remains 5.9x slower than 7-Zip `-mx=5` on this corpus (7.24 s against
-1.23 s) and reaches only ~1112% CPU where auto reaches ~1594%. XZ decode is intrinsically slower than
-LZMA2, but 223 MiB/s spread across eleven effective cores is ~20 MiB/s per core, well under one
-core's XZ decode rate, so the codec does not explain it on its own. The shared `Mutex<PackCache>` is
-the suspect: 24 workers each holding a decoded 8 MiB pack is 192 MiB against a 256 MiB cap, giving
-both lock contention and eviction pressure. Not measured yet.
+This left `--best` verify 5.9x slower than 7-Zip `-mx=5` and burning 80 core-seconds where the
+single-threaded pass burned 17. The shared `Mutex<PackCache>` looked like the suspect. It was not.
+See §13.
+
+## 13. Verify decompressed every pack 2.31 times. The unit of work was wrong
+
+The lock was never the problem: `get_pack` already decodes *outside* it. The work was simply being
+done more than once, and the cache is what hid that. Two workers that miss on the same pack both
+decompress it, and `PackCache::insert` discards the loser **after** the CPU has been spent, so the
+waste never appeared as a miss.
+
+Counting it (`CRAM_PROFILE=1`, the new pack profile) on the 186-pack kernel archive:
+
+| | decodes | per pack | decompressed |
+|---|---|---|---|
+| entry per task | 430 | 2.31 | 3446 MiB |
+| pack per task + single-flight | 274 | **1.47** | 2203 MiB |
+
+To verify 1615 MiB, the old path decompressed 3446 MiB.
+
+Two things were wrong and both had to change.
+
+**The unit of work was the entry, not the pack.** Ordering same-pack entries adjacently (the fix in
+*Extract a pack once, not sixteen times*) is not the same as keeping them on one worker: rayon still
+splits a cluster across workers and they then miss together. Grouping entries by locality key, so
+one task owns one pack, means one decode and no race to lose.
+
+**Nothing served a second comer.** `get_pack` now holds that pack's own lock across the decode, so a
+worker wanting a pack already in flight waits for those bytes instead of producing its own copy.
+Per-pack locks, at most one held at a time, so unrelated packs never serialise and they cannot
+deadlock.
+
+| | §12 | now | total |
+|---|---|---|---|
+| `cram t --best`, linux | 7.24 s @ 1112% | **3.65 s @ 1551%** | 4.96x from 18.10 s |
+| `cram t` auto, linux | 1.88 s @ 1594% | **1.12 s @ 1822%** | 2.74x from 3.07 s |
+| `cram t --best`, silesia | 0.99 s | **0.91 s** | 3.35x from 3.05 s |
+| `cram x` auto | 2.00 s | 2.13 s | within noise |
+
+Extraction does not move, which is consistent: it is write-bound on eight workers, so it races for a
+pack far less often and the decode is not its bottleneck anyway.
+
+Where verify now stands against the incumbents, same corpus and box:
+
+| | archive | verify |
+|---|---|---|
+| `cram t` fast | 260 MB | 1.03 s |
+| `7zz t -mx=5` | 165 MB | 1.08 s |
+| `cram t` auto | 199 MB | 1.12 s |
+| `7zz t -mx=9` | 154 MB | 1.58 s |
+| **`cram t --best`** | **172 MB** | **3.65 s** |
+| `rar t -m5` | 186 MB | 3.69 s |
+
+`--best` now edges past WinRAR while producing an archive 7.6% smaller, and remains 3.4x behind
+7-Zip `-mx=5`. That residue is mostly XZ against LZMA2 on the decode side, not scheduling.
+
+**What is left.** 1.47 decodes per pack, not 1.00. Silesia reaches exactly 1.00 (26 packs, 12
+files), so the residue is specific to a many-small-file tree: an entry straddling a pack boundary is
+grouped by its *first* pack, so the worker owning pack N pulls in pack N+1, whose own owner may have
+to decode it again if the cache evicted it meanwhile. 186 packs against roughly 104 extra decodes is
+close to one per boundary. Closing it needs either a larger `PACK_CACHE_CAP` (peak RSS is already
+2.2 GB at `--best`, which is the XZ dictionary per worker rather than the cache) or grouping a
+straddling entry by every pack it touches. Worth perhaps 20-30% of the remaining decode CPU.
 
 ## Fixed since this document was written
 

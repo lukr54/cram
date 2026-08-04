@@ -216,6 +216,26 @@ const RE_DECODE_FACTOR: u64 = 16;
 const MIN_DECOMP_BUDGET: u64 = 256 * 1024 * 1024;
 /// Total bytes of decompressed packs kept in the shared cross-worker cache (see [`PackCache`]).
 const PACK_CACHE_CAP: usize = 256 * 1024 * 1024;
+
+/// Read-side pack accounting, printed when `CRAM_PROFILE` is set.
+///
+/// A pack is decompressed whole, so the only figure that matters on the read side is how many times
+/// each one is decoded. **Once per pack is the floor**, and anything above it is CPU thrown away.
+/// The shared cache hides that cost rather than reporting it: two workers that miss on the same pack
+/// both decompress it and `PackCache::insert` silently discards the loser, so the wasted work shows
+/// up only as unexplained CPU time.
+///
+/// Process-global and `Relaxed`, which is right for one CLI invocation and would need revisiting if
+/// a caller ever ran two operations at once.
+mod packprof {
+    use std::sync::atomic::AtomicU64;
+    /// Packs read off disk and decompressed, i.e. cache misses.
+    pub static DECODES: AtomicU64 = AtomicU64::new(0);
+    /// Requests served from the shared cache.
+    pub static HITS: AtomicU64 = AtomicU64::new(0);
+    /// Decompressed bytes produced by those decodes.
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+}
 /// Ceiling on a single entry buffered **whole in RAM** by the sequential reader ([`next_entry`],
 /// which must materialize the body to hand back a `Read`). Extraction of real archives goes through
 /// the random-access [`copy_entry`] path, which streams to disk unbounded, so this only bounds the
@@ -1079,6 +1099,12 @@ pub struct CramReader {
     crypter: Option<Crypter>,
     /// Decompressed packs shared across concurrent `copy_entry` workers (kills re-decompression).
     pack_cache: Mutex<PackCache>,
+    /// One lock per pack, held across that pack's decode so it is decompressed **once** even when
+    /// several workers reach for it at the same instant. The shared cache alone does not give this:
+    /// each racing worker misses, each decompresses, and `PackCache::insert` throws all but one
+    /// result away *after* the CPU has been spent. Measured at 2.31 decodes per pack on a 186-pack
+    /// archive, so more than half the decompression was wasted.
+    pack_locks: Vec<Mutex<()>>,
     /// Anti-bomb ceiling on total decompression WORK for a whole extraction (see [`RE_DECODE_FACTOR`]).
     budget: u64,
     /// Cumulative bytes decompressed by the EXTRACTION paths (`reconstruct` / `copy_entry`) over this
@@ -1294,6 +1320,7 @@ impl CramReader {
 
         Ok(Self {
             path: path.to_path_buf(),
+            pack_locks: (0..packs.len()).map(|_| Mutex::new(())).collect(),
             packs,
             chunks,
             entries,
@@ -1311,12 +1338,64 @@ impl CramReader {
     /// `decompressed_now` is true only on a cache miss (so callers charge the anti-bomb budget once).
     /// The pack is decompressed WITHOUT holding the cache lock, so workers decompress in parallel.
     fn get_pack(&self, file: &mut File, pack_id: u32) -> Result<(Arc<Vec<u8>>, bool)> {
+        use std::sync::atomic::Ordering::Relaxed;
         if let Some(hit) = self.pack_cache.lock().unwrap().get(pack_id) {
+            packprof::HITS.fetch_add(1, Relaxed);
+            return Ok((hit, false));
+        }
+        // Single-flight: hold this pack's own lock across the decode, so a second worker that wants
+        // it waits for these bytes instead of decompressing its own copy for nothing. Locks are per
+        // pack, so unrelated packs never serialise, and a worker holds at most one at a time (the
+        // decode reads the file and touches no other pack), so they cannot deadlock.
+        let _flight = self.pack_locks.get(pack_id as usize).map(|m| {
+            // The lock guards exclusion and nothing else, so a decoder panic leaves no invariant
+            // broken and every later worker can carry on through the poison.
+            m.lock().unwrap_or_else(|e| e.into_inner())
+        });
+        // Whoever held it ahead of us has published by now.
+        if let Some(hit) = self.pack_cache.lock().unwrap().get(pack_id) {
+            packprof::HITS.fetch_add(1, Relaxed);
             return Ok((hit, false));
         }
         let raw = Arc::new(self.read_pack(file, pack_id)?);
+        packprof::DECODES.fetch_add(1, Relaxed);
+        packprof::BYTES.fetch_add(raw.len() as u64, Relaxed);
         self.pack_cache.lock().unwrap().insert(pack_id, raw.clone());
         Ok((raw, true))
+    }
+
+    /// Print read-side pack accounting to stderr when `CRAM_PROFILE` is set. Diagnostic only:
+    /// nothing parses this and nothing about the archive depends on it.
+    ///
+    /// `decodes / packs` is the number to read. 1.0 means every pack was decompressed exactly once,
+    /// which is the floor; above that is redundant work, either a worker racing another onto the
+    /// same pack or a pack evicted and fetched again.
+    fn report_pack_profile(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if std::env::var_os("CRAM_PROFILE").is_none() {
+            return;
+        }
+        let (d, h, b) = (
+            packprof::DECODES.load(Relaxed),
+            packprof::HITS.load(Relaxed),
+            packprof::BYTES.load(Relaxed),
+        );
+        if d == 0 && h == 0 {
+            return;
+        }
+        let packs = self.packs.len().max(1) as f64;
+        eprintln!("--- cram pack profile ---");
+        eprintln!("packs in archive  {:9}", self.packs.len());
+        eprintln!(
+            "pack decodes      {d:9}   {:.2} per pack   ({:.0} MiB decompressed)",
+            d as f64 / packs,
+            b as f64 / (1024.0 * 1024.0),
+        );
+        eprintln!(
+            "cache hits        {h:9}   {:.1}% of {} requests",
+            (h as f64 / (h + d).max(1) as f64) * 100.0,
+            h + d,
+        );
     }
 
     /// The whole-extraction decompression budget (see [`RE_DECODE_FACTOR`]).
@@ -1487,6 +1566,14 @@ impl ArchiveReader for CramReader {
 
     fn as_random_access(&self) -> Option<&dyn RandomAccessReader> {
         Some(self)
+    }
+}
+
+/// Every operation builds its own reader and drops it at the end, so this is the one place that sees
+/// a whole run's pack accounting regardless of which verb ran.
+impl Drop for CramReader {
+    fn drop(&mut self) {
+        self.report_pack_profile();
     }
 }
 
@@ -1700,6 +1787,7 @@ mod tests {
     fn reader_with(budget: u64, packs: Vec<PackLoc>, chunks: Vec<ChunkLoc>) -> CramReader {
         CramReader {
             path: PathBuf::new(),
+            pack_locks: (0..packs.len()).map(|_| Mutex::new(())).collect(),
             packs,
             chunks,
             entries: vec![],
