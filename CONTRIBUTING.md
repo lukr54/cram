@@ -1,7 +1,8 @@
 # Contributing to Cram
 
-Thanks for looking. Cram is a small, opinionated codebase: a thin core, dumb format backends, one
-smart engine. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first, it is the map, and the
+Thanks for looking. Cram is a small, opinionated codebase. Read
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first; every source file also carries a module-level
+`//!` comment explaining what it is for. The
 module-level `//!` comments in each file are the streets.
 
 **Found a security problem? Do not open a public issue**, see [`SECURITY.md`](SECURITY.md).
@@ -13,9 +14,22 @@ module-level `//!` comments in each file are the streets.
 Cram targets **`x86_64-pc-windows-gnu`** (WinLibs mingw / GCC). The [README](README.md) carries the
 authoritative toolchain setup; the short form:
 
+The stock Windows rustup default is MSVC, and the linker flags in `.cargo/config.toml` are scoped to
+`x86_64-pc-windows-gnu`. Build on the default and they are silently dropped, and the link fails on
+`multiple definition of pthread_*`. Select the toolchain once:
+
 ```sh
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
 cargo build --release
 ```
+
+CI does not rely on the default either; it sets `CARGO_BUILD_TARGET`.
+
+**CI gates on three platforms**, not one: `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-gnu` and
+`aarch64-apple-darwin` all run clippy and the full suite, and no release publishes until all three
+pass. Code behind `#[cfg(not(windows))]` is compiled by nobody on a Windows machine, and `-D
+warnings` turns its dead code into a failure, so a Windows-green change can still break the push.
 
 At the workspace root that builds every member with default features: the engine, the CLI, the
 sidecar and mount libraries, the standalone decoder, the Explorer shell handler, and the vendored
@@ -123,6 +137,24 @@ If you change a performance claim in the docs, the number must come from a run a
   valuable part.
 - Errors are typed (`ArchiveError`) and user-facing messages are plain sentences. No `unwrap()` on
   anything derived from archive bytes.
+
+### Adding or changing a dependency
+
+Two more CI jobs block a PR, and neither is fmt or clippy:
+
+- **`licences`** regenerates the third-party appendix with cargo-about 0.9.1 and diffs it against
+  the committed file, so any change to `Cargo.lock` fails until you regenerate and commit:
+
+  ```sh
+  cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
+    --workspace --features "download zstd-c phash"
+  ```
+
+  It exists because the appendix shipped once already missing eleven crates.
+
+- **`secrets`** fails on any unexplained 64-hex-character string anywhere in the tree. A test
+  vector or a hash constant will trip it; add an entry to `.github/secret-scan-allowlist.txt`
+  saying what it is.
 
 ---
 

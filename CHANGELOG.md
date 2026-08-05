@@ -7,11 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [1.0.0], unreleased
+## [Unreleased]
 
-First public release of the Cram engine and command line. Everything below is new, so there is
-nothing to list as changed or fixed. The date goes in when the tag does; nothing has been published
-yet, so the link at the foot of this file will 404 until then.
+The first public release of the Cram engine and command line. Everything below is new, so there is
+nothing to list as changed or fixed. This becomes `## [1.0.0] - <date>` when the tag is pushed.
+
+The release will also carry the **Cram Studio** installer as an asset. Studio is a separate,
+proprietary product under its own EULA; the MIT OR Apache-2.0 licence covers the engine and CLI in
+this repository and not that installer.
 
 ### Added
 
@@ -85,7 +88,8 @@ if the main build is not available. It doubles as the `make-sfx` self-extractor 
 
 **Parallel extraction** for the formats with a random-access interface (ZIP, ISO, `.cram`). The worker
 count is derived from the *destination* drive, hardware auto-detect plus a one-shot calibration
-cached in `%APPDATA%\cram\profile.toml`. `--skip` leaves a destination file alone only when a
+cached in the per-user config directory (`%APPDATA%\cram\profile.toml` on Windows,
+`~/.config/cram/` on Linux, `~/Library/Application Support/cram/` on macOS). `--skip` leaves a destination file alone only when a
 per-entry CRC proves it identical, so it helps on ZIP and 7z entries that store a CRC, and does
 nothing on `.cram`, tar, RAR or ISO, or on a WinZip AES entry written in AE-2 form, which stores no
 CRC and is proven by its AES authentication instead.
@@ -114,7 +118,10 @@ default); the DLL is bound lazily at run time, so every other command works whet
 enabled.
 
 **`cram shell`**, Cram on the Windows Explorer right-click menu. Extract here, extract to a
-subfolder and test on an archive; add to a `.cram` or a `.zip` on anything else. A COM
+subfolder and test on an archive; add to a `.cram` or a `.zip` on anything else. A container
+document (`.docx`, `.jar`, `.epub`) gets both sets, since it is legitimately both. Where
+`cram-studio.exe` sits beside `cram.exe`, two more entries appear, "Open in Cram Studio" and
+"Add to archive…", which open Studio rather than running a `cram` command. A COM
 `IContextMenu` handler, the same mechanism WinRAR and 7-Zip use, registered under `HKCU` only so it
 needs no elevation and changes nothing for other accounts. On Windows 11 it appears under "Show more
 options". `cram shell uninstall` removes it and `cram shell status` reports what is registered.
@@ -125,7 +132,7 @@ verify; the download URL is built locally rather than taken from the API respons
 binary is replaced by a move-aside and a rename, so a failure leaves the previous version in place.
 `--check` reports and changes nothing. Needs the `download` feature.
 
-**`cram conv`**, re-export any readable archive into another format, so no archive is a dead end.
+**`cram conv`**, re-export any readable archive into another format.
 Conversion does not carry encryption across: `-p` opens an encrypted *source*, `--encrypt <pw>`
 encrypts the *destination*, and converting an encrypted archive without `--encrypt` writes a
 readable, unencrypted copy.
@@ -149,9 +156,10 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 - **Platform support is not uniform.** Windows (`x86_64-pc-windows-gnu`), Linux
   (`x86_64-unknown-linux-gnu`) and macOS (`aarch64-apple-darwin`) each build and run the full test
   suite. Mount is Windows-only.
-- **`cram test` cannot detect every bit flip.** An unencrypted *stored* `.cram`, `tar` / `.tar.zst`,
-  and ISO and RAR, for which Cram computes no checksum of its own; carry no per-chunk or per-file
-  content checksum, so a flip inside file content can decode to wrong bytes undetected. What you get
+- **`cram test` cannot detect every bit flip.** Cram computes no checksum of its own for an
+  unencrypted *stored* `.cram`, for `tar` and its compressed forms, or for ISO and RAR. None of
+  those carries a per-chunk or per-file content checksum, so a flip inside file content can decode
+  to wrong bytes undetected. What you get
   there is a clean decode plus a declared-size match, plus whatever the underlying decoder rejects;
   truncation and structural damage *are* caught. For guaranteed content integrity use ZIP, 7z, or a
   compressed or encrypted `.cram`, or pair any archive with `cram sign` or `cram rec`; both cover
@@ -165,4 +173,4 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
   directories are stored, and the `.cram` format stores no timestamps by design.
 - **Nothing is code-signed**, so Windows SmartScreen warns on first run of a downloaded binary.
 
-[1.0.0]: https://github.com/lukr54/cram/releases/tag/v1.0.0
+[Unreleased]: https://github.com/lukr54/cram/compare/main...HEAD

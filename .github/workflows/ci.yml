@@ -281,10 +281,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The release body is what Cram Studio's updater renders verbatim, and the first thing
+          # anyone sees on the Releases page. `--generate-notes` emits a raw commit list, which
+          # would mean CHANGELOG.md appears nowhere at all. Extract this version's section from it
+          # instead, and fall back to generated notes only if that section cannot be found.
+          # index() rather than a regex, so the brackets in "## [1.0.0]" need no escaping through
+          # YAML, bash and awk in turn.
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v hdr="## [$ver]" '
+            index($0, hdr) == 1 { inside = 1; next }
+            inside && index($0, "## [") == 1 { exit }
+            inside { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ -s RELEASE_NOTES.md ]; then
+            notes=(--notes-file RELEASE_NOTES.md)
+          else
+            echo "::warning::no CHANGELOG.md section for $ver; falling back to generated notes"
+            notes=(--generate-notes)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             --title "Cram $GITHUB_REF_NAME" \
             --draft \
-            --generate-notes \
+            "${notes[@]}" \
             cram-*-x86_64-pc-windows-gnu.zip SHA256SUMS.windows
 
   # The Linux artifact for the same release. Built on the OLDEST supported runner (Ubuntu 22.04,

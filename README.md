@@ -246,10 +246,11 @@ cram --version                                    version + which optional featu
 ### Photos: ~23% smaller, and still byte-for-byte the same files
 
 Creating a `.cram` losslessly recompresses JPEGs. A photo's data is already entropy-coded, which is
-why zip and 7z gain essentially nothing on a photo library. Measured on a folder of 34 phone photos
+why zip and 7z gain essentially nothing on a photo library. Measured 2026-08-04 on one folder of 34 phone photos
 (26.1 MB, 8 and 12 megapixel JPEGs): ZIP and 7z both produced output *fractionally larger* than the
 originals, `tar.xz` managed 2.7%, and the same folder as a `.cram` was **23.6% smaller** with every
-file extracting byte-identical.
+file extracting byte-identical. That is a single folder, not a benchmark, and the harness is not in
+this repository; `cram a` prints the real ratio for your own files.
 
 That is one sample, not a benchmark. Expect roughly this range on ordinary photos, but the exact
 figure depends on the images; `cram a` prints the real ratio for your own files.
@@ -267,8 +268,8 @@ recoverable with the small independent decoder.
 
 ### Finding duplicates across drives
 
-`cram dedup` answers a different question from the rest of the tool: not "how do I pack this up" but
-"how much of this pile is the same file twice". It is aimed at the case where a large collection has
+`cram dedup` answers a different question from the rest of the tool: how much of this pile is the
+same file twice. It is aimed at the case where a large collection has
 accreted over years and drives, the same photo under a dozen random names, in folders nobody
 remembers copying.
 
@@ -290,8 +291,8 @@ on an SSD, because parallel reads make an HDD slower rather than faster.
 `--similar` additionally finds images that *look* the same without being byte-identical, a resized
 copy, a re-save at lower quality, the version a messaging app recompressed. These are reported
 **separately and are never counted as reclaimable space**, because a perceptual hash cannot tell a
-redundant re-encode from two different frames of a burst. Treat them as a shortlist to look
-through by hand, not as a delete list. `--similar-distance` tunes how alike is alike (0 = identical
+redundant re-encode from two different frames of a burst. They are a shortlist to look through by
+hand. `--similar-distance` tunes how alike is alike (0 = identical
 hash, default 8); it needs a build with the `phash` feature. HEIC/HEIF and camera RAW are not decoded
 for similarity (that needs a C library), though they are still covered by exact-duplicate detection,
 which never decodes anything.
@@ -308,8 +309,8 @@ cram dedup D:\photos E:\backup --link --quarantine D:\dupes --apply
 ```
 
 `--link` replaces a duplicate with a **hard link** to the copy being kept. Every filename and folder
-stays exactly where it was, for a photo collection the structure often *is* the meaning, so nothing
-disappears from view, while the redundant copies stop taking up room. Its one caveat: linked paths
+stays exactly where it was, so nothing disappears from view, while the redundant copies stop taking
+up room. Its one caveat: linked paths
 are one file, so an editor that rewrites a photo *in place* changes it under every name; tools that
 save a new file (almost all of them) are unaffected.
 
@@ -336,6 +337,9 @@ cram shell install      # cram shell status / cram shell uninstall
 Right-clicking an archive then offers **Extract here**, **Extract to `<name>\`** and **Test
 archive**; right-clicking anything else offers to add it to a `.cram` or a `.zip`. Everything sits
 under one **Cram** submenu, and each verb runs the same `cram` command you would have typed.
+A container document (`.docx`, `.jar`, `.epub`) gets both sets, being legitimately both. If Cram
+Studio is installed beside the CLI, two further entries appear, **Open in Cram Studio** and **Add to
+archive…**, which open Studio rather than running a `cram` command.
 
 It registers under `HKCU` only, so there is no elevation prompt and nothing is changed for other
 accounts. `cram shell uninstall` removes it, and `cram shell status` reports whether the handler is

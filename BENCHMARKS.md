@@ -1,282 +1,192 @@
 # Benchmarks
 
-Measured 4 August 2026 against 7-Zip 26.01 and WinRAR 7.12/7.13. Every figure is the minimum
-of repeated runs on a warm page cache. Commands are given in full so the numbers can be
+Measured 5 August 2026 against 7-Zip 26.01, RAR 7.12, xz 5.4.5 and zstd 1.5.5 on one Linux
+machine. Every archive in every table was extracted and compared byte-for-byte against the
+source; **98 of 98 verified, no failures**. Commands are given in full so the numbers can be
 checked.
 
-Nothing in this file is estimated. Where a number is missing, it says so.
+Nothing here is estimated. Where cram loses, the row is in the same table.
 
 ## Summary
 
-On a 94,753-file Linux kernel source tree, cram's default setting writes a 197 MB archive in
-7.93 s. For 7-Zip to write a smaller archive it needs `-mx=5`, which takes 5.4x as long and
-4.2x the memory. For 7-Zip to finish faster it needs `-mx=1`, which is 12% larger.
+**At the settings people actually use, cram is 6–11× faster than 7-Zip's default**, and writes
+a 9–19% larger archive. That is a different point on the speed/size frontier, not a dominance.
 
-At maximum effort cram writes a **smaller** archive than 7-Zip's default level on both
-corpora: 164,607,029 bytes against 165,227,785 on the kernel tree, and 49,228,133 against
-49,597,414 on Silesia, using 12% less memory in the first case. It takes 24% longer to get
-there.
+**cram holds the smallest archive on Silesia.** `--small` writes 48,012,170 bytes against
+7-Zip's tuned maximum at 48,287,980, and beats `xz -9e` with a 256 MiB dictionary too.
 
-Extraction is where the margin is largest: 1.88 s against 7-Zip's 5.55 s on the kernel tree.
-**Read that number with the caveat in Method below** — cram and 7-Zip did not extract the
-same number of files, and roughly 8% of the difference is accounting rather than speed.
+**cram does not hold it anywhere else.** 7-Zip `-mx=9` is 1.84% smaller on the kernel tree and
+5.09% smaller on enwik9. On the kernel tree cram `--small` is *strictly dominated*: bigger and
+slower than 7-Zip `-mx=9`.
 
-WinRAR is not on the speed/size frontier at any level on the kernel tree.
+**Against RAR on a realistic tree, cram wins outright**: default against default, 5.2× faster
+and 15% smaller.
 
-cram does not win everywhere. 7-Zip `-mx=9` reaches a ratio cram cannot match at any setting,
-and cram's `--best` gives up its former speed advantage to reach the size it now reaches.
-Both are quantified below.
+**Extraction of many small files is cram's largest margin**: 2.21 s against 7-Zip's 5.96 s and
+RAR's 11.14 s on 94,778 files.
 
-## Machines
+**One corpus exposes a real weakness.** enwik9 is a single 1 GB file, and cram extracts it in
+10.28 s against 7-Zip's 2.77 s. Parallel extraction is per-entry, and there is one entry.
 
-| | Windows | Linux |
-|---|---|---|
-| CPU | AMD Ryzen 7 3700X, 8C/16T | AMD Ryzen 9 5900X, 24 vCPU |
-| RAM | 15.9 GiB | 23 GiB |
-| OS | Windows 11 Pro 26200 | Ubuntu 24.04.4 |
-| Storage | NVMe, NTFS | virtio disk, ext4 `noatime` |
-| Notes | Defender active | KVM guest; the guest does not address the host NVMe directly |
+## Machine
 
-Tool versions: cram 1.0.0 (`zstd-c, download, phash`) · 7-Zip **26.01 on both machines** ·
-RAR 7.13 (Windows) and 7.12 (Linux; 7.13 has been withdrawn by RARLab).
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 24 threads |
+| RAM | 23 GiB |
+| OS | Ubuntu 24.04.4, kernel 6.8 |
+| Storage | dedicated ext4 volume, 124 GB free |
+
+cram 1.0.0 built with the shipping feature set (`download,zstd-c,phash`). A default-feature
+build writes XZ where the shipped one writes zstd and is not the tool users get.
 
 ## Method
 
-- Best of 2 runs, page cache warmed immediately before each run.
-- All tools receive the same explicit input list, so none silently includes or skips a file.
-- All tools are given the machine's full thread count (16 on Windows, 24 on Linux).
-- Archives are deleted between runs. 7-Zip and RAR append to an existing archive otherwise.
-- Peak RSS on Linux via `/usr/bin/time -f '%M'`. Not captured on Windows.
-- Output is written to a file handle, never a pipe.
-- **Two timings are reported for every operation.** None of these tools calls `fsync`, so on a
-  23 GiB machine a 1.6 GB archive can still be entirely in the page cache when the process
-  exits. The plain figure stops when the tool returns, which is what every published archiver
-  comparison measures; the `+sync` figure includes a full flush, which is what it costs to
-  have the bytes actually on disk. They differ by more than 3x for extraction.
-- cram is built with the shipping feature set (`download,zstd-c,phash`). A default-feature
-  build silently runs XZ at the default level instead of zstd and is not the shipping tool.
+- Silesia is the median of 3 runs; enwik9 and the kernel tree the median of 2. Each repetition
+  rotates the tool order, so no tool is permanently first or last.
+- The corpus is read into the page cache immediately before every timed run, so no tool pays to
+  warm the disk for the next one.
+- **Every tool is given all 24 threads explicitly** (`-mmt=24`, `-mt24`, `-T0`) rather than left
+  to its default.
+- **Every tool is run at both its own default and its documented maximum.** Comparing one tool's
+  maximum against another's default is the standard way these comparisons mislead.
+- Archives are deleted between runs; 7-Zip and RAR append to an existing archive otherwise.
+- Peak RSS via `/usr/bin/time -f '%M'`.
+- Every archive is extracted and `diff -rq`'d against the source. A ratio from an archive nobody
+  opened is a rumour.
+- Timings stop when the process exits. None of these tools calls `fsync`, so on a 23 GiB machine
+  part of the output can still be in the page cache at that moment. This is what every published
+  archiver comparison measures, and it flatters all four tools equally.
 
-**The three tools do not archive the same file set, and it favours cram.** The kernel tree
-holds 99 symbolic links, twelve of which point at directories. 7-Zip and WinRAR dereference
-them, so they archive and later extract **102,851 files** where cram archives **94,753** —
-the extra 8,098 being a duplicated copy of the subtrees behind those twelve directory links.
-cram archives no symlinks at all and reports each one it skipped (see `docs/CRAM_FORMAT.md`,
-"Symbolic links"). So the competitors are doing about 8% more work in the extract column, and
-cram's lead there is smaller than the raw numbers show. The size columns are barely affected,
-since duplicated content compresses away for all three.
+**All four tools archive exactly the same bytes.** The kernel tree ships 99 symbolic links,
+twelve of them pointing at directories. cram skips symlinks and reports each one; 7-Zip and RAR
+dereference them, which on this tree silently duplicates 8,011 files. Rather than caveat that
+asymmetry, the symlinks were removed from the corpus, so every tool sees an identical file set.
 
-```
-cram a OUT.cram <inputs> [--fast|--best]
-7zz  a -t7z -mx=N -mmt=<threads> -bso0 -bsp0 OUT.7z <inputs>
-rar  a -mN -s -md64m -mt<threads> -r -y -idq OUT.rar <inputs>
-```
-
-`-s` on RAR is required for a fair comparison. 7-Zip is solid by default and RAR is not.
-Without it RAR produced 286,287,804 bytes on the kernel tree instead of 186,024,063, a 35%
-penalty caused entirely by the missing switch. `-md64m` matches 7-Zip's 64 MB dictionary.
+`-s` on RAR is not optional for a fair comparison: 7-Zip is solid by default and RAR is not.
 
 ## Corpora
 
 | corpus | files | bytes | source |
 |---|---|---|---|
-| Linux kernel tree | 94,753 | 1,615,437,663 | commit `2d2338c93da79b3bfe4b6099a931d9468d539952` (v7.2-rc5), `.git` excluded |
-| Silesia | 12 | 211,938,580 | `silesia.zip` sha256 `0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af` |
-| enwik8 | 1 | 100,000,000 | mattmahoney.net |
-| enwik9 | 1 | 1,000,000,000 | mattmahoney.net |
-| Canterbury | 11 | 2,810,784 | corpus.canterbury.ac.nz |
-| Large Canterbury | 3 | 11,159,482 | corpus.canterbury.ac.nz |
-| Calgary | 18 | 3,251,493 | corpus.canterbury.ac.nz |
+| Silesia | 12 | 211,938,580 | `silesia.zip`, sha256 `0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af` |
+| enwik9 | 1 | 1,000,000,000 | mattmahoney.net/dc/enwik9.zip |
+| Linux kernel tree | 94,778 | 1,920,837,858 | `.git` and symlinks excluded |
 
-The Silesia archive hashes identically on both machines, so it is the only corpus valid for
-cross-machine comparison. The Windows kernel checkout was converted to CRLF by
-`core.autocrlf=true` and measures 1,658,608,550 bytes, 2.67% larger than the Linux checkout
-of the same commit. Kernel figures are therefore comparable between tools on one machine,
-not between machines.
-
-## Linux kernel tree, 1,615,437,663 bytes
-
-Ryzen 9 5900X, 24 threads. Sorted by create time. `+sync` includes a full flush to disk.
-
-| tool | level | size | ratio | create | +sync | MiB/s | verify | extract | +sync | peak RSS |
-|---|---|---|---|---|---|---|---|---|---|---|
-| cram | `--fast` | 259,779,988 | 6.219x | **3.12 s** | 3.69 s | 493.8 | 1.02 s | 2.17 s | 7.19 s | 332 MB |
-| 7-Zip | `-mx=1` | 221,197,968 | 7.303x | 6.15 s | 6.60 s | 250.5 | 0.74 s | 5.67 s | 10.70 s | 183 MB |
-| cram | default | 197,601,525 | 8.175x | 7.93 s | 8.35 s | 194.3 | 1.13 s | **1.88 s** | **6.70 s** | 1.37 GB |
-| WinRAR | `-m1` | 262,814,946 | 6.147x | 22.20 s | 22.85 s | 69.4 | 4.45 s | 9.22 s | 14.34 s | 534 MB |
-| 7-Zip | `-mx=5` | 165,227,785 | 9.777x | 42.64 s | 42.90 s | 36.1 | 1.09 s | 5.55 s | 10.58 s | 5.69 GB |
-| cram | `--best` | **164,607,029** | **9.814x** | 52.98 s | 53.15 s | 29.1 | 1.34 s | 3.07 s | 7.79 s | 5.00 GB |
-| WinRAR | `-m3` | 193,418,163 | 8.352x | 56.96 s | 57.10 s | 27.0 | 3.78 s | 8.54 s | 13.48 s | 550 MB |
-| WinRAR | `-m5` | 186,509,619 | 8.661x | 77.07 s | 77.13 s | 20.0 | 3.75 s | 8.57 s | 13.69 s | 1.07 GB |
-| 7-Zip | `-mx=9` | 154,370,692 | 10.465x | 84.38 s | 84.62 s | 18.3 | 1.58 s | 6.04 s | 11.12 s | 15.86 GB |
-
-A configuration is on the speed/size frontier if no other configuration is both smaller and
-faster. Here that is cram `--fast`, 7-Zip `-mx=1`, cram default, 7-Zip `-mx=5`, cram `--best`
-and 7-Zip `-mx=9`. **All three WinRAR levels are dominated**: `-m1` by cram `--fast`, which is
-both 1.2% smaller and 7.1x faster, and `-m3` and `-m5` by 7-Zip `-mx=5`.
-
-cram `--best` is 0.38% smaller than 7-Zip `-mx=5` on 12% less memory, and 24% slower. Neither
-dominates the other.
-
-7-Zip `-mx=9` reaches a ratio no cram setting matches, and needs 15.86 GB to do it — more than
-the total RAM of many machines this software is expected to run on.
+Silesia and enwik9 are the corpora the compression field publishes against, so anyone can
+re-run these. The kernel tree stands in for what people actually archive: many small files,
+mixed text and binary.
 
 ## Silesia, 211,938,580 bytes
 
-Ryzen 9 5900X, 24 threads. Sorted by create time.
+| tool | setting | create | bytes | ratio | peak RSS | extract |
+|---|---|---:|---:|---:|---:|---:|
+| **cram** | **`--small`** | 74.56 s | **48,012,170** | **0.2265** | 2227 MB | 0.86 s |
+| 7-Zip | `-mx=9` tuned | 40.07 s | 48,287,980 | 0.2278 | 2088 MB | 1.38 s |
+| xz | `-9e` | 76.51 s | 48,624,588 | 0.2294 | 1071 MB | 2.04 s |
+| 7-Zip | `-mx=9` | 34.21 s | 48,688,243 | 0.2297 | 2088 MB | 1.37 s |
+| xz | `-6` (default) | 11.23 s | 49,586,256 | 0.2340 | 1086 MB | 2.02 s |
+| 7-Zip | `-mx=5` (default) | 17.25 s | 49,597,414 | 0.2340 | 907 MB | 0.92 s |
+| zstd | `-19 --long` | 29.52 s | 52,778,162 | 0.2490 | 589 MB | 0.25 s |
+| RAR | `-m5 -s` | 5.25 s | 53,120,775 | 0.2506 | 580 MB | 0.57 s |
+| RAR | `-m3` (default) | 3.14 s | 54,218,452 | 0.2558 | 310 MB | 0.59 s |
+| **cram** | **`--auto`** (default) | **1.50 s** | 58,280,168 | 0.2750 | 764 MB | 0.28 s |
+| zstd | `-3` (default) | 0.21 s | 66,625,332 | 0.3144 | 249 MB | 0.20 s |
+| cram | `--fast` | 0.20 s | 69,474,237 | 0.3278 | 133 MB | 0.28 s |
 
-| tool | level | size | ratio | create | +sync | MiB/s | verify | extract | +sync | peak RSS |
-|---|---|---|---|---|---|---|---|---|---|---|
-| cram | `--fast` | 69,474,237 | 3.051x | **0.32 s** | 0.48 s | 631.7 | 0.25 s | 0.28 s | 0.78 s | 171 MB |
-| 7-Zip | `-mx=1` | 59,126,576 | 3.585x | 0.55 s | 0.68 s | 367.5 | 0.14 s | 0.25 s | 0.75 s | 102 MB |
-| WinRAR | `-m1` | 66,683,749 | 3.178x | 1.46 s | 1.60 s | 138.4 | 0.43 s | 0.56 s | 1.01 s | 510 MB |
-| cram | default | 58,280,168 | 3.637x | 1.63 s | 1.77 s | 124.0 | 0.25 s | 0.29 s | 0.75 s | 756 MB |
-| WinRAR | `-m3` | 54,231,315 | 3.908x | 3.52 s | 3.65 s | 57.4 | 0.48 s | 0.59 s | 1.10 s | 533 MB |
-| WinRAR | `-m5` | 53,150,010 | 3.988x | 5.71 s | 5.84 s | 35.4 | 0.47 s | 0.56 s | 1.04 s | 1.05 GB |
-| 7-Zip | `-mx=5` | 49,597,414 | 4.273x | 18.42 s | 18.55 s | 11.0 | 0.83 s | 0.93 s | 1.41 s | 907 MB |
-| cram | `--best` | **49,228,133** | **4.305x** | 18.77 s | 18.91 s | 10.8 | 0.49 s | 0.68 s | 1.15 s | 1.91 GB |
-| 7-Zip | `-mx=9` | 48,688,243 | 4.353x | 37.14 s | 37.21 s | 5.4 | 1.31 s | 1.41 s | 1.85 s | 2.09 GB |
+cram holds both ends here: the smallest archive of any tool, and the two fastest points.
+7-Zip owns the middle.
 
-Only WinRAR `-m1` is dominated here. On twelve large files WinRAR is competitive and its
-`-m3` and `-m5` are both on the frontier; the kernel-tree picture is different because WinRAR
-reaches only about 610% of 2400% available CPU on many small files.
+## enwik9, 1,000,000,000 bytes
 
-cram `--best` is 0.75% smaller than 7-Zip `-mx=5` at 1.9% more time, but carries twice the
-memory (1.91 GB against 907 MB). The memory relationship is corpus-dependent and does not
-generalise from the kernel tree.
+| tool | setting | create | bytes | ratio | peak RSS | extract |
+|---|---|---:|---:|---:|---:|---:|
+| **7-Zip** | **`-mx=9` tuned** | 155.78 s | **208,851,242** | **0.2089** | 9833 MB | 2.77 s |
+| 7-Zip | `-mx=9` | 155.47 s | 210,604,362 | 0.2106 | 9835 MB | 2.86 s |
+| xz | `-9e` | 249.50 s | 214,153,080 | 0.2142 | 3666 MB | 8.15 s |
+| cram | `--small` | 179.24 s | 219,486,008 | 0.2195 | 8210 MB | 10.28 s |
+| RAR | `-m5 -s -md512m` | 43.40 s | 219,984,649 | 0.2200 | 3910 MB | 3.35 s |
+| 7-Zip | `-mx=5` (default) | 67.38 s | 224,618,387 | 0.2246 | 3775 MB | 1.88 s |
+| zstd | `-19 --long` | 66.34 s | 230,822,761 | 0.2308 | 2402 MB | 1.21 s |
+| xz | `-6` (default) | 39.08 s | 233,402,304 | 0.2334 | 3032 MB | 7.94 s |
+| RAR | `-m5 -s` | 32.08 s | 237,654,873 | 0.2377 | 564 MB | 2.88 s |
+| RAR | `-m3` (default) | 22.23 s | 249,222,506 | 0.2492 | 294 MB | 2.84 s |
+| **cram** | **`--auto`** (default) | **11.32 s** | 267,632,141 | 0.2676 | 1937 MB | 3.91 s |
+| cram | `--fast` | 0.85 s | 328,890,853 | 0.3289 | 101 MB | 3.81 s |
 
-## Cross-machine check
+**This is cram's worst corpus and the reason is structural.** A `.cram` compresses each pack
+independently, so its match window is one pack — 64 MiB at `--small` — against LZMA's whole-file
+solid block. On one 1 GB file that costs 5.09%. RAR at `-md512m` reaches cram's `--small` ratio
+in a quarter of the time.
 
-**Measured against the previous revision (3 August 2026) and not re-run since.** The pack
-size at `--best` has changed from 8 MiB to 32 MiB, so the cram figures below no longer
-correspond to the `--best` in the tables above; they are kept because what they demonstrate
-is cross-machine byte-identity, not speed.
+## Linux kernel tree, 1,920,837,858 bytes, 94,778 files
 
-| | Windows, 16T | Linux, 24T |
-|---|---|---|
-| cram `--best` | 50,195,004 in 15.16 s | 50,195,004 in 9.12 s |
-| 7-Zip `-mx=9` | 48,688,236 in 50.41 s | 48,688,243 in 30.78 s |
-| WinRAR `-m5` | 53,147,219 in 6.08 s | 53,150,010 in 5.36 s |
+| tool | setting | create | bytes | ratio | peak RSS | extract |
+|---|---|---:|---:|---:|---:|---:|
+| **7-Zip** | **`-mx=9`** | 97.59 s | **442,486,736** | **0.2304** | 18905 MB | 6.37 s |
+| xz | `-9e` | 241.03 s | 445,092,440 | 0.2317 | 3842 MB | 9.02 s |
+| 7-Zip | `-mx=9` tuned | 102.84 s | 448,355,868 | 0.2334 | 18912 MB | 5.88 s |
+| cram | `--small` | 184.95 s | 450,635,350 | 0.2346 | 7550 MB | 5.35 s |
+| 7-Zip | `-mx=5` (default) | 49.62 s | 452,190,211 | 0.2354 | 5963 MB | 5.96 s |
+| zstd | `-19 --long` | 73.29 s | 454,490,514 | 0.2366 | 4104 MB | 3.93 s |
+| xz | `-6` (default) | 35.53 s | 458,409,724 | 0.2387 | 3185 MB | 9.19 s |
+| RAR | `-m5 -s -md512m` | 87.20 s | 474,538,515 | 0.2470 | 3962 MB | 9.64 s |
+| RAR | `-m5 -s` | 74.25 s | 482,801,949 | 0.2513 | 614 MB | 9.32 s |
+| **cram** | **`--auto`** (default) | **8.36 s** | 493,816,077 | 0.2571 | 1867 MB | **2.21 s** |
+| zstd | `-3` (default) | 1.90 s | 540,088,970 | 0.2812 | 283 MB | 4.07 s |
+| cram | `--fast` | 2.19 s | 557,998,873 | 0.2905 | 177 MB | 3.81 s |
+| RAR | `-m3` (default) | 43.47 s | 581,071,715 | 0.3025 | 345 MB | 11.14 s |
 
-Ordering was identical on both machines. cram produced **exactly the same 50,195,004 bytes**
-on Windows and Linux from independently compiled binaries. 7-Zip differed by 7 bytes,
-WinRAR by 2,791.
+Default against default, cram is **5.9× faster than 7-Zip** and **5.2× faster than RAR while
+also being 15% smaller**. It extracts in 2.21 s where 7-Zip takes 5.96 s and RAR 11.14 s.
 
-That cram property is expected to survive the pack-size change, since pack size is now chosen
-by effort level rather than by anything about the machine, and a test pins the one input that
-does vary by hardware (`tests/batch_invariance.rs`, which asserts that the number of packs
-compressed concurrently cannot change the archive). **It has not been re-verified across two
-machines since, and should be before this claim is repeated anywhere public.**
-
-## Determinism
-
-Output was byte-identical across every repeated run of all seven corpora, on a cold cache
-and a warm one, across separate sessions, and across Windows and Linux. cram writes no
-timestamps and does not let thread scheduling reach the output.
-
-## Standard corpora
-
-cram `--best`, Windows. Ratios are deterministic and hardware-independent, so published
-figures from the Large Text Compression Benchmark and lzbench are cited directly.
-
-| corpus | input | cram `--best` | ratio |
-|---|---|---|---|
-| Calgary | 3,251,493 | 854,052 | 3.807x |
-| Canterbury | 2,810,784 | 485,666 | 5.787x |
-| Large Canterbury | 11,159,482 | 2,571,006 | 4.341x |
-| enwik8 | 100,000,000 | 27,457,101 | 3.642x |
-| Silesia | 211,938,580 | 50,195,004 | 4.222x |
-| enwik9 | 1,000,000,000 | 240,181,012 | 4.164x |
-
-Against published references:
-
-| | cram | reference | delta |
-|---|---|---|---|
-| Silesia | 50,195,004 | zstd -22, 52,333,880 | cram 4.1% smaller |
-| Silesia | 50,195,004 | brotli -11, 50,407,795 | cram 0.4% smaller |
-| Silesia | 50,195,004 | xz -9, 48,745,306 | cram 3.0% larger |
-| enwik8 | 27,457,101 | zstd -22, 25,405,601 | cram 8.1% larger |
-| enwik9 | 240,181,012 | zstd -22, 215,674,670 | cram 11.4% larger |
-
-Deduplication contributed **zero bytes** on all six of these corpora, so they measure the
-entropy stage alone. On the kernel tree it contributed 45.5 MiB, 2.88% of input.
+7-Zip `-mx=9` reaches a ratio cram does not, and does it in half `--small`'s time. It pays
+**18.9 GB of RAM** to get there, against cram's 7.5 GB.
 
 ## Where cram loses
 
-**7-Zip `-mx=9` is out of reach.** 154,370,692 bytes against cram `--best`'s 164,607,029, a
-6.2% gap on the kernel tree that no cram setting closes. `.cram` compresses each pack
-independently, so its match window is one pack — 32 MiB at `--best` — where LZMA's solid block
-spans the whole archive. That is structural, not a tuning gap, and the frozen format caps a
-pack at 64 MiB. It costs 7-Zip 15.86 GB of RAM to get there.
+- **Maximum ratio on large corpora.** 7-Zip `-mx=9` is 1.84% smaller on the kernel tree and
+  5.09% smaller on enwik9. On the kernel tree cram `--small` is dominated outright: bigger and
+  slower. Use `--auto` there and take the speed.
+- **Single-file archives, on extraction.** enwik9 extracts in 10.28 s against 7-Zip's 2.77 s.
+  The parallel extract path is per-entry, so one entry means one thread.
+- **Small archives, on creation.** cram does not parallelise *within* a pack, so a corpus
+  smaller than a few packs compresses single-threaded while 7-Zip splits it across every core.
+  On a 20 MB input, cram at maximum took 15.89 s against 7-Zip `-mx=9`'s 4.55 s.
+- **Memory at maximum**, on the small corpora: 2227 MB on Silesia against 7-Zip's 2088 MB. On
+  the kernel tree the position reverses sharply, 7.5 GB against 18.9 GB.
 
-**`--best` is no longer the fast option it was.** It bought its current size by moving from
-8 MiB to 32 MiB packs, and that cost create time: 47.85 s previously against 52.98 s now on
-the kernel tree, and 9.12 s against 18.77 s on Silesia. It buys 4.5% and 1.9% of size
-respectively. On Silesia in particular that is a poor trade if size is not the goal.
+## What these corpora do not measure
 
-**Ratio falls behind on large homogeneous text.** enwik9 becomes many independent packs, so
-the penalty grows with input size and homogeneity. Silesia is within 3% of `xz -9` and enwik9
-is 11% behind `zstd -22`. Larger packs narrow this but do not close it.
+**None of the three contains duplicate content**, and cross-file deduplication is what `.cram`
+is built around. These are pure compression tests, so they measure cram's compressor with its
+main structural advantage switched off. On a corpus that does repeat itself — a set of game
+repacks, versioned build outputs, successive backups — 7-Zip and RAR cannot collapse a
+duplicate at any setting, and cram stores it once by construction.
 
-**Memory at `--best` is high.** 5.00 GB on the kernel tree, against WinRAR's 1.07 GB for a
-comparable-ratio setting. It is below 7-Zip `-mx=5`'s 5.69 GB and far below `-mx=9`'s
-15.86 GB, but it is not a small number, and it scales with pack size. The create path sizes
-its pack batch from available RAM, so a smaller machine uses less and takes longer rather than
-failing; that behaviour has not been measured on a genuinely small machine.
+That is not an excuse for the tables above. It is a statement about what is missing from them,
+and the measurement has not been done yet.
 
-**Symbolic links are not archived at all.** No format cram writes can record a link target.
-Each one is reported by name at create time rather than dropped in silence, but an archive of
-a tree containing symlinks is not a complete copy of it. See `docs/CRAM_FORMAT.md`.
+## Determinism
 
-### Fixed since the previous measurement
-
-Three entries in this section are gone because the defects behind them were fixed, not because
-the benchmark changed:
-
-- **Extraction of many small files.** Previously 39 files/s, aborted after 666 s having written
-  24,452 of 94,753 files, and described here as roughly two orders of magnitude off. Now 1.88 s
-  at the default level, faster than either competitor. The cause was the extraction scheduler
-  fanning out by entry across a shared pack cache; see `docs/PERFORMANCE_FINDINGS.md` §12-13.
-- **Verification.** Previously 17.64 s at `--best` against 7-Zip's 1.59 s. Now 1.34 s, faster
-  than `-mx=9`. It had been running on a single thread on a 24-thread machine.
-- **`--best` being dominated on the kernel tree.** 7-Zip `-mx=5` was both 4.1% smaller and
-  1.18x faster. It is now 0.38% larger than cram `--best`.
-
-## Limitations
-
-- One machine per operating system. No aggregation across hardware.
-- Peak memory was not captured on Windows.
-- The Linux machine is a KVM guest. Disk behaviour passes through the hypervisor.
-- Windows Defender was active throughout the Windows runs.
-- Source and archive shared one physical device on both machines.
-- RAR versions differ by one point release between the two machines.
-- **The extract column is not a like-for-like comparison.** 7-Zip and WinRAR wrote 102,851
-  files where cram wrote 94,753, because they dereference the tree's twelve directory
-  symlinks and cram archives no symlinks at all. About 8% of cram's extract advantage is that
-  accounting difference rather than throughput. Re-measuring on a symlink-free corpus would
-  settle it and has not been done.
-- Only the Linux machine was re-measured for this revision. The Windows figures from the
-  previous revision have been removed rather than carried forward against new Linux numbers.
-- The `--best` pack size changed between revisions (8 MiB to 32 MiB), so `--best` rows are not
-  comparable to any earlier published table. Every other level changed too.
-- cram's calibration profile (`hw.rs`) is consumed by the extraction planner, not by the
-  create path, so create figures do not depend on it. The Linux machine's cached profile was
-  inaccurate at the time of measurement and does not affect any create number here.
+An unencrypted `.cram` is byte-for-byte reproducible: the same inputs give the same archive on
+any machine, at any thread count, with any amount of RAM. Pinned by
+`crates/cram-core/tests/reproducible.rs`, `batch_invariance.rs` and `chunk_lanes.rs`, the last
+of which builds the same tree at 1, 2, 4 and 16 chunk workers and compares the bytes.
 
 ## Reproducing
 
-```bash
+```sh
 # corpora
-curl -O https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip     # sha256 0626e25f...
-git init linux && cd linux
-git remote add origin https://github.com/torvalds/linux.git
-git fetch --depth 1 origin 2d2338c93da79b3bfe4b6099a931d9468d539952
-git checkout FETCH_HEAD
+curl -LO https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip
+curl -LO https://mattmahoney.net/dc/enwik9.zip
 
 # one configuration, as run
-cram a out.cram <inputs>
-7zz  a -t7z -mx=5 -mmt=$(nproc) -bso0 -bsp0 out.7z <inputs>
-rar  a -m5 -s -md64m -mt$(nproc) -r -y -idq out.rar <inputs>
+cram a OUT.cram <inputs> --auto -y
+7zz  a -mmt=24 -mx=9 OUT.7z <inputs>
+rar  a -mt24 -m5 -s -r -y OUT.rar <inputs>
+tar -cf - <inputs> | xz -9e -T0 > OUT.tar.xz
+tar -cf - <inputs> | zstd -19 --long=27 -T0 -o OUT.tar.zst
 ```
 
-Pass the same explicit input list to each tool, delete the archive between runs, warm the
-cache first, and take the minimum of at least two runs.
+Peak RSS comes from `/usr/bin/time -f '%M'` around each command.
