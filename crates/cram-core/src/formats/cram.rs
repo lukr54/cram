@@ -1239,6 +1239,10 @@ fn pack_compress_single(raw: Vec<u8>, level: u32, use_zstd: bool) -> Result<(u8,
 /// not. Running both and keeping the winner is by construction no worse than either alone, and it
 /// is what let `--best` stop losing to the default level on a mixed corpus.
 fn pack_compress_exhaustive(raw: Vec<u8>, level: u32) -> Result<(u8, Vec<u8>)> {
+    // Only reassigned by the zstd candidate below, which a pure-Rust build compiles out entirely,
+    // leaving one candidate and an unused `mut`. CI lints on default features, so without this the
+    // push fails on a build nobody runs locally.
+    #[cfg_attr(not(feature = "zstd-c"), allow(unused_mut))]
     let mut best: Option<(u8, Vec<u8>)> = xz_compress(&raw, level)?.map(|c| (CODEC_XZ, c));
 
     #[cfg(feature = "zstd-c")]

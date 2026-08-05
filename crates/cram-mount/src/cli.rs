@@ -53,10 +53,29 @@ pub fn main(args: &[String]) -> ExitCode {
     if selftest {
         let (files, dirs, bytes) = walk_verify(&root);
         println!("selftest: {dirs} dirs, {files} files, {bytes} bytes read back through ProjFS");
-    } else {
+    } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         println!("browse it in Explorer; press Enter to unmount...");
         let mut s = String::new();
         std::io::stdin().read_line(&mut s).ok();
+    } else {
+        // No console to press Enter at: a shortcut, a scheduled task, a service, `cram mount`
+        // inside a script. Reading a line from a closed stdin returns EOF immediately, so the mount
+        // came up and went away again in the same breath while printing "mounted" and "unmounted",
+        // which reads like success and leaves nothing mounted.
+        //
+        // There is nothing to wait *for* in that case, so wait for the process to be stopped
+        // instead. A stop leaves ProjFS placeholders behind in the mount directory, which is what
+        // `mount` already detects and refuses to mount over, telling the user to delete the folder.
+        println!(
+            "no console attached, so nothing to press Enter on: the mount stays up until this"
+        );
+        println!(
+            "process is stopped. Stopping it leaves the mount folder behind; delete it before"
+        );
+        println!("mounting there again.");
+        loop {
+            std::thread::park();
+        }
     }
 
     drop(m);

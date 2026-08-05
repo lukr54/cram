@@ -410,44 +410,62 @@ unsafe extern "system" fn get_file_data(
             return E_INVALIDARG;
         }
         let ctx = (*cb).NamespaceVirtualizationContext;
-        let data = match st.reader.read_range(info.index, byte_offset, length as u64) {
-            Ok(d) => d,
-            // A missing/wrong password (e.g. an encrypted ZIP entry the mount listed but can't
-            // decrypt without the password supplied at mount time) maps to ACCESS_DENIED so the OS
-            // reports something meaningful; any other backend error is a generic failure.
-            Err(ArchiveError::PasswordRequired) | Err(ArchiveError::WrongPassword) => {
-                return ERROR_ACCESS_DENIED_HR
+        // **Serve the range in windows, not in one piece.** ProjFS decides how much to ask for, and
+        // the first read of a large placeholder asks for the entire file however few bytes the
+        // caller actually wanted: reading 1 KB at offset 300 MB of a 600 MB asset took this process
+        // to 515 MB resident. Peak memory was therefore the size of the largest file in the
+        // archive, which is exactly the wrong shape for the thing mounts exist to do -- open a game
+        // or a video without unpacking it first.
+        //
+        // The OS is happy to receive one request as several `PrjWriteFileData` calls, so memory
+        // becomes the window instead. 4 MiB is a multiple of any volume's alignment requirement,
+        // which matters because only the final write of a range is allowed to be unaligned.
+        const WINDOW: u64 = 4 * 1024 * 1024;
+        let total = length as u64;
+        let mut done = 0u64;
+        while done < total {
+            let offset = byte_offset + done;
+            let want = WINDOW.min(total - done);
+            let data = match st.reader.read_range(info.index, offset, want) {
+                Ok(d) => d,
+                // A missing/wrong password (e.g. an encrypted ZIP entry the mount listed but can't
+                // decrypt without the password supplied at mount time) maps to ACCESS_DENIED so the
+                // OS reports something meaningful; any other backend error is a generic failure.
+                Err(ArchiveError::PasswordRequired) | Err(ArchiveError::WrongPassword) => {
+                    return ERROR_ACCESS_DENIED_HR
+                }
+                Err(_) => return E_FAIL,
+            };
+            // Guard against a short decode: the placeholder advertised `info.size` (from the
+            // archive's own metadata, e.g. a ZIP central-directory size), so a read within that
+            // size must return the bytes it promised. If the entry actually decodes short (a
+            // malformed/lying archive), returning S_OK with fewer bytes would silently truncate the
+            // virtual file; surface it as a read failure instead.
+            let expected = info.size.saturating_sub(offset).min(want);
+            if (data.len() as u64) < expected {
+                return E_FAIL;
             }
-            Err(_) => return E_FAIL,
-        };
-        // Guard against a short decode: the placeholder advertised `info.size` (from the archive's
-        // own metadata, e.g. a ZIP central-directory size), so a read within that size must return
-        // the bytes it promised. If the entry actually decodes short (a malformed/lying archive),
-        // returning S_OK with fewer bytes would silently truncate the virtual file; surface it as a
-        // read failure instead.
-        let expected = info.size.saturating_sub(byte_offset).min(length as u64);
-        if (data.len() as u64) < expected {
-            return E_FAIL;
+            if data.is_empty() {
+                break; // past the end of the entry; the range asked for more than exists
+            }
+            let buf = projfs_api::allocate_aligned_buffer(ctx, data.len());
+            if buf.is_null() {
+                return E_OUTOFMEMORY;
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, data.len());
+            let r = projfs_api::write_file_data(
+                ctx,
+                &(*cb).DataStreamId,
+                buf,
+                offset,
+                data.len() as u32,
+            );
+            projfs_api::free_aligned_buffer(buf);
+            if let Err(e) = r {
+                return e.code();
+            }
+            done += data.len() as u64;
         }
-        if data.is_empty() {
-            return S_OK;
-        }
-        let buf = projfs_api::allocate_aligned_buffer(ctx, data.len());
-        if buf.is_null() {
-            return E_OUTOFMEMORY;
-        }
-        std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, data.len());
-        let r = projfs_api::write_file_data(
-            ctx,
-            &(*cb).DataStreamId,
-            buf,
-            byte_offset,
-            data.len() as u32,
-        );
-        projfs_api::free_aligned_buffer(buf);
-        match r {
-            Ok(()) => S_OK,
-            Err(e) => e.code(),
-        }
+        S_OK
     })
 }
