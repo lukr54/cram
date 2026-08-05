@@ -72,24 +72,37 @@ and work on **any file**, not just Cram's own formats. The self-extracting `.exe
 
 ## Install
 
-Prebuilt Windows x86-64 binaries are attached to the releases at
-<https://github.com/lukr54/cram/releases>: `cram.exe`, `cram-extract.exe`, and `cram_shell.dll` (the
-Explorer right-click menu, which does nothing until you run `cram shell install`). Keep the three
-together. They are **not code-signed**, so SmartScreen will warn on first run (see
-[Limitations](#limitations)).
+**No binary release has been published yet.** There is no tag, the Releases page is empty, and
+everything in this section starts working the moment a `v*` tag is pushed. Until then, build from
+source — see [Building from source](#building-from-source) below.
 
-Once installed, `cram update` fetches the next release, checks it against the SHA-256 the release
-publishes, and replaces itself. It refuses to install anything it cannot verify.
+Once the first release exists, Windows x86-64 binaries ship as a single zip,
+`cram-<tag>-x86_64-pc-windows-gnu.zip`, alongside `SHA256SUMS.windows` and a version-free
+`cram-latest-x86_64-pc-windows-gnu.zip` so a permanent
+`https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-pc-windows-gnu.zip`
+link keeps working. The zip holds `cram.exe`, `cram-extract.exe`, `cram_shell.dll` (the Explorer
+right-click menu, which does nothing until you run `cram shell install`) and `libwinpthread-1.dll`,
+which `cram.exe` links against and will not start without. Keep the contents together. They are
+**not code-signed**, so SmartScreen will warn on first run (see [Limitations](#limitations)).
+
+`cram update` then fetches the next release, checks it against the SHA-256 the release publishes,
+and replaces itself. It refuses to install anything it cannot verify. Run against an empty Releases
+page today it reports that no published release exists yet.
 
 ### Linux and macOS
 
-The `cram` CLI runs on Linux x86-64 and on Apple Silicon macOS. Install the latest release binary with:
+The `cram` CLI runs on Linux x86-64 and on Apple Silicon macOS. Once a release is published, install
+it with:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/lukr54/cram/main/install.sh | sh
 ```
 
-That drops `cram` into `~/.local/bin` (no root, no daemon, nothing else touched); re-run it to upgrade.
+The script resolves the newest release from the GitHub API, so it exits with "could not determine the
+latest release" until one exists; build from source in the meantime.
+
+It installs two binaries into `~/.local/bin` (no root, no daemon, nothing else touched) — `cram` and
+`cram-extract`, which `cram make-sfx` shells out to — and re-running it upgrades them.
 Prefer to read before you pipe to a shell? Download [`install.sh`](install.sh), read it, then run it.
 The tarball is also attached to each release if you'd rather place the binary yourself. Archive
 **mount** (`cram mount`) is Windows-only (it uses ProjFS); every other verb works identically.
@@ -106,15 +119,25 @@ Cram targets **`x86_64-pc-windows-gnu`** (WinLibs mingw / GCC). No MSVC toolchai
 required. The UnRAR C++ dependency needs the linker flags already configured in
 [`.cargo/config.toml`](.cargo/config.toml).
 
+The stock Windows rustup default is MSVC, which is **not** the configuration this ships as: the
+linker flags in `.cargo/config.toml` are scoped to `x86_64-pc-windows-gnu`, so a default build
+silently drops them and fails on `multiple definition of pthread_*`. Select the toolchain first:
+
 ```sh
-cargo build --release -p cram-cli -p cram-extract
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
+cargo build --release -p cram-cli -p cram-extract -p cram-shell
 ```
+
+CI pins the same target through `CARGO_BUILD_TARGET` rather than relying on the default.
 
 That produces, in `target/release/`:
 
 - **`cram.exe`**, the CLI.
 - **`cram-extract.exe`**, a standalone `.cram` decoder and the self-extractor stub. Keep it beside
   `cram.exe`; `cram make-sfx` shells out to it and fails without it.
+- **`cram_shell.dll`**, the Explorer right-click handler. `cram shell install` refuses to run
+  without it beside `cram.exe`, which is why it is in the build line above.
 
 Deploying either binary also needs `libwinpthread-1.dll` alongside it (it lives on the mingw PATH
 during development).
@@ -144,8 +167,9 @@ cargo build --release -p cram-cli --features zstd-c,download
 writes different `.cram` bytes than the pure-Rust default, so it is worth checking before comparing
 two archives.
 
-Run the tests with `cargo test`; that is 174 tests across the workspace, and 185 with the features
+Run the tests with `cargo test`; that is 212 tests across the workspace, and 224 with the features
 the release is built with (`download,zstd-c,phash`), which compile code the default build leaves out.
+Exact counts drift with every commit; what matters is that the suite is green.
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -411,6 +435,11 @@ contains no benchmark harness, so nothing here is a performance claim.
 
 Cram Studio is a separate Windows desktop application built on this engine. Its source is not in
 this repository, and nothing in this repository depends on it.
+
+**Studio is proprietary and sold under its own EULA.** The MIT OR Apache-2.0 licence on this page
+covers the engine and the CLI in this repository and nothing else. When the Studio installer is
+published as an asset on this repository's Releases page, that installer is not covered by those
+licences.
 
 ---
 

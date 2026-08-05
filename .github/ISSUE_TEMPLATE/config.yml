@@ -1,0 +1,16 @@
+# The bug report form is the only template, so without these links there is nowhere in the filing
+# flow that repeats SECURITY.md's "please do not open a public issue", and nothing at all for a
+# Cram Studio buyer who lands here because the installer is published on this repository.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/lukr54/cram/security/advisories/new
+    about: >-
+      Do not open a public issue. Anything that escapes the output directory, corrupts memory, runs
+      code or forges a signature goes through the private advisory form. No GitHub account? Email
+      cram-support@nexalit.fr and say it is a security report.
+  - name: Cram Studio (the Windows GUI)
+    url: mailto:cram-support@nexalit.fr
+    about: >-
+      Studio's installer is published here but its source is not in this repository. Studio bugs,
+      licence keys and purchases go to cram-support@nexalit.fr.

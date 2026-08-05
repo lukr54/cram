@@ -6,6 +6,10 @@ labels: bug
 assignees: ''
 ---
 
+> **Security bug? Do not file it here.** Anything that escapes the output directory, corrupts
+> memory, runs code or forges a signature goes to the [private advisory
+> form](https://github.com/lukr54/cram/security/advisories/new). See [SECURITY.md](../../SECURITY.md).
+
 **What happened**
 
 A clear description of the bug: what you ran and what went wrong.
@@ -20,6 +24,7 @@ repro matters more than a description: archive bugs are usually specific to how 
 **Environment**
 
 - Cram version (`cram --version`):
+- Which component (`cram` / `cram-extract` / the Explorer right-click menu):
 - OS and version (Windows / Linux / macOS):
 - Archive format(s) involved (zip / 7z / rar / tar family / `.cram` / …):
 

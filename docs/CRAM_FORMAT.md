@@ -39,8 +39,8 @@ document and the code disagree, that is a bug in one of them; please file it.
 
 `packs_start` is `8` for an unencrypted archive and `8 + 28 = 36` for an encrypted one. The index
 sits at the end of the packs region (immediately before the trailer) so the writer can stream packs
-out in a single forward pass and only needs to seek once, never at all, in practice, since it
-appends. The trailer records where the index begins, so a reader finds everything by reading the
+out in a single forward pass, appending throughout. It seeks exactly once, back to offset 6, and
+only when it has to promote the archive to v2 because an entry was transformed. The trailer records where the index begins, so a reader finds everything by reading the
 fixed-size trailer first.
 
 ---
@@ -82,8 +82,8 @@ Present **iff** the ENCRYPTED flag is set. Immediately follows the header.
 | p_cost  | u32       | Argon2 parallelism (lanes)                     |
 
 The cost parameters are stored so they stay tunable without a format change. Because they come from
-an untrusted file, a reader **must** clamp them before use (§8): reject `m_cost > 1048576` (1 GiB),
-`t_cost > 64`, or `p_cost > 16`. The reference writer emits `m_cost = 19456` (19 MiB), `t_cost = 2`,
+an untrusted file, a reader **must** clamp them before use (§8): reject `m_cost > 262144` (256 MiB),
+`t_cost > 8`, or `p_cost > 16`. The reference writer emits `m_cost = 19456` (19 MiB), `t_cost = 2`,
 `p_cost = 1`, the OWASP-recommended Argon2id floor.
 
 ---
@@ -166,12 +166,21 @@ before trusting it in any budget calculation.
 - `name`, the member path, UTF-8, forward-slash separated, no leading slash. Two distinct rules:
   - a name that is **not valid UTF-8** is corruption, the reference reader rejects the whole
     archive (§9 item 13);
-  - a name that is valid UTF-8 but **unsafe as a path** (`..` traversal, drive letter / absolute
-    path, NUL, a reserved device name) must be sanitized before use as a filesystem path. The
-    reference reader **silently drops** such an entry from the listing (it is neither listed nor
-    extracted) rather than rejecting the archive.
-- `size`, the reconstructed file length in bytes. Invariant: `size == Σ length` over the entry's
-  `chunk_ids` (§8). Directories have `size == 0` and no chunks.
+  - a name that is valid UTF-8 but **unsafe as a path** is handled three different ways, and the
+    difference matters to anyone writing a reader:
+    - **dropped** (neither listed nor extracted, archive not rejected): a `..` component, any
+      component containing `:` (drive letter or NTFS alternate data stream), a NUL byte, an empty
+      name, or more than 4096 path components.
+    - **normalised**: leading separators are stripped, so a POSIX absolute path `/etc/passwd` is
+      kept and stored as `etc/passwd`, relative to the destination.
+    - **kept verbatim, mangled only on write**: a Windows reserved device name (`NUL`, `CON`,
+      `COM1`, …) survives into the listing unchanged and is mangled (`NUL` → `_NUL`) only when it
+      becomes a real path, so a Unix-authored file called `NUL` is preserved rather than written to
+      the null device.
+- `size`, the reconstructed file length in bytes. Invariant, **for an untransformed entry only**:
+  `size == Σ length` over the entry's `chunk_ids` (§9). A transformed entry (§6) stores fewer bytes
+  than it reconstructs, so the equality does not hold there; the bound is `Σ length != 0` and
+  `size <= Σ length × 64` instead. Directories have `size == 0` and no chunks.
 - `mode`, Unix permission bits, or `0` if unknown/not applicable. **The file-type bits of `st_mode`
   are reserved, not spare** (see "Symbolic links" below); do not repurpose them.
 - `chunk_ids`, the ordered list of chunk-table indices whose bytes, concatenated in this order,
@@ -266,16 +275,26 @@ any violation as corruption (never a panic, never an unbounded allocation):
 5. Every pack lies wholly within `[packs_start, index_offset)`, checked by subtraction for the same
    reason, and `raw_len ≤ 64 MiB`.
 6. Every `ChunkLoc`: `pack_id < pack_count` and `offset + length ≤ pack.raw_len`.
-7. Every entry `chunk_id < chunk_count`, and `size == Σ length` over the entry's chunks.
+7. Every entry `chunk_id < chunk_count`. For an entry with `transform == NONE`, `size == Σ length`
+   over its chunks; for a transformed entry that equality does **not** hold and check 13 applies
+   instead. A reader built from this list without the carve-out rejects every valid v2 archive.
 8. On decompression, a pack must expand to **exactly** its declared `raw_len` (a codec that yields a
    different length is corruption).
 9. Argon2 parameter caps (§3).
-10. **Anti-amplification budget:** reconstructing one entry may decompress at most
-    `max(256 MiB, 1000 × file_len)` bytes total. This bounds a hostile `chunk_ids` list that
-    alternates packs to force repeated full-pack decompression (a bomb from a tiny file). The
-    `size == Σ length` invariant (7) bounds output; this bounds work.
+10. **Anti-amplification budget:** a reader may decompress at most
+    `max(256 MiB, 16 × total declared output)` bytes over the whole extraction, where *total declared
+    output* is the sum of the entries' `size` fields. The budget is charged cumulatively across the
+    reader's lifetime, not per entry. This bounds a hostile `chunk_ids` list that alternates packs to
+    force repeated full-pack decompression (a bomb from a tiny file). The `size == Σ length`
+    invariant (7) bounds output; this bounds work.
+
+    A bound of the form `ratio × file_len` was tried and abandoned: it rejects an archive that
+    legitimately compresses better than the ratio, which a sparse or highly repetitive input does.
 11. Counts (`pack_count`, `chunk_count`, `entry_count`, `chunk_id_count`, `name_len`) are never used
     to pre-size an allocation; parse incrementally so a bogus count fails on exhausted input.
+12. **Path depth:** an entry name with more than 4096 path components is dropped, not extracted.
+13. **Transform expansion:** a transformed entry's declared `size` may be at most **64×** the summed
+    length of its chunks. A transformed entry whose chunks sum to zero is rejected.
 12. Reject an unknown pack `codec`, only STORE (0), XZ (1), and ZSTD (2) are defined (§11).
 13. Every entry `name` must be valid UTF-8; a non-UTF-8 name is corruption and rejects the archive.
     (A name that is valid UTF-8 but unsafe as a path is *not* corruption, see §6.)
@@ -312,9 +331,10 @@ not hashes, so a reader neither computes nor trusts any hash.
 | ZSTD  | 2  | pack plaintext is a single zstd frame; `raw_len` is its decoded length    |
 
 Every build can **decode** all three codecs (the XZ and zstd decoders are pure-Rust and always
-present), so any `.cram` file is readable regardless of which build produced it. Which codec a
-**writer** emits is a build/config choice (the default writer uses XZ; a `zstd-c` build may write
-ZSTD), and does not affect readability.
+present), so any `.cram` file is readable regardless of which build produced it. Which codec a **writer** emits is a
+build and effort-level choice, and does not affect readability. A pure-Rust build always writes XZ.
+Every officially released binary is built with `zstd-c` and writes **ZSTD** at `--fast` and `--auto`
+and **XZ** at `--small`, picking STORE for any pack the codec fails to shrink.
 
 ---
 

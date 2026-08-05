@@ -4,7 +4,7 @@ How the engine and the `cram` CLI are put together, for someone reading or chang
 normative `.cram` container spec is [`CRAM_FORMAT.md`](CRAM_FORMAT.md); what the tool does from a
 user's seat is [`README.md`](../README.md); how to build and test is
 [`CONTRIBUTING.md`](../CONTRIBUTING.md). Every source file carries a module-level doc comment
-(`//! …`) explaining that piece, this document is the map, those comments are the streets.
+(`//! …`) explaining that piece; this document maps them.
 
 ---
 
@@ -51,7 +51,7 @@ in the engine.
 | Crate | What it is |
 |---|---|
 | **`cram-core`** | the engine, every read/write backend, and the `.cram` format. The library everything else builds on. |
-| **`cram-cli`** | the single `cram` binary. Parses the archive verbs (calling `cram-core`) and delegates the sidecar/mount tools to their crates' `cli::main`. |
+| **`cram-cli`** | the single `cram` binary. Three dispatch mechanisms: it parses the archive verbs itself (calling `cram-core`), delegates the sidecar/mount tools to their crates' `cli::main`, and **execs** the co-located `cram-extract` stub for `make-sfx` rather than linking it, which is what preserves the no-shared-code rule of §6. It also owns `cram update` (`update.rs`): a GitHub release fetch whose URL is constructed locally rather than echoed from the API, a mandatory SHA-256 check before anything is written, and move-aside replacement of the running binary. `CRAM_UPDATE_REPO` overrides the repository for tests. |
 | **`cram-mount`** | ProjFS mount, present an archive as a browsable virtual folder. Its own crate so the Windows/ProjFS specifics stay contained. |
 | **`cram-recovery`** | Reed-Solomon parity **sidecar** (`.cramrec`): store parity, later repair bit-rot or truncation. Works on any file. |
 | **`cram-sign`** | detached **ed25519** signature sidecar (`.cramsig`), authorship plus integrity. Works on any file. |
@@ -94,8 +94,9 @@ wins, so a `.zip` that is really a RAR is handled as a RAR.
 `Format` to a concrete reader or writer.
 
 **Random-access formats, ZIP, `.cram`, ISO 9660; take the parallel path**
-([`engine/parallel.rs`](../crates/cram-core/src/engine/parallel.rs)): a rayon pool, largest-entry-first
-scheduling to keep it balanced, and every worker opening its own handle via `copy_entry`. Those three
+([`engine/parallel.rs`](../crates/cram-core/src/engine/parallel.rs)): a rayon pool, largest-group-first
+scheduling to keep it balanced (a group's weight is the sum of its entries, since a group runs in
+sequence), and every worker opening its own handle via `copy_entry`. Those three
 containers can address an entry without reading what precedes it, which is what makes independent
 per-entry workers possible.
 
@@ -115,8 +116,12 @@ mtime.
 
 The parallel path folds entries by **destination path** before scheduling, since two entries can map
 to one on-disk file, duplicate names (legal in ZIP), case-variants on NTFS, Win32 trailing-dot/space
-normalization. Only the last occurrence per folded path is scheduled; the shadowed ones count as
-skipped.
+normalization. A colliding group is **serialised onto one task in archive order** and every member is written; the
+last writer owns the file. Nothing is dropped and nothing counts as skipped.
+
+Keeping only the last entry per folded key was tried and removed: it destroyed files whenever the
+fold was harsher than the target filesystem's own rule, and a four-pair archive lost three files
+while exiting 0.
 
 ### Worker count
 
@@ -374,9 +379,11 @@ Archives are untrusted input, so hardening is centralized rather than sprinkled 
   ([`model.rs`](../crates/cram-core/src/model.rs)), the single place that strips or rejects absolute
   paths (a POSIX-style leading `/` is dropped, so `/etc/hosts` becomes `etc/hosts` under the
   destination; a drive letter is rejected outright), rejects `..`, alternate data streams (any
-  component containing `:`), NUL and pathologically deep names, and that mangles Windows device names
-  (`NUL`, `CON`, …) so a Unix-authored file named `NUL` is kept rather than silently written to the
-  null device. The result is always relative, so `join_under` cannot leave the output directory.
+  component containing `:`), NUL and pathologically deep names. Windows device names (`NUL`, `CON`, …)
+  survive `from_raw` **verbatim**, so the archive still lists what it contains; they are mangled in
+  `join_under`, on the way to a real path, so a Unix-authored file named `NUL` is kept rather than
+  silently written to the null device. The result is always relative, so `join_under` cannot leave
+  the output directory.
 - **Decompression bombs**: bodies stream through bounded buffers and are size-checked against the
   container's declared sizes, so a crafted huge size cannot force an unbounded allocation. `cram test`
   streams bodies through a hashing sink, so even a bombed entry is counted and discarded rather than
@@ -421,11 +428,17 @@ Archives are untrusted input, so hardening is centralized rather than sprinkled 
     enabling it does not fork the format.
   - **`download`** (off by default) pulls in `rdm-core` and its async/HTTP dependencies for `cram dl`
     and extract-while-download.
+  - **`phash`** (off by default in the engine, **on** in the shipped CLI) adds perceptual image
+    hashing. It gates `cram dedup --similar`, which on a default build prints "rebuild with
+    --features phash" and does nothing. §4's perceptual "similar" groups depend on it.
   - `cram --version` prints which of these the binary was built with.
 - **ProjFS binding is clean-room and lazy.** The mount uses the MIT/Apache `windows` crate's ProjFS
   *type* definitions rather than the GPL `windows-projfs` crate, and lives in its own crate. The
   *function* bindings are ours and resolve at first use (§8).
-- **Windows-first, GNU toolchain.** Cram targets `x86_64-pc-windows-gnu` (WinLibs mingw); UnRAR needs
-  the link tweaks in [`.cargo/config.toml`](../.cargo/config.toml). Some code (`hw.rs`, the mount) is
-  Windows-only; non-Windows targets get a stub `mount` that errors.
+- **Three targets, Windows-first.** `x86_64-pc-windows-gnu` (WinLibs mingw), `x86_64-unknown-linux-gnu`
+  and `aarch64-apple-darwin` all build, test and publish. UnRAR needs the link tweaks in
+  [`.cargo/config.toml`](../.cargo/config.toml) on Windows and a system g++ on Linux. **Only the mount
+  is Windows-only** (it is ProjFS); non-Windows targets get a stub `mount` that errors. `hw.rs` is a
+  three-platform module with a per-OS detection backend: Win32, sysfs on Linux, sysctl on macOS.
+  macOS binaries are unsigned, so a download is Gatekeeper-quarantined.
 - **Binaries are not code-signed.** Windows SmartScreen will warn on first run.

@@ -1,7 +1,7 @@
 # Security policy
 
-Cram parses files that come from other people, downloads, mail attachments, a colleague's USB stick.
-This document says where to report a problem, what counts as one, and which protections exist.
+Cram parses files that come from other people. This document says where to report a problem and
+which protections exist.
 
 It covers the code in this repository: the `cram-core` engine, the `cram` CLI, the `cram-sign`,
 `cram-recovery` and `cram-mount` sidecars, the standalone `cram-extract` decoder, the `cram-shell`
@@ -13,8 +13,9 @@ features are.
 
 ## Supported versions
 
-`1.0.x` is supported. It is the first public release, so there is nothing earlier and nothing to
-backport to. Fixes land on `main` and ship in the next release.
+**No binary release has shipped yet.** Until the first `v*` tag is pushed, fixes land on `main` and
+are available by building from source. Once v1.0.0 is published, `1.0.x` is the supported line;
+there is nothing earlier and nothing to backport to.
 
 ---
 
@@ -26,6 +27,9 @@ backport to. Fixes land on `main` and ship in the next release.
 
 That is the channel to use. It keeps the report private until a fix exists and lets us add you to the
 discussion.
+
+No GitHub account? Email <cram-support@nexalit.fr> instead. Say in the subject that it is a security
+report and we will move it to a private advisory.
 
 **Please do not open a public issue** for anything that lets a crafted file escape the output
 directory, corrupt memory, run code, or forge a signature. Ordinary crashes and wrong-output bugs with
@@ -40,7 +44,7 @@ A useful report contains:
 
 ### What to expect
 
-Cram is maintained by Nexalit, a small company. There is no 24/7 security team. Our targets:
+Cram is maintained by Nexal IT (Ulysses Horkan EI). There is no 24/7 security team. Our targets:
 
 - **acknowledgement within 7 days**,
 - **an assessment within 30 days**, in scope or not, our severity read, and whether a fix is planned,
@@ -65,6 +69,7 @@ Anything below, reachable by feeding Cram a file you control:
 | **Standalone decoder** | [`crates/cram-extract`](crates/cram-extract/src/main.rs) | it is shipped to people who may have no other tool to hand; it gets the same scrutiny as the engine |
 | **Explorer handler** | [`crates/cram-shell`](crates/cram-shell/src/lib.rs) | it runs **inside explorer.exe**: anything that lets a crafted file name reach a command line unquoted, crash Explorer, or make a menu verb act on a path the user did not select |
 | **Self-update** | [`cram-cli/src/update.rs`](crates/cram-cli/src/update.rs) | it replaces the running binary: anything that lets an unverified, wrong-version or attacker-chosen payload be installed |
+| **Install script** | [`install.sh`](install.sh) | it is a piped shell install, running before the user has any binary to inspect: anything that makes it fetch or execute a payload it did not verify against `SHA256SUMS` |
 | **Download engine** | [`crates/rdm-core`](crates/rdm-core/src/) | it parses Metalink XML and HTTP `Link` headers straight off the network, ahead of any user decision: a redirect, header or manifest that makes `cram dl` write outside the chosen directory, fetch from a host the user never named, or exhaust memory |
 
 ## Out of scope
@@ -78,6 +83,9 @@ Anything below, reachable by feeding Cram a file you control:
   directory, its state directory, or your signing keys.
 - **Missing hardening with no demonstrated impact.** Very welcome as a normal issue or PR, just not
   as an advisory.
+- **Cram Studio**, the Windows GUI. Its installer is published on this repository's Releases page
+  but its source is not in this repository and the private repo cannot take a report. Send Studio
+  findings to <cram-support@nexalit.fr>.
 - **The ProjFS requirement.** `cram mount` needs the optional Windows feature `Client-ProjFS`, which
   is off by default and takes an elevated `Enable-WindowsOptionalFeature` to turn on. That is
   Windows' design, not a Cram flaw. Every other command works without it.
