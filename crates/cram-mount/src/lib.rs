@@ -104,7 +104,14 @@ pub fn mount_with(
     // Sniff → dispatch to whichever backend offers random access (ZIP or `.cram`). The mount only
     // ever touches the `RandomAccessReader` boundary, so it is agnostic to which concrete reader backs it.
     let fmt = cram_core::sniff::sniff_path(archive)?;
-    let reader = cram_core::formats::open_random_access(archive, fmt, pw)?;
+    // A mount is the long-lived, local-read case, so it asks for the smaller pack cache. Sized for
+    // extraction it held ~512 MB resident on a 600 MB archive for as long as the mount was up.
+    let reader = cram_core::formats::open_random_access_with(
+        archive,
+        fmt,
+        pw,
+        cram_core::formats::cram::CacheProfile::Browse,
+    )?;
     let inner = projfs::MountInner::start(reader, root, writable)?;
     Ok(Mount {
         inner,

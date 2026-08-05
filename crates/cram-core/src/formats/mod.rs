@@ -55,9 +55,25 @@ pub fn open_random_access(
     fmt: Format,
     pw: Arc<dyn PasswordProvider>,
 ) -> Result<Box<dyn RandomAccessReader>> {
+    open_random_access_with(path, fmt, pw, cram::CacheProfile::Extract)
+}
+
+/// As [`open_random_access`], but states what the reader is for so it can size its caches.
+///
+/// Only `.cram` acts on it today, and only for the decompressed-pack cache: a mount is one reader
+/// doing local reads that stays open for hours, where extraction's sizing (one pack per worker)
+/// means hundreds of megabytes resident to serve a pattern that needs a handful of packs.
+pub fn open_random_access_with(
+    path: &Path,
+    fmt: Format,
+    pw: Arc<dyn PasswordProvider>,
+    profile: cram::CacheProfile,
+) -> Result<Box<dyn RandomAccessReader>> {
     match fmt.container {
         Container::Zip => Ok(Box::new(zip::ZipReader::open(path, pw)?)),
-        Container::Cram => Ok(Box::new(cram::CramReader::open(path, pw)?)),
+        Container::Cram => Ok(Box::new(cram::CramReader::open_with_cache(
+            path, pw, profile,
+        )?)),
         Container::Iso => Ok(Box::new(iso::IsoReader::open(path, pw)?)),
         // No native random-access interface → decode the whole stream into a bounded in-memory cache.
         Container::Tar | Container::SevenZ | Container::Rar | Container::Raw => {

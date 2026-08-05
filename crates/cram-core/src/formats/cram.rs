@@ -300,7 +300,7 @@ const PACK_CACHE_CAP: usize = 256 * 1024 * 1024;
 /// fixed by the level that made it and only the memory spent handling it bends to the hardware. A
 /// 4 GB machine reading a 32 MiB-pack archive caches less and re-decodes a little more; it still
 /// reads the archive, and it reads exactly the same archive a large machine does.
-fn pack_cache_cap(packs: &[PackLoc]) -> usize {
+fn pack_cache_cap(packs: &[PackLoc], profile: CacheProfile) -> usize {
     const CEILING: usize = 1024 * 1024 * 1024;
     let largest = packs.iter().map(|p| p.raw_len as usize).max().unwrap_or(0);
     let ram_avail = HwProfile::detect().ram_avail;
@@ -312,8 +312,37 @@ fn pack_cache_cap(packs: &[PackLoc]) -> usize {
     };
     // Room for one pack always wins: a cache too small to hold the pack being decoded would make
     // every single entry a fresh decompression.
-    let floor = PACK_CACHE_CAP.min(ceiling).max(largest);
-    largest.saturating_mul(32).clamp(floor, ceiling.max(floor))
+    match profile {
+        CacheProfile::Extract => {
+            let floor = PACK_CACHE_CAP.min(ceiling).max(largest);
+            largest.saturating_mul(32).clamp(floor, ceiling.max(floor))
+        }
+        // One reader walking a file needs the pack it is in and the few around it, not one per
+        // worker. Four packs covers a sequential walk (chunks are laid down in file order, so
+        // consecutive reads land in the same pack or the next) while a mount left open for hours
+        // holds tens of MiB instead of hundreds. It still must hold one whole pack, or every chunk
+        // would re-read its pack from the top -- `read_pack` reads all of `comp_len` whichever
+        // chunk was asked for, so a cache too small to keep it turns a sequential read into one
+        // full pack read per chunk.
+        CacheProfile::Browse => largest
+            .saturating_mul(4)
+            .clamp(largest.max(1), (64 * 1024 * 1024).max(largest)),
+    }
+}
+
+/// How much decompressed-pack cache a reader should keep, which depends on who is reading rather
+/// than on the archive.
+///
+/// Extraction runs one pack per worker across every thread and finishes; a cache below the thread
+/// count evicts packs still in use and they are decompressed twice. A mount is one reader doing
+/// local reads and stays open for as long as the user leaves it, so the same sizing means hundreds
+/// of megabytes resident for hours to serve a pattern that needs a handful of packs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheProfile {
+    /// Sized for parallel extraction: room for 32 packs, one per worker and then some.
+    Extract,
+    /// Sized for a long-lived reader doing local reads, such as a mount.
+    Browse,
 }
 
 /// Read-side pack accounting, printed when `CRAM_PROFILE` is set.
@@ -2242,6 +2271,15 @@ pub struct CramReader {
 
 impl CramReader {
     pub fn open(path: &Path, pw: Arc<dyn PasswordProvider>) -> Result<Self> {
+        Self::open_with_cache(path, pw, CacheProfile::Extract)
+    }
+
+    /// Open with an explicit cache profile; see [`CacheProfile`].
+    pub fn open_with_cache(
+        path: &Path,
+        pw: Arc<dyn PasswordProvider>,
+        profile: CacheProfile,
+    ) -> Result<Self> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         if file_len < HEADER_LEN + TRAILER_LEN {
@@ -2445,7 +2483,7 @@ impl CramReader {
         Ok(Self {
             path: path.to_path_buf(),
             pack_locks: (0..packs.len()).map(|_| Mutex::new(())).collect(),
-            pack_cache: Mutex::new(PackCache::new(pack_cache_cap(&packs))),
+            pack_cache: Mutex::new(PackCache::new(pack_cache_cap(&packs, profile))),
             packs,
             chunks,
             entries,
