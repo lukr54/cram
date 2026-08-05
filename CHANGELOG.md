@@ -166,8 +166,9 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
   the whole file.
 - **RAR is read-only** and always will be, the UnRAR licence forbids building a RAR compressor from
   its source.
-- **Each RAR entry is buffered whole in memory** by the UnRAR engine, so an entry larger than 2 GiB
-  is refused and reported as a per-entry failure rather than extracted.
+- **A RAR entry is buffered whole in memory** by the UnRAR engine, which has no per-chunk hook.
+  Entries above a memory-derived threshold are extracted to a scratch file beside the archive and
+  streamed from there instead, costing one extra write and read; no entry is refused for its size.
 - **Mounting tar / 7z / RAR / a bare compressed stream is capped at 2 GiB** of uncompressed content.
 - **Symlinks and other special files are not archived on create**, only regular files and
   directories are stored, and the `.cram` format stores no timestamps by design.

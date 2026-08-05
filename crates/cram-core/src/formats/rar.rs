@@ -7,12 +7,14 @@
 //! because `OpenArchive` owns its C handle (no borrow of the path/password), so it can live in the
 //! struct between calls. Each file entry is read fully into memory (UnRAR has no per-chunk hook),
 //! then streamed to disk by the sequential engine; only one entry is buffered at a time. Because
-//! that read is whole-entry (unbounded by anything but the declared size), an entry whose declared
-//! size exceeds `MAX_INMEM_ENTRY` is refused (surfaced as a per-entry failure) rather than allowed
-//! to OOM the process, a crafted RAR could otherwise claim a multi-TB entry.
+//! that read is whole-entry (unbounded by anything but the declared size), an entry larger than
+//! [`inmem_ceiling`] is instead extracted by UnRAR straight to a scratch file and streamed back
+//! from there, so a crafted RAR claiming a multi-TB entry cannot force the allocation, and a real
+//! multi-gigabyte one still extracts.
 
+use std::fs::{self, File};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -20,15 +22,73 @@ use unrar::{Archive, CursorBeforeHeader, OpenArchive, Process, VolumeInfo};
 
 use crate::error::{ArchiveError, Result};
 use crate::format::Format;
+use crate::hw;
 use crate::model::{Entry, EntryKind, EntryPath};
 use crate::reader::{ArchiveReader, EntryStream};
 use crate::secret::{PasswordProvider, PasswordRequest, Secret};
 
-/// Ceiling on a single RAR entry read whole into RAM. UnRAR's safe API has no per-chunk hook (only
-/// whole-entry `read()` or extract-to-file), so we bound the declared size: a hostile archive can't
-/// force an unbounded allocation, and an entry above this is reported as a failure, not extracted.
-/// Generous so real files pass; a future extract-to-temp path could stream and lift this.
-const MAX_INMEM_ENTRY: u64 = 2 * 1024 * 1024 * 1024;
+/// Hard ceiling on what may be read whole into RAM, whatever the machine reports.
+const INMEM_CAP: u64 = 1024 * 1024 * 1024;
+/// Floor, so a machine that reports almost no free memory still takes the fast path for ordinary
+/// files instead of writing a scratch copy of everything.
+const INMEM_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// How large a RAR entry may be before it is streamed through a scratch file instead of a `Vec`.
+///
+/// UnRAR's safe API has no per-chunk hook: `read()` returns the whole entry at once. So every entry
+/// is either one allocation of its full size or one temporary file, and the only question is where
+/// the line sits. Below it, the allocation is cheaper than the extra write and read a scratch copy
+/// costs. Above it, the allocation is the thing that fails.
+///
+/// Derived from free memory rather than fixed, because the old fixed 2 GiB was wrong in both
+/// directions: it refused entries that a 24 GiB machine could hold easily, and it would happily
+/// attempt a 1.9 GiB allocation on a machine with 2 GiB free. This is extraction, so nothing here
+/// reaches an archive's bytes and it is free to depend on the machine.
+fn inmem_ceiling() -> u64 {
+    if let Some(n) = std::env::var_os("CRAM_RAR_INMEM")
+        .and_then(|v| v.to_str()?.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
+    let avail = hw::HwProfile::detect().ram_avail;
+    if avail == 0 {
+        return INMEM_FLOOR;
+    }
+    (avail / 4).clamp(INMEM_FLOOR, INMEM_CAP)
+}
+
+/// A body backed by a scratch file, which is removed once the engine has finished reading it.
+struct ScratchBody {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl ScratchBody {
+    fn new(file: File, path: PathBuf) -> Self {
+        Self {
+            file: Some(file),
+            path,
+        }
+    }
+}
+
+impl io::Read for ScratchBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.file.as_mut() {
+            Some(f) => f.read(buf),
+            None => Ok(0),
+        }
+    }
+}
+
+impl Drop for ScratchBody {
+    fn drop(&mut self) {
+        // Close the handle before unlinking: Windows refuses to delete an open file.
+        self.file = None;
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 /// A body that fails on first read, surfaces an entry we refuse to extract (an
 /// oversized RAR entry UnRAR would buffer whole in RAM) as a per-entry failure via the engine's
@@ -161,6 +221,35 @@ pub struct RarReader {
 }
 
 impl RarReader {
+    /// Where to put the scratch copy of an entry too large to hold in memory.
+    ///
+    /// Beside the archive first. That directory demonstrably holds a file at least as large as the
+    /// one being extracted, and on Linux it avoids `/tmp`, which is frequently a tmpfs -- writing a
+    /// 3 GiB scratch copy into RAM would defeat the entire point of not holding it in RAM. Falls
+    /// back to the system temp directory when the archive's own directory is not writable, which is
+    /// the read-only-share and mounted-image case.
+    fn scratch_path(&self) -> Option<PathBuf> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = format!(".cram-rar-{}-{}.part", std::process::id(), stamp);
+        for dir in [
+            self.path.parent().map(Path::to_path_buf),
+            Some(std::env::temp_dir()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = dir.join(&name);
+            // Prove it is writable by creating it, rather than inferring from permissions.
+            if File::create(&candidate).is_ok() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     /// Re-open the archive and wind the cursor forward to just after header `self.pos`.
     ///
     /// Needed because `unrar`'s `read()` takes `self` by value and propagates with `?` *before*
@@ -309,18 +398,57 @@ impl ArchiveReader for RarReader {
                 }));
             }
 
-            // Refuse an entry whose declared size would buffer an unreasonable amount in RAM: UnRAR
-            // reads the whole entry (no per-chunk hook), so a crafted huge size would OOM. Skip its
-            // data and hand back a body that errors, so the engine records one failure and moves on.
-            if size > MAX_INMEM_ENTRY {
-                self.state = Some(header.skip().map_err(map_unrar)?);
-                return Ok(Some(EntryStream {
-                    entry,
-                    body: Box::new(ErrBody::new(format!(
-                        "entry too large to extract from RAR in memory ({size} bytes)"
-                    ))),
-                    meta_final: true,
-                }));
+            // An entry too big to hold in RAM goes out to a scratch file and is streamed back from
+            // there. UnRAR has no per-chunk hook -- `read()` hands back the whole entry as one Vec
+            // -- but it *can* write the entry to a file itself, so a large entry is a temporary
+            // file rather than a large allocation.
+            //
+            // This used to refuse outright above a flat 2 GiB. A repacked game with one asset over
+            // that size extracted every other file, reported a single failure, and left an install
+            // that did not run; 7-Zip, WinRAR and Bandizip all extract it, because none of them
+            // routes the bytes through memory.
+            if size > inmem_ceiling() {
+                let scratch = match self.scratch_path() {
+                    Some(p) => p,
+                    None => {
+                        self.state = Some(header.skip().map_err(map_unrar)?);
+                        return Ok(Some(EntryStream {
+                            entry,
+                            body: Box::new(ErrBody::new(format!(
+                                "entry is {size} bytes, too large to hold in memory, and no \
+                                 writable scratch directory was found to stream it through"
+                            ))),
+                            meta_final: true,
+                        }));
+                    }
+                };
+                match header.extract_to(&scratch) {
+                    Ok(next) => {
+                        self.state = Some(next);
+                        let file = File::open(&scratch).map_err(|e| {
+                            ArchiveError::Backend(format!("reopening the scratch copy: {e}"))
+                        })?;
+                        return Ok(Some(EntryStream {
+                            entry,
+                            body: Box::new(ScratchBody::new(file, scratch)),
+                            meta_final: true,
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = fs::remove_file(&scratch);
+                        // Same policy as the in-memory path below: one damaged entry is a per-entry
+                        // failure, not the end of the job.
+                        let msg = format!("unrar: {e}");
+                        if !self.reposition() {
+                            self.state = None; // cannot continue; the report keeps what we recovered
+                        }
+                        return Ok(Some(EntryStream {
+                            entry,
+                            body: Box::new(ErrBody::new(msg)),
+                            meta_final: true,
+                        }));
+                    }
+                }
             }
 
             // File: UnRAR extracts the whole entry into a Vec (no per-chunk hook), advancing the

@@ -411,9 +411,11 @@ contains no benchmark harness, so nothing here is a performance claim.
   2 GiB; above that the mount is refused. Only ZIP, ISO and `.cram` are projected lazily.
 - **A mount is read-only, and its directory is removed on unmount.** Edits saved into a mounted
   folder never reach the archive and do not survive the unmount (see ‡ above).
-- **RAR entries larger than 2 GiB are refused.** The RAR decoder hands an entry back in one piece
-  rather than in chunks, so an entry has to fit in memory; past 2 GiB Cram reports it as a per-entry
-  failure and carries on with the rest of the archive.
+- **A large RAR entry is written to a scratch file first.** The RAR decoder hands an entry back in
+  one piece rather than in chunks, so anything too big to hold in memory is extracted by UnRAR
+  straight to a scratch file beside the archive and streamed from there, then deleted. The threshold
+  comes from free memory. It costs one extra write and read for those entries, and no entry is
+  refused for its size.
 - **`cram conv` cannot read a `.cram` entry larger than 512 MiB.** Conversion walks the source entry
   by entry and holds one whole entry in memory, so a `.cram` containing a single file above that
   limit fails to convert ("entry too large to buffer in memory") even though `cram x` extracts the

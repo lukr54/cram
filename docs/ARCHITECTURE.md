@@ -404,9 +404,12 @@ Archives are untrusted input, so hardening is centralized rather than sprinkled 
   `i32`) is reported as a crash and returns 70, rather than being clamped into a false success.
   Isolation applies only when an argument actually names an existing RAR file, so every other archive
   keeps the in-process path. **This isolation belongs to the CLI**, a program linking `cram-core`
-  directly decodes RAR in-process. UnRAR's safe API has no per-chunk hook, so an entry is read whole
-  into RAM and a single entry above **2 GiB** is reported as a per-entry failure rather than
-  extracted.
+  directly decodes RAR in-process. UnRAR's safe API has no per-chunk hook, so an entry is either read
+  whole into RAM or handed to UnRAR's own extract-to-file call. Which one is decided per entry
+  against a threshold derived from free memory (`CRAM_RAR_INMEM` overrides it): below it the
+  allocation is cheaper, above it the allocation is what fails. The scratch copy goes beside the
+  archive rather than in the system temp directory, which on Linux is frequently a tmpfs, where a
+  multi-gigabyte scratch file would land right back in the RAM it exists to avoid.
 - **Damage is contained, not hidden.** A damaged entry does not abort the job: intact entries are
   extracted, each damaged one is collected in the `Report` by name, and the process exits non-zero so
   a script can tell. On the sequential path a stream that cannot advance (truncation, a broken header)
