@@ -60,7 +60,7 @@ fn lzma_level(level: Level) -> u32 {
     match level {
         Level::Auto | Level::Balanced => 6,
         Level::Fastest => 1,
-        Level::Best => 9,
+        Level::Best | Level::Cold => 9,
         Level::Explicit(n) => n.clamp(0, 9),
     }
 }

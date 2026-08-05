@@ -34,6 +34,15 @@ AES-256-GCM encryption, when a password is set the footer index is sealed along 
 the file listing is hidden as well as the contents, and byte-for-byte reproducible when unencrypted.
 Specified normatively in [`docs/CRAM_FORMAT.md`](docs/CRAM_FORMAT.md).
 
+**Four effort levels**, `--store`, `--fast`, the default, `--best`, and `--cold`. `--store` keeps the
+bytes as they are and still deduplicates them. `--cold` is the far end: the widest pack the format
+allows, LZMA's extreme match search, and a per-pack search over pre-filters and coder parameters,
+keeping whichever came out smallest. That search is worth its cost because the answer is
+content-dependent, the x86 BCJ filter takes Silesia's `ooffice` down 14.1% and makes `mozilla` 0.9%
+larger, so it can only ever be a candidate. Measured on Silesia, `--cold` is 2.5% smaller than
+`--best`, and smaller than `xz -9e` with a 256 MiB dictionary. Nothing about it reaches the reader:
+an xz block header carries its own filter chain, so a `--cold` archive is read by any Cram build.
+
 **`cram dedup`**, find duplicate files across folders and drives, without archiving anything. A file
 whose size is unique cannot have a byte-identical twin, so it is never read; same-size files are
 separated by a partial hash of their first and last 64 KiB; only what survives both is read in full

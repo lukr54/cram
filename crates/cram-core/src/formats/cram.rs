@@ -45,7 +45,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use fastcdc::v2020::StreamCDC;
-use lzma_rust2::{XzOptions, XzReader, XzWriter};
+use lzma_rust2::{FilterType, XzOptions, XzReader, XzWriter};
 use zeroize::Zeroizing;
 
 use crate::error::{ArchiveError, Result};
@@ -233,6 +233,10 @@ fn pack_target_for(level: Level) -> usize {
         Level::Fastest => 8 * MIB,
         Level::Auto | Level::Balanced | Level::Explicit(_) => 16 * MIB,
         Level::Best => 32 * MIB,
+        // As large as the format permits. A pack is the window every match has to be found inside,
+        // and 32 -> 64 MiB measured 0.7% on Silesia; the ceiling is what a reader is obliged to
+        // accept ([`MAX_PACK_RAW`]), less the one chunk a pack may overshoot its target by.
+        Level::Cold => MAX_PACK_RAW - CHUNK_MAX as usize,
     }
 }
 
@@ -421,7 +425,7 @@ fn preset(level: Level) -> u32 {
     match level {
         Level::Auto | Level::Balanced => 6,
         Level::Fastest => 1,
-        Level::Best => 9,
+        Level::Best | Level::Cold => 9,
         Level::Explicit(n) => n.clamp(0, 9),
     }
 }
@@ -1166,6 +1170,9 @@ enum PackPolicy {
     Single { zstd: bool },
     /// `--best`: every codec, no sampling shortcut, smallest result wins.
     Exhaustive,
+    /// `--cold`: as `Exhaustive`, plus a search over pre-filters and coder parameters, and LZMA's
+    /// extreme match search over the widest pack the format allows.
+    Cold,
 }
 
 /// Codec choice for one pack: zstd (fast, `zstd-c` build only) or XZ (default, best ratio). Returns
@@ -1179,6 +1186,7 @@ fn pack_compress(raw: Vec<u8>, level: u32, policy: PackPolicy) -> Result<(u8, Ve
         PackPolicy::Store => Ok((CODEC_STORE, raw)),
         PackPolicy::Single { zstd } => pack_compress_single(raw, level, zstd),
         PackPolicy::Exhaustive => pack_compress_exhaustive(raw, level),
+        PackPolicy::Cold => pack_compress_cold(raw, level),
     }
 }
 
@@ -1250,10 +1258,168 @@ fn pack_compress_exhaustive(raw: Vec<u8>, level: u32) -> Result<(u8, Vec<u8>)> {
 /// Borrows rather than consuming so the exhaustive path can also hand the same bytes to zstd, and
 /// keep them, without a copy of the pack per attempt.
 fn xz_compress(raw: &[u8], level: u32) -> Result<Option<Vec<u8>>> {
-    let mut w = XzWriter::new(Vec::new(), XzOptions::with_preset(level))?;
+    let mut opts = XzOptions::with_preset(level);
+    // `CRAM_XZ_EXTREME` puts `xz -9e`'s match search behind the ordinary levels. The knob exists
+    // because extreme mode is not the obvious trade it sounds like: on Silesia as one stream it was
+    // both 0.64% smaller *and* faster than plain preset 9, since a nice length of 273 lets the
+    // finder stop early on long matches. Whether that holds on data with fewer long matches is the
+    // open question, and this is how it gets asked.
+    if env_i32("CRAM_XZ_EXTREME") == Some(1) {
+        opts.lzma_options.nice_len = 273;
+        opts.lzma_options.depth_limit = 512;
+    }
+    xz_encode(raw, opts)
+}
+
+/// Run one configured XZ encode. `None` means it didn't shrink and the caller should store.
+fn xz_encode(raw: &[u8], options: XzOptions) -> Result<Option<Vec<u8>>> {
+    let mut w = XzWriter::new(Vec::new(), options)?;
     w.write_all(raw)?;
     let comp = w.finish()?;
     Ok((comp.len() < raw.len()).then_some(comp))
+}
+
+/// One thing `--cold` tries on a pack: an optional pre-filter, and how LZMA splits its literal and
+/// position context bits.
+///
+/// **None of this reaches the reader.** An xz block header records its own filter chain and the
+/// LZMA2 properties with it, so `XzReader` reads a filtered or retuned pack back without being told
+/// anything; only the *choice* is ours to make. That is what keeps a search this wide out of the
+/// format.
+#[derive(Clone, Copy)]
+struct ColdCandidate {
+    /// Filter, and its property: the delta distance, or a BCJ start offset.
+    filter: Option<(FilterType, u32)>,
+    lc: u32,
+    lp: u32,
+    pb: u32,
+}
+
+/// Fixed order, so a tie between two candidates of equal size breaks the same way on every machine.
+///
+/// Deliberately small. Each entry is a full LZMA pass, and the answer is content-dependent rather
+/// than universally good -- the x86 filter took Silesia's `ooffice` down 14.1% and made `mozilla`
+/// 0.9% larger -- so what belongs here is the handful known to matter, not a sweep. `lc4 lp0 pb0` is
+/// the usual win on text, `lc0 lp2 pb2` on word-aligned binary data, and the two BCJ variants cover
+/// the executables people actually archive. `lc + lp <= 4` is an LZMA constraint; both hold.
+const COLD_CANDIDATES: &[ColdCandidate] = &[
+    ColdCandidate {
+        filter: None,
+        lc: 3,
+        lp: 0,
+        pb: 2,
+    },
+    ColdCandidate {
+        filter: None,
+        lc: 4,
+        lp: 0,
+        pb: 0,
+    },
+    ColdCandidate {
+        filter: None,
+        lc: 0,
+        lp: 2,
+        pb: 2,
+    },
+    ColdCandidate {
+        filter: Some((FilterType::BcjX86, 0)),
+        lc: 3,
+        lp: 0,
+        pb: 2,
+    },
+    ColdCandidate {
+        filter: Some((FilterType::BcjArm64, 0)),
+        lc: 3,
+        lp: 0,
+        pb: 2,
+    },
+    ColdCandidate {
+        filter: Some((FilterType::Delta, 4)),
+        lc: 3,
+        lp: 0,
+        pb: 2,
+    },
+];
+
+/// Build the encoder options for one candidate.
+///
+/// `extreme` is what `xz -9e` adds over `xz -9`: the preset alone tops out at a nice length of 64,
+/// and the extreme flag is the deeper, slower match search laid over it. That is exactly the trade
+/// `--cold` exists to make.
+fn cold_options(preset: u32, cand: &ColdCandidate, extreme: bool) -> XzOptions {
+    let mut opts = XzOptions::with_preset(preset);
+    if extreme {
+        opts.lzma_options.nice_len = 273;
+        opts.lzma_options.depth_limit = 512;
+    }
+    opts.lzma_options.lc = cand.lc;
+    opts.lzma_options.lp = cand.lp;
+    opts.lzma_options.pb = cand.pb;
+    if let Some((filter, property)) = cand.filter {
+        opts.prepend_pre_filter(filter, property);
+    }
+    opts
+}
+
+/// `--cold`: choose a filter and coder split per pack, then encode it properly.
+///
+/// Two phases rather than one. Encoding every candidate at full strength would be six extreme-mode
+/// passes over a 64 MiB pack; instead each is screened at preset 1, which is cheap, and only the
+/// winner is encoded at preset 9 extreme. The shortcut holds because a filter either matches the
+/// data or it does not -- BCJ is looking for x86 call/jump displacements, and whether they are there
+/// is not a function of how hard the match finder is trying. `CRAM_COLD_EXHAUSTIVE=1` skips the
+/// screen and encodes every candidate at full strength, which is how that claim gets checked.
+fn pack_compress_cold(raw: Vec<u8>, level: u32) -> Result<(u8, Vec<u8>)> {
+    let exhaustive = env_i32("CRAM_COLD_EXHAUSTIVE") == Some(1);
+    let mut best: Option<(u8, Vec<u8>)> = None;
+    let keep = |cand_out: Option<Vec<u8>>, codec: u8, best: &mut Option<(u8, Vec<u8>)>| {
+        if let Some(c) = cand_out {
+            if best.as_ref().is_none_or(|(_, b)| c.len() < b.len()) {
+                *best = Some((codec, c));
+            }
+        }
+    };
+
+    if exhaustive {
+        for cand in COLD_CANDIDATES {
+            keep(
+                xz_encode(&raw, cold_options(level, cand, true))?,
+                CODEC_XZ,
+                &mut best,
+            );
+        }
+    } else {
+        // Screen cheaply, then commit. A candidate that cannot beat the plain one at preset 1 is not
+        // going to start winning because the match finder got more patient.
+        let mut winner = &COLD_CANDIDATES[0];
+        let mut winner_len = usize::MAX;
+        for cand in COLD_CANDIDATES {
+            if let Some(c) = xz_encode(&raw, cold_options(1, cand, false))? {
+                if c.len() < winner_len {
+                    winner_len = c.len();
+                    winner = cand;
+                }
+            }
+        }
+        keep(
+            xz_encode(&raw, cold_options(level, winner, true))?,
+            CODEC_XZ,
+            &mut best,
+        );
+    }
+
+    // zstd is still worth asking, for the same reason it is at `--best`: it wins the packs XZ gives
+    // up on entirely, which are a rounding error in bytes but free to collect here.
+    #[cfg(feature = "zstd-c")]
+    {
+        let floor = best.as_ref().map_or(raw.len(), |(_, c)| c.len());
+        let zc = zstd::bulk::compress(&raw, zstd_level(level))
+            .map_err(|e| ArchiveError::Backend(format!("zstd encode: {e}")))?;
+        if zc.len() < floor {
+            best = Some((CODEC_ZSTD, zc));
+        }
+    }
+    Ok(best.unwrap_or((CODEC_STORE, raw)))
 }
 
 impl CramArchiveWriter {
@@ -1306,7 +1472,8 @@ impl CramArchiveWriter {
         // lands near XZ's size for a fraction of the encode time -- a different point on the
         // frontier rather than a cheaper route to the same one.
         let use_zstd = cfg!(feature = "zstd-c")
-            && (!matches!(opts.level, Level::Best) || env_i32("CRAM_FORCE_ZSTD") == Some(1));
+            && (!matches!(opts.level, Level::Best | Level::Cold)
+                || env_i32("CRAM_FORCE_ZSTD") == Some(1));
         // `--store` reaches here as `format::Codec::None`. For a container that wraps a stream that
         // means "no wrapper"; for `.cram`, which compresses per pack, nothing consulted it at all
         // and the flag did nothing. It now means what it says.
@@ -1316,6 +1483,8 @@ impl CramArchiveWriter {
         // knob exists precisely to measure zstd alone against XZ alone.
         let policy = if store_packs {
             PackPolicy::Store
+        } else if matches!(opts.level, Level::Cold) && env_i32("CRAM_FORCE_ZSTD") != Some(1) {
+            PackPolicy::Cold
         } else if matches!(opts.level, Level::Best) && env_i32("CRAM_FORCE_ZSTD") != Some(1) {
             PackPolicy::Exhaustive
         } else {

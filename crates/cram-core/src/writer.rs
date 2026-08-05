@@ -45,6 +45,16 @@ pub enum Level {
     Fastest,
     Balanced,
     Best,
+    /// The smallest archive reachable in a reasonable time, with speed **explicitly secondary**.
+    ///
+    /// Where [`Best`](Self::Best) makes one good attempt per pack, this searches: LZMA's extreme
+    /// parameters, a wider window, and a set of pre-filters and coder parameters tried per pack with
+    /// the smallest result kept. The search is worth having because the answer is genuinely
+    /// content-dependent -- the x86 BCJ filter took Silesia's `ooffice` down 14.1% and made
+    /// `mozilla` 0.9% *larger* -- so it cannot be a default, only a candidate.
+    ///
+    /// Only `.cram` distinguishes this from `Best`; every other container treats the two alike.
+    Cold,
     /// Raw codec level (meaning is codec-specific); clamped to the codec's valid range.
     Explicit(u32),
 }

@@ -179,3 +179,73 @@ fn jpeg_is_only_transformed_when_requested() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// **`--cold` searches pre-filters, and what it finds has to decode.**
+///
+/// The level tries a BCJ or delta filter ahead of LZMA on every pack and keeps whichever came out
+/// smallest. That is safe only because an xz block header records its own filter chain, so
+/// `XzReader` puts it back without being told; nothing in the reader, the format or `cram-extract`
+/// knows this level exists. If that ever stops being true the archive still lists, still tests, and
+/// hands back mangled bytes, so the check that matters is byte-for-byte equality after a round trip.
+///
+/// The tree deliberately contains real machine code -- this test binary -- because the filters only
+/// engage on the data they were built for, and a corpus of text would exercise none of them. On
+/// Silesia the x86 filter took `ooffice` down 14.1% while making `mozilla` 0.9% larger, which is why
+/// it is searched per pack rather than applied.
+#[test]
+fn cold_round_trips_through_its_filters() {
+    use std::sync::Arc;
+    let dir = scratch("cold");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    // Real executable bytes, so the BCJ candidates have something to match on.
+    let exe = fs::read(std::env::current_exe().unwrap()).unwrap();
+    fs::write(src.join("code.bin"), &exe[..exe.len().min(2_000_000)]).unwrap();
+    fs::write(
+        src.join("prose.txt"),
+        "the quick brown fox jumps over the lazy dog, repeatedly and at length\n".repeat(3_000),
+    )
+    .unwrap();
+    // Word-aligned numeric data, which is what the delta and lp/pb candidates are for.
+    let mut table = Vec::new();
+    for i in 0..80_000u32 {
+        table.extend_from_slice(&(i.wrapping_mul(2_654_435_761)).to_le_bytes());
+    }
+    fs::write(src.join("table.bin"), &table).unwrap();
+
+    let arc = dir.join("cold.cram");
+    let cold = create(
+        &arc,
+        &src,
+        CreateOptions {
+            level: Level::Cold,
+            ..Default::default()
+        },
+    );
+    let raw: u64 = fs::read_dir(&src)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(cold < raw, "--cold produced {cold} bytes from {raw}");
+
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    cram_core::engine::extract(
+        &arc,
+        &out,
+        Arc::new(cram_core::secret::NoPassword),
+        Default::default(),
+        &cram_core::progress::NullSink,
+    )
+    .unwrap_or_else(|e| panic!("extract a --cold archive: {e}"));
+
+    for name in ["code.bin", "prose.txt", "table.bin"] {
+        assert_eq!(
+            fs::read(src.join(name)).unwrap(),
+            fs::read(out.join("src").join(name)).unwrap(),
+            "{name} did not survive --cold; a pre-filter is not being reversed on read"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

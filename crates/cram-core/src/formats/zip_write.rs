@@ -159,7 +159,7 @@ fn deflate_level(level: Level) -> Option<i64> {
     match level {
         Level::Auto | Level::Balanced => None,
         Level::Fastest => Some(1),
-        Level::Best => Some(9),
+        Level::Best | Level::Cold => Some(9),
         Level::Explicit(n) => Some((n as i64).clamp(0, 9)),
     }
 }

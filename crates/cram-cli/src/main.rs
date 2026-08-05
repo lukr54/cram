@@ -3,7 +3,7 @@
 //! ```text
 //! cram l  <archive>                            list entries
 //! cram x  <archive> [-o <dir>] [-p <pw>]       extract (parallel per-entry for ZIP) [--skip]
-//! cram a  <archive> <input...> [-p <pw>]       create [--store|--fast|--best] [--encrypt-names]
+//! cram a  <archive> <input...> [-p <pw>]       create [--store|--fast|--best|--cold] [--encrypt-names]
 //!                                              [--overwrite] to replace an existing <archive>
 //! cram t  <archive> [-p <pw>]                  test integrity (decode + checksums, no extract)
 //! cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format
@@ -264,14 +264,18 @@ const USAGE: &str = "\
 usage: cram <command> …
   l  <archive>                        list entries
   x  <archive> [-o <dir>] [-p <pw>]   extract [--skip]
-  a  <archive> <input...> [-p <pw>]   create [--store|--fast|--best] [--encrypt-names]
+  a  <archive> <input...> [-p <pw>]   create [--store|--fast|--best|--cold] [--encrypt-names]
+       --store keeps the bytes as they are (dedup still runs), --fast and --best trade
+       time for size, and --cold is the smallest cram can go: the widest window the
+       format allows, LZMA's extreme match search, and a per-pack search over pre-filters
+       and coder parameters. Expect it to take several times as long as --best
        --recompress losslessly recompresses JPEGs, ~23% off each one with the exact
        originals restored on extract. It is slow -- roughly 4x the create time -- so it
-       is on only with --best or when asked for by name; --no-recompress overrides both
+       is on only with --best/--cold or when asked for by name; --no-recompress overrides both
        --overwrite (-y) replaces an existing <archive>; without it cram refuses, because
        `a` creates a new archive rather than adding to one
   t  <archive> [-p <pw>]              test integrity (decode + checksums, no extract)
-  conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--best|--fast|--store]
+  conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--cold|--best|--fast|--store]
        also refuses an existing <out> unless --overwrite
   dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]
        several urls = mirrors of one file · --discover finds mirrors · --auto ramps
@@ -1305,12 +1309,13 @@ fn recompress_choice(args: &[String]) -> bool {
     if has(args, "--no-recompress") {
         return false;
     }
-    has(args, "--recompress") || has(args, "--best")
+    has(args, "--recompress") || has(args, "--best") || has(args, "--cold")
 }
 
 fn create_inputs(args: &[String]) -> Vec<PathBuf> {
     const CREATE_FLAGS: &[&str] = &[
         "--best",
+        "--cold",
         "--fast",
         "--store",
         "--encrypt-names",
@@ -1397,7 +1402,9 @@ fn create(args: &[String]) -> Result<()> {
     overwrite_guard(&archive, args)?;
     let fmt = fmt_for_create(&archive)?;
 
-    let level = if has(args, "--best") {
+    let level = if has(args, "--cold") {
+        Level::Cold
+    } else if has(args, "--best") {
         Level::Best
     } else if has(args, "--fast") {
         Level::Fastest
@@ -1499,6 +1506,7 @@ fn convert_cmd(args: &[String]) -> Result<()> {
         2,
         &[
             "--best",
+            "--cold",
             "--fast",
             "--store",
             "--encrypt-names",
@@ -1522,7 +1530,9 @@ fn convert_cmd(args: &[String]) -> Result<()> {
     let src_fmt = sniff::sniff_path(&src)?; // magic-sniff the existing source
     let dst_fmt = fmt_for_create(&dst)?; // format from the destination extension
 
-    let level = if has(args, "--best") {
+    let level = if has(args, "--cold") {
+        Level::Cold
+    } else if has(args, "--best") {
         Level::Best
     } else if has(args, "--fast") {
         Level::Fastest
