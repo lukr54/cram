@@ -294,7 +294,7 @@ index fully determines reconstruction, but it explains why the format deduplicat
 - A chunk's identity is its **BLAKE3** hash (256-bit). The writer keeps a hash→chunk-id table; a
   chunk whose hash is already present is not stored again, its id is simply referenced.
 - Unique chunks accumulate into a pack buffer; when the buffer reaches the writer's pack target
-  (8 MiB at `--fast`, 16 MiB by default, 32 MiB at `--best`; always `≤ 64 MiB`, §9 check 5) it is
+  (8 MiB at `--fast`, 16 MiB at `--auto`, the §9 maximum at `--small`; always `≤ 64 MiB`, §9 check 5) it is
   flushed as a pack (§4). A pack that compression does not shrink is stored with codec STORE so a
   pack never grows.
 

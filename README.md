@@ -154,7 +154,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Using it
 
 ```sh
-cram a backup.cram ./project        # create (adaptive compression; --store / --fast / --best)
+cram a backup.cram ./project        # create (adaptive compression; --fast / --auto / --small)
 cram l backup.cram                  # list
 cram t backup.cram                  # test integrity (no extract; exits non-zero if bad)
 cram x backup.cram -o ./out         # extract (--skip: see the note below)
@@ -171,10 +171,10 @@ same way.
 ```
 cram l  <archive>                                 list entries
 cram x  <archive> [-o <dir>] [-p <pw>] [--skip]   extract
-cram a  <archive> <input...> [-p <pw>]            create [--store|--fast|--best] [--encrypt-names]
+cram a  <archive> <input...> [-p <pw>]            create [--fast|--auto|--small|--store]
            [--overwrite]                          [--overwrite] replaces an existing <archive>
 cram t  <archive> [-p <pw>]                       test integrity (decode + checksums, no extract)
-cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--best|--fast|--store]
+cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--fast|--auto|--small]
            [--overwrite]                          [--overwrite] replaces an existing <out>
 cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]
                                                   segmented download; several URLs are mirrors of
