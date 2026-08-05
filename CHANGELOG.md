@@ -127,6 +127,12 @@ the folder resets to a pristine archive and is the only way, since ProjFS cannot
 virtualization root. Without the flag, a folder that has picked up files not in the archive is now
 kept rather than deleted, which previously lost them silently.
 
+`--remember` adds a mount to a list that `cram mount --restore` brings back after a reboot, in one
+process holding all of them. `--list` shows it, `--forget` drops an entry without touching the
+folder. Nothing is remembered unless asked for: the list starts empty and there is no setting that
+turns auto-remount on for everything. Encrypted archives are refused, their password not being
+something Cram will store.
+
 **`cram shell`**, Cram on the Windows Explorer right-click menu. Extract here, extract to a
 subfolder and test on an archive; add to a `.cram` or a `.zip` on anything else. A container
 document (`.docx`, `.jar`, `.epub`) gets both sets, since it is legitimately both. Where

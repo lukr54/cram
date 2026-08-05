@@ -22,6 +22,19 @@ use cram_core::secret::{FixedPassword, NoPassword, PasswordProvider, Secret};
 pub fn main(args: &[String]) -> ExitCode {
     let selftest = args.iter().any(|a| a == "--selftest");
     let writable = args.iter().any(|a| a == "--writable");
+    let remember = args.iter().any(|a| a == "--remember");
+
+    // These three do not mount anything, so they answer before the parsing below, which requires
+    // an archive and a directory.
+    if args.iter().any(|a| a == "--list") {
+        return list_remembered();
+    }
+    if args.iter().any(|a| a == "--forget") {
+        return forget_remembered(args);
+    }
+    if args.iter().any(|a| a == "--restore") {
+        return restore_remembered();
+    }
     let pw: Arc<dyn PasswordProvider> = match args.iter().position(|a| a == "-p") {
         Some(i) => Arc::new(FixedPassword(Secret::new(
             args.get(i + 1).cloned().unwrap_or_default(),
@@ -36,7 +49,10 @@ pub fn main(args: &[String]) -> ExitCode {
         .map(|(_, a)| a)
         .collect();
     let (Some(archive), Some(root)) = (pos.first(), pos.get(1)) else {
-        eprintln!("usage: cram mount [--writable] [--selftest] [-p <pw>] <archive> <mount-dir>");
+        eprintln!(
+            "usage: cram mount [--writable] [--remember] [--selftest] [-p <pw>] <archive> <mount-dir>"
+        );
+        eprintln!("       cram mount --restore | --list | --forget <mount-dir>");
         return ExitCode::from(2);
     };
     let archive = PathBuf::from(archive);
@@ -50,6 +66,20 @@ pub fn main(args: &[String]) -> ExitCode {
         }
     };
     println!("mounted {} at {}", archive.display(), m.root().display());
+    if remember {
+        // A password cannot be stored, so an encrypted archive can be mounted but never brought
+        // back unattended. Say so when the user asks, rather than at the next reboot.
+        if args.iter().any(|a| a == "-p") {
+            eprintln!("not remembered: an encrypted archive needs its password at every mount.");
+        } else {
+            match crate::registry::remember(&archive, &root, writable) {
+                Ok(()) => {
+                    println!("remembered; `cram mount --restore` brings it back after a reboot.")
+                }
+                Err(e) => eprintln!("could not remember this mount: {e}"),
+            }
+        }
+    }
     if writable {
         println!(
             "writable: anything written here is kept in {} and layered over the archive,",
@@ -126,4 +156,116 @@ fn walk_verify(dir: &Path) -> (u64, u64, u64) {
         }
     }
     (files, dirs, bytes)
+}
+
+/// `cram mount --list`: what would come back, and from where.
+fn list_remembered() -> ExitCode {
+    let entries = crate::registry::load();
+    if entries.is_empty() {
+        println!("No mounts are remembered.");
+        println!("Add one with `cram mount --writable --remember <archive> <dir>`.");
+        return ExitCode::SUCCESS;
+    }
+    for e in &entries {
+        let missing = if e.archive.is_file() {
+            ""
+        } else {
+            "   [archive missing]"
+        };
+        println!(
+            "{}  <-  {}{}{}",
+            e.root.display(),
+            e.archive.display(),
+            if e.writable { "  (writable)" } else { "" },
+            missing
+        );
+    }
+    println!("\n`cram mount --restore` brings these back.");
+    ExitCode::SUCCESS
+}
+
+/// `cram mount --forget <dir>`: stop bringing that one back. Never touches the folder itself, so a
+/// writable mount's contents are the user's to keep or delete.
+fn forget_remembered(args: &[String]) -> ExitCode {
+    let Some(dir) = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| *i > 0 && !a.starts_with("--"))
+        .map(|(_, a)| a)
+        .next()
+    else {
+        eprintln!("usage: cram mount --forget <mount-dir>");
+        return ExitCode::from(2);
+    };
+    match crate::registry::forget(Path::new(dir)) {
+        Ok(true) => {
+            println!("forgotten: {dir}");
+            println!("The folder and anything in it are untouched.");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            eprintln!("{dir} was not in the remembered list.");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("could not update the remembered list: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `cram mount --restore`: bring back every remembered mount in this one process, then hold them.
+///
+/// One process for all of them, rather than one each, so that quitting whatever launched it cannot
+/// take a mount away mid-session and so the mounts have somewhere to share a memory budget later.
+///
+/// A single bad entry never costs the others: a missing archive, a folder that has become something
+/// else, or an archive that now needs a password is reported and skipped.
+fn restore_remembered() -> ExitCode {
+    let entries = crate::registry::load();
+    if entries.is_empty() {
+        println!("Nothing is remembered, so nothing was restored.");
+        return ExitCode::SUCCESS;
+    }
+    let mut held = Vec::new();
+    let mut failed = 0;
+    for e in &entries {
+        if !e.archive.is_file() {
+            eprintln!(
+                "skipped {}: {} is gone",
+                e.root.display(),
+                e.archive.display()
+            );
+            failed += 1;
+            continue;
+        }
+        match crate::mount_with(&e.archive, &e.root, Arc::new(NoPassword), e.writable) {
+            Ok(m) => {
+                println!("mounted {} at {}", e.archive.display(), e.root.display());
+                held.push(m);
+            }
+            Err(err) => {
+                eprintln!("skipped {}: {err}", e.root.display());
+                failed += 1;
+            }
+        }
+    }
+    if held.is_empty() {
+        eprintln!("nothing could be restored ({failed} failed).");
+        return ExitCode::from(1);
+    }
+    println!(
+        "{} mount(s) restored{}. They stay up until this process is stopped.",
+        held.len(),
+        if failed > 0 {
+            format!(", {failed} skipped")
+        } else {
+            String::new()
+        }
+    );
+    // Hold them. There is no console to wait on at boot, and dropping `held` would unmount
+    // everything that was just restored.
+    loop {
+        std::thread::park();
+    }
 }

@@ -72,6 +72,18 @@ comes from the archive, and a deleted one stays deleted. Nothing is ever written
 `.cram`; **deleting the mount folder is how you reset to a pristine archive**, and the only way,
 since ProjFS has no way to un-tag a virtualization root.
 
+**Bringing mounts back after a reboot.** A mount does not survive a restart: the folder and
+everything written into it does, but the process serving the archive's files does not, so its
+files list at the right sizes and fail to open until something re-mounts. Add `--remember` to a
+mount and `cram mount --restore` brings it back, holding every remembered mount in one process.
+`cram mount --list` shows what would come back and `--forget <dir>` drops one, leaving the folder
+and its contents alone.
+
+**Nothing is remembered unless you say so.** There is no setting that turns this on for
+everything: an empty list is the default, `--remember` is the whole opt-in, and a machine that
+never asked restores nothing. An encrypted archive is refused, since its password cannot be
+stored and would have to be typed at every boot.
+
 That last point matters for the case this was built for: a game archived once and mounted rather than
 installed keeps its saves and config beside it, and the archive it reads from cannot be changed by
 playing. It only captures writes that land *inside* the mount, so anything a program writes to

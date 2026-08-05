@@ -29,6 +29,7 @@ mod projfs;
 mod projfs_api;
 
 pub mod cli;
+pub mod registry;
 
 /// Whether this machine can mount at all, i.e. whether the optional Windows feature `Client-ProjFS`
 /// is enabled. Callers that show a mount affordance should check this first and explain
