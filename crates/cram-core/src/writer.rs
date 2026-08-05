@@ -10,7 +10,7 @@
 //! supplied it when they chose to encrypt).
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::Result;
@@ -127,4 +127,30 @@ pub trait ArchiveWriter: Send {
 
     /// Finalize the archive (write the central directory / footer index) and report totals.
     fn finish(self: Box<Self>) -> Result<CreateReport>;
+
+    /// Whether [`add_path`](Self::add_path) reads the file itself, on its own schedule.
+    ///
+    /// The engine asks once, before the loop, and when the answer is yes it hands over the path
+    /// instead of opening the file, sampling it for a [`WriteHint`] and streaming it. Only `.cram`
+    /// says yes.
+    fn takes_paths(&self) -> bool {
+        false
+    }
+
+    /// Add one file by path rather than by reader.
+    ///
+    /// The default opens it and calls [`add_file`](Self::add_file), which is exactly what the engine
+    /// did inline before this existed, so a backend that does not override it behaves as it always
+    /// did and `takes_paths` returning false costs nothing.
+    ///
+    /// `.cram` overrides it. Its per-file cost is FastCDC boundary search, BLAKE3 and the optional
+    /// Lepton pass, all three pure functions of that one file's bytes, so it hands the path to a
+    /// worker pool and returns before any of the work is done. Everything order-dependent -- which
+    /// chunk is the first occurrence of its hash, what id it gets, which pack it lands in -- still
+    /// happens on one thread in entry order, so the archive is unchanged.
+    fn add_path(&mut self, entry: &Entry, path: &Path, hint: WriteHint) -> Result<()> {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| crate::error::ArchiveError::Backend(format!("{}: {e}", path.display())))?;
+        self.add_file(entry, &mut file, hint)
+    }
 }

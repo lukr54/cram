@@ -266,6 +266,10 @@ pub fn create(
     let staging = super::staging_path(archive);
     let result = (|| {
         let mut writer = formats::create(&staging, fmt, &opts)?;
+        // Asked once, before the loop: `.cram` reads its own sources so it can chunk them off this
+        // thread, and then opening the file here, sampling it for a hint it ignores, and streaming
+        // it through a counting reader would all be work done twice or not at all.
+        let hands_over_paths = writer.takes_paths();
         for item in &items {
             sink.wait_if_paused();
             if sink.is_cancelled() {
@@ -277,6 +281,19 @@ pub fn create(
             sink.on_entry_start(&item.entry);
             match &item.disk_path {
                 None => writer.add_dir(&item.entry)?,
+                Some(disk) if hands_over_paths => {
+                    // The writer opens and reads it on its own schedule, so byte progress is
+                    // reported per entry from the plan rather than per read. `on_file_done` below
+                    // already had that shape; this makes the byte counter match it.
+                    writer.add_path(&item.entry, disk, item.hint).map_err(|e| {
+                        if sink.is_cancelled() {
+                            ArchiveError::Cancelled
+                        } else {
+                            e
+                        }
+                    })?;
+                    sink.on_bytes(item.entry.size);
+                }
                 Some(disk) => {
                     // Name the file. One locked or unreadable source aborts the whole create, and
                     // `io::Error` from `File::open` carries no path, so on a 100 000-file backup the

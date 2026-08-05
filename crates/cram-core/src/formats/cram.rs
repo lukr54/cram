@@ -36,7 +36,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -596,8 +596,21 @@ pub struct CramArchiveWriter {
     packs: Vec<PackLoc>,
     chunks: Vec<ChunkLoc>,
     entries: Vec<EntryMeta>,
-    /// Raw bytes of the pack currently being filled.
-    pack_buf: Vec<u8>,
+    /// The pack currently being filled, as the chunks that go into it rather than as one buffer.
+    ///
+    /// It used to be a single `Vec<u8>` that every chunk was copied into on this thread, and that
+    /// copy was cheap only because the chunker had *just* produced those bytes on this core: they
+    /// were still in L2. Once chunking moved to a pool the same copy became a read from another
+    /// core's memory and cost 3.6 s of a 7.4 s create on the kernel tree -- more than the CDC and
+    /// BLAKE3 the pool had taken away.
+    ///
+    /// So the bytes are not touched here at all. The chunk buffers are moved into this list, the
+    /// pack worker concatenates them once, and that concatenation is the cold read -- on 24 threads
+    /// in parallel, where it disappears, instead of on the one thread everything else queues behind.
+    pack_buf: Vec<Vec<u8>>,
+    /// Bytes in [`pack_buf`](Self::pack_buf), which is now a sum rather than a `len`. Also the next
+    /// chunk's offset inside the pack.
+    pack_bytes: usize,
     /// Total logical (pre-dedup) file bytes ingested.
     in_bytes: u64,
     /// Bytes eliminated by dedup (chunks that matched an already-stored chunk).
@@ -619,6 +632,19 @@ pub struct CramArchiveWriter {
     /// Raw bytes to accumulate before sealing a pack. Resolved once at construction rather than
     /// read per chunk (see [`pack_target`]).
     pack_target: usize,
+    /// Entries named but not yet committed, oldest first. Bounded by [`PrepPool::window`].
+    ///
+    /// **Declared before `prep`, and it has to stay that way.** Fields drop in declaration order,
+    /// and `PrepPool`'s drop joins its workers. A create abandoned part-way -- a cancel, an
+    /// unreadable file -- leaves workers blocked on output channels that are full, and the only
+    /// thing that can release them is dropping the receivers, which live in here. Join first and
+    /// the join never returns.
+    pending: VecDeque<Pending>,
+    /// The chunkers, running ahead of this thread. Files go in as the engine names them and their
+    /// chunks come back per entry, in file order (see [`PrepPool`]).
+    prep: PrepPool,
+    /// Worker-side timings, shared with the pool.
+    prep_prof: Arc<PrepProf>,
     start: Instant,
     /// Phase accounting, printed at `finish` only when `CRAM_PROFILE` is set in the environment.
     /// The create path alternates between a serial chunk phase and a parallel compress phase, and
@@ -663,7 +689,7 @@ struct PackQueue {
     /// Bounded, so a chunker that outruns the compressors blocks rather than buffering the whole
     /// archive into memory. This is the cap on raw packs in flight, and with it the cap on `ready`:
     /// at most `capacity + workers` packs can be outstanding, so neither can grow without limit.
-    work: Option<SyncSender<(u32, Vec<u8>)>>,
+    work: Option<SyncSender<(u32, Vec<Vec<u8>>)>>,
     done: Receiver<Result<DonePack>>,
     workers: Vec<JoinHandle<()>>,
     /// Packs that finished ahead of their turn, waiting on the ids in front of them.
@@ -680,7 +706,7 @@ impl PackQueue {
         policy: PackPolicy,
         crypter: Option<Arc<Crypter>>,
     ) -> Self {
-        let (work_tx, work_rx) = sync_channel::<(u32, Vec<u8>)>(capacity.max(1));
+        let (work_tx, work_rx) = sync_channel::<(u32, Vec<Vec<u8>>)>(capacity.max(1));
         let (done_tx, done_rx) = sync_channel::<Result<DonePack>>(capacity.max(1) + workers);
         // One receiver shared by every worker. Contention is a lock per pack against a pack that
         // takes whole seconds to compress, so it never shows up.
@@ -726,7 +752,7 @@ impl PackQueue {
 
     /// Hand a raw pack over, blocking while the queue is full. Blocking here is the backpressure
     /// that bounds memory, and the time spent in it is the chunker waiting on the compressors.
-    fn send(&mut self, id: u32, raw: Vec<u8>) -> Result<()> {
+    fn send(&mut self, id: u32, raw: Vec<Vec<u8>>) -> Result<()> {
         let Some(tx) = self.work.as_ref() else {
             return Err(ArchiveError::Backend("pack queue already closed".into()));
         };
@@ -787,14 +813,284 @@ impl PackQueue {
     }
 }
 
+// The entry pipeline
+//
+// Chunking one file is three pure functions of that file's bytes -- the FastCDC boundary search,
+// BLAKE3 over each chunk, and the optional Lepton pass -- and on a corpus that does not compress
+// they are the whole job: 62% of the wall on a 55 472-file tree, with the pack workers at 30%
+// occupancy because nothing could produce packs fast enough to feed them.
+//
+// None of it is order-dependent, so it moves to a pool. What stays on one thread is every decision
+// that depends on what came before: which chunk is the *first* occurrence of its hash, the id that
+// gives it, the pack it lands in, and the byte accounting. Workers produce, the commit stage
+// decides, and the commit stage sees entries in exactly the order the engine named them.
+//
+// So the archive does not change. `tests/chunk_lanes.rs` asserts that directly, by building the
+// same tree at several worker counts and comparing the bytes.
+
+/// One chunk on its way from a worker to the commit stage.
+enum Piece {
+    /// A chunk of the entry, in file order.
+    Chunk { hash: [u8; 32], data: Vec<u8> },
+    /// The entry is complete; exactly one of these ends every stream.
+    Done {
+        /// Logical size: the length of the file extraction will produce.
+        size: u64,
+        transform: u8,
+        /// Bytes the user handed in that the chunks do not account for, which is what a transform
+        /// saved. Zero for everything stored as-is.
+        extra_in_bytes: u64,
+    },
+}
+
+/// One file to turn into chunks, holding nothing borrowed from the writer.
+struct PrepJob {
+    path: PathBuf,
+    /// Plan-time size, used only as the cheap first gate on the Lepton pass, exactly as the in-line
+    /// path uses it.
+    size: u64,
+    /// The archive name, which decides whether the Lepton pass is attempted at all.
+    name: String,
+    recompress: bool,
+    out: SyncSender<Result<Piece>>,
+}
+
+/// Worker-side timings, summed across every worker. These are **core-time**, not wall-time: on a
+/// pipeline that is working they add up to far more than the run took, and that is the point.
+#[derive(Default)]
+struct PrepProf {
+    open_nanos: AtomicU64,
+    read_cdc_nanos: AtomicU64,
+    hash_nanos: AtomicU64,
+    /// The Lepton pass, which used to run on the single chunking thread and cost 41 s of a 53 s
+    /// create for it.
+    lepton_nanos: AtomicU64,
+    files: AtomicU64,
+}
+
+/// The chunker: worker threads pulling files off one bounded queue, each streaming its chunks back
+/// down a channel of its own.
+///
+/// **Why a channel per entry rather than one shared one.** The commit stage needs the next entry's
+/// chunks in file order and needs nothing at all from the entries behind it, so a per-entry channel
+/// is both the reorder buffer and the backpressure: a worker runs [`buffer`](hw::PrepareLanes::buffer)
+/// chunks ahead and then blocks, which is what bounds memory on a corpus of very large files without
+/// having to re-read anything.
+///
+/// **Why it cannot deadlock.** Workers block only on a full output channel, and the commit stage
+/// blocks only on the queue being full or on the oldest entry's channel being empty. The writer
+/// commits until fewer than `workers + depth` entries are outstanding *before* it dispatches, so at
+/// most `depth - 1` jobs are ever waiting when it sends and the send cannot block. The oldest
+/// outstanding entry is the oldest dispatched, so it is being worked rather than queued, and the
+/// commit stage always drains that one -- which is what frees its worker. Progress is therefore
+/// always available to the thread that needs it.
+struct PrepPool {
+    work: Option<SyncSender<PrepJob>>,
+    workers: Vec<JoinHandle<()>>,
+    lanes: hw::PrepareLanes,
+}
+
+impl PrepPool {
+    fn new(lanes: hw::PrepareLanes, prof: Arc<PrepProf>) -> Self {
+        let (work_tx, work_rx) = sync_channel::<PrepJob>(lanes.depth.max(1));
+        // One receiver shared by every worker, as the pack queue does. The lock is held for the
+        // `recv` alone, against a job that is a whole file, so it never shows up.
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let workers = (0..lanes.workers.max(1))
+            .map(|_| {
+                let rx = Arc::clone(&work_rx);
+                let prof = Arc::clone(&prof);
+                std::thread::spawn(move || loop {
+                    let job = {
+                        let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.recv()
+                    };
+                    let Ok(job) = job else { break };
+                    prepare_entry(job, &prof);
+                })
+            })
+            .collect();
+        Self {
+            work: Some(work_tx),
+            workers,
+            lanes,
+        }
+    }
+
+    /// How many entries may be outstanding before the caller has to commit one. See the deadlock
+    /// argument on the type: this bound is what the argument rests on.
+    fn window(&self) -> usize {
+        self.lanes.workers.max(1) + self.lanes.depth
+    }
+
+    fn send(&self, job: PrepJob) -> Result<()> {
+        let Some(tx) = self.work.as_ref() else {
+            return Err(ArchiveError::Backend(
+                "chunk pipeline already closed".into(),
+            ));
+        };
+        tx.send(job)
+            .map_err(|_| ArchiveError::Backend("chunking workers died".into()))
+    }
+
+    /// Stop accepting files and wait for the workers to exit. Idempotent: `Drop` calls it too, so a
+    /// create that fails part-way still leaves no threads behind.
+    fn close_and_join(&mut self) {
+        self.work = None;
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for PrepPool {
+    fn drop(&mut self) {
+        self.close_and_join();
+    }
+}
+
+/// Run one job, reporting a failure down the same channel the chunks would have gone down so the
+/// commit stage meets it in the entry's own place in the order.
+fn prepare_entry(job: PrepJob, prof: &PrepProf) {
+    prof.files.fetch_add(1, Ordering::Relaxed);
+    let out = job.out.clone();
+    if let Err(e) = prepare_stream(job, prof) {
+        // The commit stage may already be gone, having failed elsewhere. There is nothing useful to
+        // do with a failure to report a failure.
+        let _ = out.send(Err(e));
+    }
+}
+
+/// Open the file and stream its chunks out, mirroring [`CramArchiveWriter::add_file`]'s three-way
+/// decision exactly -- same order, same gates, same fallbacks -- because both paths have to produce
+/// the same archive from the same tree.
+fn prepare_stream(job: PrepJob, prof: &PrepProf) -> Result<()> {
+    let PrepJob {
+        path,
+        size,
+        name,
+        recompress,
+        out,
+    } = job;
+    let open_t0 = Instant::now();
+    // One locked or unreadable source aborts the whole create, and `io::Error` from `File::open`
+    // carries no path, so the name goes in here exactly as the engine's own open does it.
+    let mut file =
+        File::open(&path).map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))?;
+    prof.open_nanos
+        .fetch_add(open_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    let plausible_size = size == 0 || size <= MAX_XFORM_INPUT;
+    if recompress && plausible_size && looks_like_jpeg(&name) {
+        let mut head = Vec::new();
+        (&mut file)
+            .take(MAX_XFORM_INPUT + 1)
+            .read_to_end(&mut head)?;
+        if head.len() as u64 <= MAX_XFORM_INPUT {
+            let lepton_t0 = Instant::now();
+            let encoded = jpeg_recompress(&head);
+            prof.lepton_nanos
+                .fetch_add(lepton_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if let Some(encoded) = encoded {
+                let original_len = head.len() as u64;
+                let extra = original_len.saturating_sub(encoded.len() as u64);
+                emit_chunks(&mut Cursor::new(&encoded), &out, prof)?;
+                return send_done(&out, original_len, XFORM_LEPTON, extra);
+            }
+        }
+        // Not transformable: the bytes already read, then the rest of the file.
+        let mut rest = Cursor::new(head).chain(file);
+        let size = emit_chunks(&mut rest, &out, prof)?;
+        return send_done(&out, size, XFORM_NONE, 0);
+    }
+    let size = emit_chunks(&mut file, &out, prof)?;
+    send_done(&out, size, XFORM_NONE, 0)
+}
+
+/// Chunk a stream and send every chunk on, returning the bytes consumed.
+fn emit_chunks(
+    src: &mut dyn Read,
+    out: &SyncSender<Result<Piece>>,
+    prof: &PrepProf,
+) -> Result<u64> {
+    let mut size = 0u64;
+    let mut chunker = StreamCDC::new(src, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX);
+    loop {
+        let cdc_t0 = Instant::now();
+        let next = chunker.next();
+        prof.read_cdc_nanos
+            .fetch_add(cdc_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|e| ArchiveError::Backend(format!("chunker: {e}")))?;
+        let data = chunk.data;
+        size += data.len() as u64;
+        let hash_t0 = Instant::now();
+        let hash = *blake3::hash(&data).as_bytes();
+        prof.hash_nanos
+            .fetch_add(hash_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        send_piece(out, Piece::Chunk { hash, data })?;
+    }
+    Ok(size)
+}
+
+fn send_done(
+    out: &SyncSender<Result<Piece>>,
+    size: u64,
+    transform: u8,
+    extra_in_bytes: u64,
+) -> Result<()> {
+    send_piece(
+        out,
+        Piece::Done {
+            size,
+            transform,
+            extra_in_bytes,
+        },
+    )
+}
+
+fn send_piece(out: &SyncSender<Result<Piece>>, piece: Piece) -> Result<()> {
+    out.send(Ok(piece))
+        .map_err(|_| ArchiveError::Backend("chunk consumer went away".into()))
+}
+
+/// One entry between being named by the engine and being committed to the archive. The order of
+/// this queue is the order the engine added them, which is the order they reach the file.
+enum Pending {
+    /// Complete already: a directory, or a file the calling thread chunked itself.
+    Ready(EntryMeta),
+    /// A worker is producing this entry's chunks. Name and mode were known when it was dispatched;
+    /// size, transform and the chunk list arrive down the channel.
+    Streaming {
+        name: String,
+        mode: u32,
+        rx: Receiver<Result<Piece>>,
+    },
+}
+
 #[derive(Default)]
 struct Prof {
-    /// Inside `chunk_stream`, excluding any nested `flush_batch`.
+    /// Work on the commit thread: the dedup lookups, the copies into the pack being filled, and any
+    /// chunking done in-line. Excludes everything nested inside it -- writing packs, blocking on a
+    /// full pack queue, waiting on a chunk worker -- each of which is reported on its own line.
     chunk_nanos: u128,
-    /// Pulling bytes from the source and running FastCDC over them.
-    read_cdc_nanos: u128,
-    /// BLAKE3 over chunk bodies.
-    hash_nanos: u128,
+    /// The dedup table: a `get` for every chunk, plus an `insert` on every miss.
+    lookup_nanos: u128,
+    /// Copying a new chunk's bytes into the pack being filled.
+    copy_nanos: u128,
+    /// The commit stage standing still because no worker had produced the next chunk yet. Near zero
+    /// means the pipeline is ahead and the commit stage is the wall; large means the reverse, and
+    /// more chunk workers would help.
+    prep_wait_nanos: u128,
+    prep_stalls: u64,
+    /// Handing one file to the pipeline: naming it, allocating its channel, and any blocking on a
+    /// full work queue. Excludes the commits done to make room for it, which are charged above.
+    /// This is per-file overhead that the in-line path simply does not have, so on a corpus of very
+    /// many very small files it is the thing that decides whether the pipeline is worth having.
+    dispatch_nanos: u128,
+    /// The part of `dispatch_nanos` spent blocked on a full work queue, which is the chunkers not
+    /// keeping up rather than overhead.
+    dispatch_block_nanos: u128,
     /// Writing completed packs out in id order, on the chunking thread.
     flush_nanos: u128,
     /// The part of `flush_nanos` spent standing still: backpressure on a full work queue, plus
@@ -817,16 +1113,38 @@ struct Prof {
     workers: usize,
 }
 
+/// Join a pack's chunks into the single contiguous buffer the codecs and the sealer need.
+///
+/// **This is where the cold read lives.** Each chunk buffer was written by whichever chunk worker
+/// produced it, so pulling them together crosses cores and misses cache. It is deliberately here
+/// rather than in `commit_chunk`: there are as many pack workers as the machine has threads and
+/// exactly one commit stage, so this is the copy that parallelises and that one was the copy that
+/// everything else queued behind.
+fn concat_pack(mut chunks: Vec<Vec<u8>>) -> Vec<u8> {
+    // One chunk filled the pack by itself (a final partial pack, usually): take its buffer instead
+    // of copying it into a new one.
+    if chunks.len() == 1 {
+        return chunks.pop().unwrap_or_default();
+    }
+    let total: usize = chunks.iter().map(Vec::len).sum();
+    let mut raw = Vec::with_capacity(total);
+    for c in &chunks {
+        raw.extend_from_slice(c);
+    }
+    raw
+}
+
 /// Compress (and, when encrypting, seal) one pack's raw bytes into its on-disk payload. Pure and
 /// thread-safe, packs are independent, so a whole batch compresses in parallel. Returns
 /// `(payload, raw_len, codec)`; a pack that the codec doesn't shrink is stored raw so it never grows.
 fn compress_pack(
-    raw: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
     pack_id: u32,
     level: u32,
     policy: PackPolicy,
     crypter: Option<&Crypter>,
 ) -> Result<(Vec<u8>, u32, u8)> {
+    let raw = concat_pack(chunks);
     let raw_len = raw.len() as u32;
     let (codec, plaintext) = pack_compress(raw, level, policy)?;
     // Encrypt AFTER compression (compress-then-encrypt); AAD binds the pack to its id.
@@ -980,7 +1298,8 @@ impl CramArchiveWriter {
         let pack_target = pack_target_for(opts.level);
         // One worker per slot the machine can afford, and the same number again queued behind them,
         // so the outstanding-pack ceiling matches what the old two-batch scheme held.
-        let slots = hw::create_batch(pack_target, &HwProfile::detect());
+        let hwp = HwProfile::detect();
+        let slots = hw::create_batch(pack_target, &hwp);
         // In a `zstd-c` build, use the fast C zstd for packs by default, but honor `--best` by
         // falling back to XZ's stronger ratio. A pure-Rust build always uses XZ (flag stays false).
         // `CRAM_FORCE_ZSTD=1` overrides that, to test whether zstd at --ultra over a 32 MiB pack
@@ -1007,6 +1326,17 @@ impl CramArchiveWriter {
             workers: slots,
             ..Prof::default()
         };
+        // The entry pipeline. Sized from the machine like the pack slots are, and invisible in the
+        // output for the same reason: it changes when work happens, never what the work decides.
+        let prep_prof = Arc::new(PrepProf::default());
+        let prep = PrepPool::new(
+            hw::prepare_lanes(
+                CHUNK_MAX as usize,
+                matches!(policy, PackPolicy::Store),
+                &hwp,
+            ),
+            Arc::clone(&prep_prof),
+        );
 
         Ok(Self {
             out,
@@ -1016,6 +1346,7 @@ impl CramArchiveWriter {
             chunks: Vec::new(),
             entries: Vec::new(),
             pack_buf: Vec::new(),
+            pack_bytes: 0,
             in_bytes: 0,
             dedup_saved: 0,
             // Storing and transforming are contradictory instructions: a Lepton pass is the most
@@ -1026,6 +1357,9 @@ impl CramArchiveWriter {
             next_pack_id: 0,
             queue,
             pack_target,
+            pending: VecDeque::new(),
+            prep,
+            prep_prof,
             start: Instant::now(),
             prof,
         })
@@ -1048,35 +1382,19 @@ impl CramArchiveWriter {
         loop {
             let cdc_t0 = Instant::now();
             let next = chunker.next();
-            self.prof.read_cdc_nanos += cdc_t0.elapsed().as_nanos();
+            self.prep_prof
+                .read_cdc_nanos
+                .fetch_add(cdc_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| ArchiveError::Backend(format!("chunker: {e}")))?;
             let data = chunk.data;
             size += data.len() as u64;
-            self.in_bytes += data.len() as u64;
-            self.prof.chunks += 1;
             let hash_t0 = Instant::now();
             let key = *blake3::hash(&data).as_bytes();
-            self.prof.hash_nanos += hash_t0.elapsed().as_nanos();
-            if let Some(&id) = self.seen.get(&key) {
-                self.dedup_saved += data.len() as u64;
-                self.prof.dedup_hits += 1;
-                chunk_ids.push(id);
-                continue;
-            }
-            let id = self.chunks.len() as u32;
-            let loc = ChunkLoc {
-                pack_id: self.next_pack_id,
-                offset: self.pack_buf.len() as u32,
-                length: data.len() as u32,
-            };
-            self.pack_buf.extend_from_slice(&data);
-            self.chunks.push(loc);
-            self.seen.insert(key, id);
-            chunk_ids.push(id);
-            if self.pack_buf.len() >= self.pack_target {
-                self.queue_pack()?;
-            }
+            self.prep_prof
+                .hash_nanos
+                .fetch_add(hash_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.commit_chunk(key, data, &mut chunk_ids)?;
         }
         // Serial time for this stream: everything above, minus the pack handling nested inside it.
         // Both parts have to come out -- writing packs out, and blocking on a full queue -- or
@@ -1086,6 +1404,162 @@ impl CramArchiveWriter {
             + self.prof.drain_nanos.saturating_sub(drain_at_entry);
         self.prof.chunk_nanos += stream_t0.elapsed().as_nanos().saturating_sub(nested);
         Ok((chunk_ids, size))
+    }
+
+    /// Place one chunk in the archive: the dedup lookup, the id it gets if it is new, and the copy
+    /// into the pack being filled.
+    ///
+    /// **Every chunk goes through here, on one thread, in entry order** -- the in-line path and the
+    /// pipeline both. Which chunk is the first occurrence of its hash is a fact about the order the
+    /// entries arrived in, not about their bytes, and so are the id and the pack that follow from
+    /// it. Keeping all three here is what lets the chunking itself run anywhere.
+    fn commit_chunk(&mut self, key: [u8; 32], data: Vec<u8>, ids: &mut Vec<u32>) -> Result<()> {
+        self.in_bytes += data.len() as u64;
+        self.prof.chunks += 1;
+        let look_t0 = Instant::now();
+        let hit = self.seen.get(&key).copied();
+        if let Some(id) = hit {
+            self.prof.lookup_nanos += look_t0.elapsed().as_nanos();
+            self.dedup_saved += data.len() as u64;
+            self.prof.dedup_hits += 1;
+            ids.push(id);
+            return Ok(());
+        }
+        let id = self.chunks.len() as u32;
+        self.seen.insert(key, id);
+        self.prof.lookup_nanos += look_t0.elapsed().as_nanos();
+        // Moving the buffer, never reading it: this thread must not be the one that pulls another
+        // core's cache lines across. See `pack_buf`.
+        let copy_t0 = Instant::now();
+        let loc = ChunkLoc {
+            pack_id: self.next_pack_id,
+            offset: self.pack_bytes as u32,
+            length: data.len() as u32,
+        };
+        self.pack_bytes += data.len();
+        self.pack_buf.push(data);
+        self.chunks.push(loc);
+        self.prof.copy_nanos += copy_t0.elapsed().as_nanos();
+        ids.push(id);
+        if self.pack_bytes >= self.pack_target {
+            self.queue_pack()?;
+        }
+        Ok(())
+    }
+
+    /// Commit the oldest outstanding entry, blocking until a worker has produced all of it.
+    ///
+    /// Blocking on the *oldest* is what makes the pipeline deterministic and what keeps it moving:
+    /// entries, their chunks and their ids reach the archive strictly in the order the engine named
+    /// them, and the worker this frees is the one every other worker is queued behind.
+    fn commit_front(&mut self) -> Result<()> {
+        let Some(front) = self.pending.pop_front() else {
+            return Ok(());
+        };
+        let t0 = Instant::now();
+        let flush_at_entry = self.prof.flush_nanos;
+        let drain_at_entry = self.prof.drain_nanos;
+        let wait_at_entry = self.prof.prep_wait_nanos;
+        let outcome = match front {
+            Pending::Ready(meta) => {
+                if meta.transform != XFORM_NONE {
+                    self.used_transform = true;
+                }
+                self.entries.push(meta);
+                Ok(())
+            }
+            Pending::Streaming { name, mode, rx } => self.commit_stream(name, mode, &rx),
+        };
+        // Same subtraction as `chunk_stream`, for the same reason, plus the time spent waiting on a
+        // worker: charge this line with work done and nothing else, so a slow pipeline shows up as
+        // a wait rather than as a commit stage that got mysteriously slower.
+        let nested = self.prof.flush_nanos.saturating_sub(flush_at_entry)
+            + self.prof.drain_nanos.saturating_sub(drain_at_entry)
+            + self.prof.prep_wait_nanos.saturating_sub(wait_at_entry);
+        self.prof.chunk_nanos += t0.elapsed().as_nanos().saturating_sub(nested);
+        outcome
+    }
+
+    /// Drain one entry's chunks into the archive, in file order, until its `Done`.
+    fn commit_stream(
+        &mut self,
+        name: String,
+        mode: u32,
+        rx: &Receiver<Result<Piece>>,
+    ) -> Result<()> {
+        let mut chunk_ids = Vec::new();
+        loop {
+            // Try first, so a pipeline that is keeping ahead never touches the clock, then fall
+            // back to a blocking wait that is timed. A channel that hangs up before `Done` means
+            // the worker died without reporting, which must fail rather than store a short entry.
+            let piece = match rx.try_recv() {
+                Ok(piece) => piece,
+                Err(TryRecvError::Empty) => {
+                    // About to stand still, so spend the moment on the other half of the job:
+                    // take back whatever the pack compressors have finished and write it out.
+                    // Without this the write side idles for exactly as long as the chunk side
+                    // makes it wait, and the two stalls add up instead of overlapping.
+                    self.pump()?;
+                    let wait_t0 = Instant::now();
+                    let got = rx.recv();
+                    self.prof.prep_wait_nanos += wait_t0.elapsed().as_nanos();
+                    self.prof.prep_stalls += 1;
+                    got.map_err(|_| {
+                        ArchiveError::Backend(format!("{name}: chunking ended mid-entry"))
+                    })?
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return Err(ArchiveError::Backend(format!(
+                        "{name}: chunking ended mid-entry"
+                    )))
+                }
+            };
+            match piece? {
+                Piece::Chunk { hash, data } => self.commit_chunk(hash, data, &mut chunk_ids)?,
+                Piece::Done {
+                    size,
+                    transform,
+                    extra_in_bytes,
+                } => {
+                    // The logical bytes a transform saved, so the report's ratio reflects what the
+                    // user actually handed in rather than what was stored.
+                    self.in_bytes += extra_in_bytes;
+                    if transform != XFORM_NONE {
+                        self.used_transform = true;
+                    }
+                    self.entries.push(EntryMeta {
+                        name,
+                        is_dir: false,
+                        size,
+                        mode,
+                        chunk_ids,
+                        transform,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Commit the oldest entries until at most `target` remain outstanding.
+    fn commit_down_to(&mut self, target: usize) -> Result<()> {
+        while self.pending.len() > target {
+            self.commit_front()?;
+        }
+        Ok(())
+    }
+
+    /// Commit everything outstanding. Called before anything that needs the entry list complete,
+    /// and before the in-line path adds an entry of its own.
+    fn settle(&mut self) -> Result<()> {
+        self.commit_down_to(0)
+    }
+
+    /// Queue an entry that is already complete -- a directory, or a file chunked in-line -- behind
+    /// whatever the pipeline still owes, so it takes its place in the order rather than jumping it.
+    fn push_entry(&mut self, meta: EntryMeta) -> Result<()> {
+        self.pending.push_back(Pending::Ready(meta));
+        self.commit_down_to(self.prep.window())
     }
 
     fn write_out(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1101,6 +1575,7 @@ impl CramArchiveWriter {
         }
         let id = self.next_pack_id;
         self.next_pack_id += 1;
+        self.pack_bytes = 0;
         if self.prof.first_dispatch.is_none() {
             self.prof.first_dispatch = Some(Instant::now());
         }
@@ -1177,21 +1652,53 @@ impl CramArchiveWriter {
         if std::env::var_os("CRAM_PROFILE").is_none() {
             return;
         }
+        use crate::engine::prof as eprof;
+        use std::sync::atomic::Ordering::Relaxed;
         let p = &self.prof;
         let wall = self.start.elapsed().as_nanos().max(1);
         let ms = |n: u128| n as f64 / 1e6;
         let pct = |n: u128| (n as f64 / wall as f64) * 100.0;
         eprintln!("--- cram create profile ---");
         eprintln!("wall            {:9.1} ms", ms(wall));
+        // The commit stage is what is left on one thread once chunking moved to the pool: a dedup
+        // lookup and a copy per chunk. It is the floor the pipeline cannot go under, so its two
+        // halves are broken out rather than left in an "other" bucket.
         eprintln!(
-            "chunk (serial)  {:9.1} ms  {:5.1}%   read+cdc {:.1} ms, hash {:.1} ms, other {:.1} ms",
+            "commit (serial) {:9.1} ms  {:5.1}%   lookup {:.1} ms, copy {:.1} ms, other {:.1} ms",
             ms(p.chunk_nanos),
             pct(p.chunk_nanos),
-            ms(p.read_cdc_nanos),
-            ms(p.hash_nanos),
+            ms(p.lookup_nanos),
+            ms(p.copy_nanos),
             ms(p.chunk_nanos
-                .saturating_sub(p.read_cdc_nanos)
-                .saturating_sub(p.hash_nanos)),
+                .saturating_sub(p.lookup_nanos)
+                .saturating_sub(p.copy_nanos)),
+        );
+        // Core-time, not wall: summed over every worker. Read against the wall above, this says
+        // whether the pipeline is actually running wide. The wait beside it is the commit stage
+        // standing still, which is the number that says whether more workers would help.
+        let pp = &self.prep_prof;
+        let core = |a: &AtomicU64| a.load(Relaxed) as u128;
+        eprintln!(
+            "chunk workers   {:9.1} ms  {:5.1}%   {} lanes over {} files: read+cdc {:.1} s, hash {:.1} s, lepton {:.1} s, open {:.1} s (core-time)",
+            ms(p.prep_wait_nanos),
+            pct(p.prep_wait_nanos),
+            self.prep.lanes.workers,
+            pp.files.load(Relaxed),
+            core(&pp.read_cdc_nanos) as f64 / 1e9,
+            core(&pp.hash_nanos) as f64 / 1e9,
+            core(&pp.lepton_nanos) as f64 / 1e9,
+            core(&pp.open_nanos) as f64 / 1e9,
+        );
+        eprintln!(
+            "dispatch        {:9.1} ms  {:5.1}%   {:.1} us per file, of which BLOCKED {:.1} ms",
+            ms(p.dispatch_nanos),
+            pct(p.dispatch_nanos),
+            if pp.files.load(Relaxed) > 0 {
+                p.dispatch_nanos as f64 / pp.files.load(Relaxed) as f64 / 1e3
+            } else {
+                0.0
+            },
+            ms(p.dispatch_block_nanos),
         );
         eprintln!(
             "write packs     {:9.1} ms  {:5.1}%   {} workers, of which BLOCKED {:.1} ms ({:.1}%) over {} stalls",
@@ -1202,11 +1709,10 @@ impl CramArchiveWriter {
             pct(p.drain_nanos),
             p.stalls,
         );
-        // Costs the writer cannot see: the source files are opened by `engine::create`, and the tree
-        // walk and the store-vs-compress probe both run to completion before this writer exists, so
-        // those two sit outside `wall` entirely rather than inside the residual.
-        use crate::engine::prof as eprof;
-        use std::sync::atomic::Ordering::Relaxed;
+        // Costs the writer cannot see: the tree walk and the store-vs-compress probe both run to
+        // completion before this writer exists, so they sit outside `wall` entirely rather than
+        // inside the residual. Opening is zero here whenever the engine handed over paths instead
+        // of readers, since the workers then do it and it is counted on their line.
         let open = eprof::OPEN_NANOS.load(Relaxed) as u128;
         let opens = eprof::OPEN_COUNT.load(Relaxed);
         let walk = eprof::WALK_NANOS.load(Relaxed) as u128;
@@ -1229,6 +1735,8 @@ impl CramArchiveWriter {
         );
         let residual = wall
             .saturating_sub(p.chunk_nanos)
+            .saturating_sub(p.prep_wait_nanos)
+            .saturating_sub(p.dispatch_nanos)
             .saturating_sub(p.flush_nanos)
             .saturating_sub(open)
             .saturating_sub(p.index_nanos);
@@ -1306,6 +1814,11 @@ impl CramArchiveWriter {
 
 impl ArchiveWriter for CramArchiveWriter {
     fn add_file(&mut self, entry: &Entry, body: &mut dyn Read, _hint: WriteHint) -> Result<()> {
+        // This path chunks on the calling thread and commits as it goes, so anything the pipeline
+        // still owes has to land first or its chunks would arrive after ones added later. The two
+        // paths are never mixed in practice -- the engine picks one for the whole run -- and this is
+        // what makes that a property rather than an assumption.
+        self.settle()?;
         let name = cram_name(entry);
 
         // A JPEG is stored as a Lepton stream when that round-trips provably: zip and 7z get ~0% on
@@ -1328,7 +1841,7 @@ impl ArchiveWriter for CramArchiveWriter {
                     // Account the logical bytes, not the stored ones, so the report's ratio reflects
                     // what the user actually put in.
                     self.in_bytes += original_len.saturating_sub(encoded.len() as u64);
-                    self.entries.push(EntryMeta {
+                    return self.push_entry(EntryMeta {
                         name,
                         is_dir: false,
                         size: original_len, // what extraction will produce
@@ -1336,8 +1849,6 @@ impl ArchiveWriter for CramArchiveWriter {
                         chunk_ids,
                         transform: XFORM_LEPTON,
                     });
-                    self.used_transform = true;
-                    return Ok(());
                 }
             }
             // Not transformable: chunk what was already read, then the rest of the body.
@@ -1346,7 +1857,7 @@ impl ArchiveWriter for CramArchiveWriter {
             // lengths gave the same answer, since a deduplicated id still contributes its length
             // once per appearance, but it walked the chunk table for a figure already in hand.
             let (chunk_ids, size) = self.chunk_stream(&mut rest)?;
-            self.entries.push(EntryMeta {
+            return self.push_entry(EntryMeta {
                 name,
                 is_dir: false,
                 size,
@@ -1354,7 +1865,6 @@ impl ArchiveWriter for CramArchiveWriter {
                 chunk_ids,
                 transform: XFORM_NONE,
             });
-            return Ok(());
         }
 
         // Chunk the *live* body; the stored size is the actual bytes chunked (not the plan-time
@@ -1365,30 +1875,67 @@ impl ArchiveWriter for CramArchiveWriter {
         // They did not, so a change to one would silently not reach the other -- and this is the copy
         // every ordinary file takes.
         let (chunk_ids, size) = self.chunk_stream(body)?;
-        self.entries.push(EntryMeta {
+        self.push_entry(EntryMeta {
             name: cram_name(entry),
             is_dir: false,
             size,
             mode: entry.unix_mode.unwrap_or(0),
             chunk_ids,
             transform: XFORM_NONE,
-        });
-        Ok(())
+        })
     }
 
     fn add_dir(&mut self, entry: &Entry) -> Result<()> {
-        self.entries.push(EntryMeta {
+        self.push_entry(EntryMeta {
             name: cram_name(entry),
             is_dir: true,
             size: 0,
             mode: entry.unix_mode.unwrap_or(0),
             chunk_ids: Vec::new(),
             transform: XFORM_NONE,
+        })
+    }
+
+    /// `.cram` reads its own sources, so the engine hands over the path and moves on.
+    fn takes_paths(&self) -> bool {
+        true
+    }
+
+    fn add_path(&mut self, entry: &Entry, path: &Path, _hint: WriteHint) -> Result<()> {
+        // Commit down to one below the window *before* dispatching, never after. The pipeline's
+        // freedom from deadlock rests on this: it is what guarantees a free slot in the work queue,
+        // so the send below cannot block while the workers are all blocked on full channels.
+        self.commit_down_to(self.prep.window().saturating_sub(1))?;
+        // Timed on its own, because it is the cost the in-line path does not pay at all: two string
+        // allocations, a channel, and a handoff, per file however small the file is.
+        let dispatch_t0 = Instant::now();
+        let name = cram_name(entry);
+        let (tx, rx) = sync_channel::<Result<Piece>>(self.prep.lanes.buffer.max(1));
+        let job = PrepJob {
+            path: path.to_path_buf(),
+            size: entry.size,
+            name: name.clone(),
+            recompress: self.recompress_images,
+            out: tx,
+        };
+        // Split out, because setup cost and queue-full blocking want opposite fixes: the first is
+        // per-file overhead to amortise, the second is the chunkers not keeping up.
+        let send_t0 = Instant::now();
+        let sent = self.prep.send(job);
+        self.prof.dispatch_block_nanos += send_t0.elapsed().as_nanos();
+        self.pending.push_back(Pending::Streaming {
+            name,
+            mode: entry.unix_mode.unwrap_or(0),
+            rx,
         });
-        Ok(())
+        self.prof.dispatch_nanos += dispatch_t0.elapsed().as_nanos();
+        sent
     }
 
     fn finish(mut self: Box<Self>) -> Result<CreateReport> {
+        // Everything the pipeline still owes, in order, before anything reads the entry list.
+        self.settle()?;
+        self.prep.close_and_join();
         // Queue the final partial pack, hand it off, then wait for it: the index records every
         // pack's file offset, so nothing can be serialized until the last one has been written.
         self.queue_pack()?;

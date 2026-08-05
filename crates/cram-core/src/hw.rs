@@ -1044,6 +1044,101 @@ pub fn create_batch(pack_bytes: usize, hw: &HwProfile) -> usize {
     ((budget / per_slot) as usize).clamp(1, ceiling)
 }
 
+/// Lanes for the `.cram` writer's entry pipeline: how many files are chunked at once, how many wait
+/// behind them, and how far ahead of the commit stage one file may run.
+#[derive(Debug, Clone, Copy)]
+pub struct PrepareLanes {
+    /// Threads running FastCDC, BLAKE3 and the Lepton pass.
+    pub workers: usize,
+    /// Files queued behind the workers, so a thread that finishes a small file never waits for the
+    /// engine's loop to name the next one.
+    pub depth: usize,
+    /// Chunks one worker may produce before the commit stage has taken any of them. This is what
+    /// lets a worker on a large file keep going instead of handing over a chunk at a time, and with
+    /// it the only real memory in the pipeline.
+    pub buffer: usize,
+}
+
+/// Size the entry pipeline for this machine.
+///
+/// Like [`create_batch`], every number here is invisible in the output: chunk boundaries are a
+/// function of the file's bytes, and everything order-dependent happens on one thread in entry
+/// order, so lanes cannot change the archive. `tests/chunk_lanes.rs` is what holds that down, and
+/// the three env overrides exist so it can vary them on one machine.
+///
+/// **`packs_are_cheap` is the whole reason this is not simply one lane per thread.** The chunk
+/// workers do not have the machine to themselves: the pack compressors are already on it, one per
+/// thread, and they are the expensive half. Measured on the 1.9 GB kernel tree, 94 778 files, 24
+/// threads, best of two:
+///
+/// | lanes | `--store` | default level |
+/// |------:|----------:|--------------:|
+/// | in-line (before this existed) | 4.08 s | 7.29 s |
+/// | 2  |      -- | 7.32 s |
+/// | 4  |  2.52 s | 7.54 s |
+/// | 8  |  2.32 s | 7.76 s |
+/// | 12 |  2.27 s | 7.75 s |
+/// | 24 |  2.40 s | 7.85 s |
+///
+/// Two opposite curves. Under `--store` the pack pool has almost nothing to do, the cores are free,
+/// and the chunkers are bound by the per-file `open`/`read` rather than by CPU, so going wide wins
+/// 1.8x by twelve lanes. At the default level the pack pool needs 131 core-seconds of LZMA and owns
+/// every core already; extra chunk lanes cannot add throughput and only preempt the compressors,
+/// costing 6% by twelve. So the wide setting is spent only where the packs are known in advance to
+/// be cheap, and everything else gets just enough lanes to keep the commit stage fed.
+///
+/// This leaves something on the table: a corpus that *attempts* compression and mostly fails --
+/// media inside a mixed tree, where pack occupancy measured 30% -- has idle cores too and still gets
+/// the narrow setting. Dividing the machine between the two pools at runtime, from the pack queue's
+/// own occupancy, is the answer to that and is not this change.
+///
+/// The buffer budget is a quarter of available RAM, against the half [`create_batch`] already claims
+/// for packs. Worst case is every in-flight file sitting on a full buffer of maximum-size chunks,
+/// which is what this divides by; the typical case is a fraction of that, since chunks average
+/// `CHUNK_AVG` and most files are smaller than one buffer.
+pub fn prepare_lanes(max_chunk: usize, packs_are_cheap: bool, hw: &HwProfile) -> PrepareLanes {
+    let env = |k: &str| {
+        std::env::var_os(k)
+            .and_then(|v| v.to_str()?.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    };
+    let logical = hw.logical.max(1);
+    let lanes = if packs_are_cheap {
+        (logical / 2).clamp(2, 16)
+    } else {
+        // One lane already chunks around 760 MB/s, which is well past what a compressing create
+        // consumes, so this is "enough to keep the commit stage fed" and deliberately no more.
+        (logical / 8).clamp(2, 6)
+    };
+    let workers = env("CRAM_CHUNK_WORKERS").unwrap_or(lanes).min(256);
+    let depth = env("CRAM_CHUNK_DEPTH").unwrap_or(workers).min(1024);
+    if let Some(buffer) = env("CRAM_CHUNK_BUFFER") {
+        return PrepareLanes {
+            workers,
+            depth,
+            buffer: buffer.min(4096),
+        };
+    }
+    // Couldn't read memory: a modest fixed buffer rather than a computed one, since the computation
+    // is the only thing keeping the product below in bounds.
+    if hw.ram_avail == 0 {
+        return PrepareLanes {
+            workers,
+            depth,
+            buffer: 8,
+        };
+    }
+    let budget = hw.ram_avail / 4;
+    let in_flight = (workers + depth).max(1) as u64;
+    let per_chunk = max_chunk.max(1) as u64;
+    let buffer = (budget / (in_flight * per_chunk)) as usize;
+    PrepareLanes {
+        workers,
+        depth,
+        buffer: buffer.clamp(1, 64),
+    }
+}
+
 /// Approx. per-thread compressor memory (MiB), the LZMA/xz RAM trap. zstd is far cheaper.
 fn codec_mem_per_thread_mib(codec: Codec) -> f64 {
     match codec {
