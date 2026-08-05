@@ -1355,36 +1355,10 @@ fn create_inputs(args: &[String]) -> Vec<PathBuf> {
 
 /// Pick the create format from the archive extension (the file doesn't exist yet, so no magic).
 fn fmt_for_create(archive: &Path) -> Result<Format> {
-    let name = archive
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if name.ends_with(".zip") {
-        Ok(Format::zip())
-    } else if name.ends_with(".7z") {
-        Ok(Format::sevenz())
-    } else if name.ends_with(".cram") {
-        Ok(Format::cram(Codec::None))
-    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        Ok(Format::tar(Codec::Gzip))
-    } else if name.ends_with(".tar.xz") || name.ends_with(".txz") {
-        Ok(Format::tar(Codec::Xz))
-    } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") || name.ends_with(".tbz") {
-        Ok(Format::tar(Codec::Bzip2))
-    } else if name.ends_with(".tar.lz4") {
-        Ok(Format::tar(Codec::Lz4))
-    } else if name.ends_with(".tar.br") {
-        Ok(Format::tar(Codec::Brotli))
-    } else if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
-        Ok(Format::tar(Codec::Zstd))
-    } else if name.ends_with(".tar") {
-        Ok(Format::tar(Codec::None))
-    } else {
-        Err(cram_core::error::ArchiveError::Backend(
-            "create supports .zip / .7z / .cram / .tar[.gz|.xz|.bz2|.lz4|.br|.zst]".into(),
-        ))
-    }
+    // The extension table lives in the engine, because this match used to exist here AND in the
+    // Studio GUI, and the two had drifted four formats apart -- the GUI quietly offered less than
+    // the engine could write. See `formats::CREATE_TARGETS`.
+    cram_core::formats::format_for_new(archive)
 }
 
 fn create(args: &[String]) -> Result<()> {

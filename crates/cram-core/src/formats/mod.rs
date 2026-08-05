@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{ArchiveError, Result};
-use crate::format::{Container, Format};
+use crate::format::{Codec, Container, Format};
 use crate::reader::{ArchiveReader, RandomAccessReader};
 use crate::secret::PasswordProvider;
 use crate::writer::{ArchiveWriter, CreateOptions};
@@ -83,4 +83,84 @@ pub fn create(path: &Path, fmt: Format, opts: &CreateOptions) -> Result<Box<dyn 
         Container::Cram => Ok(Box::new(cram::CramArchiveWriter::create(path, opts)?)),
         _ => Err(ArchiveError::UnsupportedFormat),
     }
+}
+
+/// One archive kind `create` can write, named by the extension that selects it.
+pub struct CreateTarget {
+    /// Extension including the leading dot. Matching is longest-first, so `.tar.gz` wins over
+    /// `.tar` regardless of the order here.
+    pub ext: &'static str,
+    pub container: Container,
+    pub codec: Codec,
+    /// Whether a picker should offer this name. The rest are accepted aliases (`.tgz` is written
+    /// by anyone who types it, and is not worth a second tile).
+    pub offer: bool,
+}
+
+/// **Every archive Cram can create, in one table.**
+///
+/// This existed twice before: `cram-cli` and the Studio GUI each carried their own extension match,
+/// and they had drifted four formats apart, so the GUI silently offered less than the engine could
+/// do and nothing failed to tell anyone. Anything that needs to know what can be created -- the
+/// extension matcher below, the CLI's error text, the GUI's format picker -- reads this and only
+/// this.
+///
+/// RAR and ISO are absent because they are not writable ([`Format::is_writable`]): creating RAR is
+/// forbidden by the UnRAR licence, permanently.
+pub const CREATE_TARGETS: &[CreateTarget] = &[
+    t(".cram", Container::Cram, Codec::None, true),
+    t(".zip", Container::Zip, Codec::None, true),
+    t(".7z", Container::SevenZ, Codec::None, true),
+    t(".tar", Container::Tar, Codec::None, true),
+    t(".tar.gz", Container::Tar, Codec::Gzip, true),
+    t(".tgz", Container::Tar, Codec::Gzip, false),
+    t(".tar.xz", Container::Tar, Codec::Xz, true),
+    t(".txz", Container::Tar, Codec::Xz, false),
+    t(".tar.zst", Container::Tar, Codec::Zstd, true),
+    t(".tzst", Container::Tar, Codec::Zstd, false),
+    t(".tar.bz2", Container::Tar, Codec::Bzip2, true),
+    t(".tbz2", Container::Tar, Codec::Bzip2, false),
+    t(".tbz", Container::Tar, Codec::Bzip2, false),
+    t(".tar.lz4", Container::Tar, Codec::Lz4, true),
+    t(".tar.br", Container::Tar, Codec::Brotli, true),
+];
+
+const fn t(ext: &'static str, container: Container, codec: Codec, offer: bool) -> CreateTarget {
+    CreateTarget {
+        ext,
+        container,
+        codec,
+        offer,
+    }
+}
+
+/// The format a new archive at `path` should be, from its name alone.
+///
+/// Longest match wins, so `out.tar.gz` is a gzipped tar rather than a bare tar that happens to end
+/// in `.gz`. Nothing about the file is read: it does not exist yet.
+pub fn format_for_new(path: &Path) -> Result<Format> {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    CREATE_TARGETS
+        .iter()
+        .filter(|t| name.ends_with(t.ext))
+        .max_by_key(|t| t.ext.len())
+        .map(|t| Format {
+            container: t.container,
+            codec: t.codec,
+        })
+        .ok_or_else(|| ArchiveError::Backend(format!("create supports {}", creatable_list())))
+}
+
+/// The offered extensions, comma separated, for error messages and help text.
+pub fn creatable_list() -> String {
+    CREATE_TARGETS
+        .iter()
+        .filter(|t| t.offer)
+        .map(|t| t.ext)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
