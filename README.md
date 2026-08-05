@@ -79,6 +79,9 @@ mount and `cram mount --restore` brings it back, holding every remembered mount 
 `cram mount --list` shows what would come back and `--forget <dir>` drops one, leaving the folder
 and its contents alone.
 
+If Cram Studio is installed and set to start with Windows, it runs `--restore` for you at boot,
+and only at boot: opening the Studio window by hand never re-mounts anything.
+
 **Nothing is remembered unless you say so.** There is no setting that turns this on for
 everything: an empty list is the default, `--remember` is the whole opt-in, and a machine that
 never asked restores nothing. An encrypted archive is refused, since its password cannot be

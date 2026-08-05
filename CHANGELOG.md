@@ -131,7 +131,9 @@ kept rather than deleted, which previously lost them silently.
 process holding all of them. `--list` shows it, `--forget` drops an entry without touching the
 folder. Nothing is remembered unless asked for: the list starts empty and there is no setting that
 turns auto-remount on for everything. Encrypted archives are refused, their password not being
-something Cram will store.
+something Cram will store. Cram Studio, when set to start with Windows, runs
+`--restore` at boot and only at boot, in a detached `cram.exe` so the mounts outlive the Studio
+window; opening Studio by hand re-mounts nothing.
 
 **`cram shell`**, Cram on the Windows Explorer right-click menu. Extract here, extract to a
 subfolder and test on an archive; add to a `.cram` or a `.zip` on anything else. A container
