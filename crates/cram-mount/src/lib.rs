@@ -79,11 +79,33 @@ impl Mount {
 /// reported, since that folder is otherwise unmountable for good.
 #[cfg(windows)]
 pub fn mount(archive: &Path, root: &Path, pw: Arc<dyn PasswordProvider>) -> Result<Mount> {
+    mount_with(archive, root, pw, false)
+}
+
+/// As [`mount`], but `writable` keeps whatever is written into the mount.
+///
+/// ProjFS makes a mount writable whether or not anyone asked: a modified placeholder becomes a full
+/// file and a deleted one a tombstone, both on disk, both outliving the mount. A read-only mount
+/// therefore does not prevent writes, it only throws them away with the folder.
+///
+/// A writable mount keeps the folder instead, so the archive is the immutable base and the folder is
+/// everything that has diverged from it: settings, saves, anything created. Re-mounting the same
+/// archive on the same folder resumes over that. Nothing is ever written back into the archive.
+///
+/// The folder is permanent, because ProjFS has no way to un-tag a virtualization root. Deleting the
+/// folder is how you reset to a pristine archive, and the only way.
+#[cfg(windows)]
+pub fn mount_with(
+    archive: &Path,
+    root: &Path,
+    pw: Arc<dyn PasswordProvider>,
+    writable: bool,
+) -> Result<Mount> {
     // Sniff → dispatch to whichever backend offers random access (ZIP or `.cram`). The mount only
     // ever touches the `RandomAccessReader` boundary, so it is agnostic to which concrete reader backs it.
     let fmt = cram_core::sniff::sniff_path(archive)?;
     let reader = cram_core::formats::open_random_access(archive, fmt, pw)?;
-    let inner = projfs::MountInner::start(reader, root)?;
+    let inner = projfs::MountInner::start(reader, root, writable)?;
     Ok(Mount {
         inner,
         root: root.to_path_buf(),
@@ -95,6 +117,17 @@ pub fn mount(_archive: &Path, _root: &Path, _pw: Arc<dyn PasswordProvider>) -> R
     Err(cram_core::error::ArchiveError::Backend(
         "archive mount requires Windows (ProjFS)".into(),
     ))
+}
+
+/// Non-Windows stub, so the CLI can call one name on every platform.
+#[cfg(not(windows))]
+pub fn mount_with(
+    archive: &Path,
+    root: &Path,
+    pw: Arc<dyn PasswordProvider>,
+    _writable: bool,
+) -> Result<Mount> {
+    mount(archive, root, pw)
 }
 
 /// Build the browsable directory model from a random-access reader's entry list: a per-directory

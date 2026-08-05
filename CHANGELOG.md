@@ -117,6 +117,16 @@ into RAM up front and capped at 2 GiB. ProjFS is an optional Windows feature (`C
 default); the DLL is bound lazily at run time, so every other command works whether or not it is
 enabled.
 
+`--writable` makes the mount folder a persistent layer over the archive. ProjFS makes a mount
+writable whether or not anyone asks — a modified placeholder becomes a full file and a deleted one a
+tombstone, both on disk — so a read-only mount never prevented writes, it only discarded them along
+with the folder. With `--writable` they are kept: the archive is the immutable base, the folder is
+everything that diverged, and re-mounting resumes over it. A modified file wins over the archive's
+copy, an untouched one still comes from the archive, and the `.cram` is never written to. Deleting
+the folder resets to a pristine archive and is the only way, since ProjFS cannot un-tag a
+virtualization root. Without the flag, a folder that has picked up files not in the archive is now
+kept rather than deleted, which previously lost them silently.
+
 **`cram shell`**, Cram on the Windows Explorer right-click menu. Extract here, extract to a
 subfolder and test on an archive; add to a `.cram` or a `.zip` on anything else. A container
 document (`.docx`, `.jar`, `.epub`) gets both sets, since it is legitimately both. Where

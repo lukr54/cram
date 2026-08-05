@@ -69,6 +69,7 @@ type FnWriteFileData = unsafe extern "system" fn(
     u32,
 ) -> HRESULT;
 type FnFreeAlignedBuffer = unsafe extern "system" fn(*const c_void);
+type FnGetOnDiskFileState = unsafe extern "system" fn(PCWSTR, *mut u32) -> HRESULT;
 
 /// The resolved entry points. Only function pointers are kept (they are `Send + Sync`); the module
 /// handle is not stored, the DLL stays loaded for the life of the process, which is
@@ -83,6 +84,10 @@ struct Api {
     allocate_aligned_buffer: FnAllocateAlignedBuffer,
     write_file_data: FnWriteFileData,
     free_aligned_buffer: FnFreeAlignedBuffer,
+    /// Optional, unlike every field above. It is only needed to tell a file the user changed from
+    /// one Cram projected, so a Windows build that somehow lacks the export should lose that
+    /// distinction rather than lose mounting altogether.
+    get_on_disk_file_state: Option<FnGetOnDiskFileState>,
 }
 
 static API: OnceLock<Option<Api>> = OnceLock::new();
@@ -121,6 +126,9 @@ fn load() -> Option<Api> {
             allocate_aligned_buffer: sym!("PrjAllocateAlignedBuffer", FnAllocateAlignedBuffer),
             write_file_data: sym!("PrjWriteFileData", FnWriteFileData),
             free_aligned_buffer: sym!("PrjFreeAlignedBuffer", FnFreeAlignedBuffer),
+            get_on_disk_file_state: GetProcAddress(module, s!("PrjGetOnDiskFileState")).map(|p| {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, FnGetOnDiskFileState>(p)
+            }),
         })
     }
 }
@@ -251,4 +259,57 @@ pub unsafe fn free_aligned_buffer(buffer: *const c_void) {
     if let Some(api) = api() {
         (api.free_aligned_buffer)(buffer);
     }
+}
+
+/// ProjFS's on-disk state bits for one entry (`PRJ_FILE_STATE`).
+///
+/// The two that matter are `DIRTY_PLACEHOLDER` and `FULL`: both mean the file's contents no longer
+/// come from us. A placeholder the user only *read* stays `HYDRATED_PLACEHOLDER` and is still ours
+/// to reproduce from the archive, which is the distinction that decides whether a mount folder can
+/// be deleted on unmount.
+pub const FILE_STATE_DIRTY_PLACEHOLDER: u32 = 0x4;
+pub const FILE_STATE_FULL: u32 = 0x8;
+pub const FILE_STATE_TOMBSTONE: u32 = 0x10;
+
+/// The ProjFS state of one path, or `None` when it cannot be determined -- an unreadable path, or a
+/// Windows without the export. Callers must treat `None` as "assume it is the user's", since the
+/// only action that depends on this is deletion.
+pub fn on_disk_file_state(path: &std::path::Path) -> Option<u32> {
+    let api = api()?;
+    let f = api.get_on_disk_file_state?;
+    let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+    wide.push(0);
+    let mut state = 0u32;
+    unsafe {
+        f(PCWSTR(wide.as_ptr()), &mut state).ok().ok()?;
+    }
+    Some(state)
+}
+
+/// Whether anything under `root` is the user's rather than ours: a file they modified or created, or
+/// an archive entry they deleted. Used to decide whether unmounting may delete the mount folder.
+///
+/// Errs towards "yes". Every caller uses this to guard a deletion, so an entry that cannot be
+/// classified has to count as theirs.
+pub fn holds_user_changes(root: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return true;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        match on_disk_file_state(&path) {
+            None => return true,
+            Some(s)
+                if s & (FILE_STATE_DIRTY_PLACEHOLDER | FILE_STATE_FULL | FILE_STATE_TOMBSTONE)
+                    != 0 =>
+            {
+                return true
+            }
+            Some(_) => {}
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) && holds_user_changes(&path) {
+            return true;
+        }
+    }
+    false
 }

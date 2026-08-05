@@ -21,6 +21,7 @@ use cram_core::secret::{FixedPassword, NoPassword, PasswordProvider, Secret};
 /// Run the mount CLI. `args[0]` is the program name (ignored); parameters are read from `args[1..]`.
 pub fn main(args: &[String]) -> ExitCode {
     let selftest = args.iter().any(|a| a == "--selftest");
+    let writable = args.iter().any(|a| a == "--writable");
     let pw: Arc<dyn PasswordProvider> = match args.iter().position(|a| a == "-p") {
         Some(i) => Arc::new(FixedPassword(Secret::new(
             args.get(i + 1).cloned().unwrap_or_default(),
@@ -35,13 +36,13 @@ pub fn main(args: &[String]) -> ExitCode {
         .map(|(_, a)| a)
         .collect();
     let (Some(archive), Some(root)) = (pos.first(), pos.get(1)) else {
-        eprintln!("usage: cram mount [--selftest] [-p <pw>] <archive> <mount-dir>");
+        eprintln!("usage: cram mount [--writable] [--selftest] [-p <pw>] <archive> <mount-dir>");
         return ExitCode::from(2);
     };
     let archive = PathBuf::from(archive);
     let root = PathBuf::from(root);
 
-    let m = match crate::mount(&archive, &root, pw) {
+    let m = match crate::mount_with(&archive, &root, pw, writable) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("mount failed: {e}");
@@ -49,6 +50,13 @@ pub fn main(args: &[String]) -> ExitCode {
         }
     };
     println!("mounted {} at {}", archive.display(), m.root().display());
+    if writable {
+        println!(
+            "writable: anything written here is kept in {} and layered over the archive,",
+            m.root().display()
+        );
+        println!("which is never modified. Delete that folder to go back to a pristine archive.");
+    }
 
     if selftest {
         let (files, dirs, bytes) = walk_verify(&root);
@@ -69,10 +77,14 @@ pub fn main(args: &[String]) -> ExitCode {
         println!(
             "no console attached, so nothing to press Enter on: the mount stays up until this"
         );
-        println!(
-            "process is stopped. Stopping it leaves the mount folder behind; delete it before"
-        );
-        println!("mounting there again.");
+        if writable {
+            println!(
+                "process is stopped. The mount folder is kept, which is the point of --writable."
+            );
+        } else {
+            println!("process is stopped. Stopping it leaves the mount folder behind; delete it");
+            println!("before mounting there again.");
+        }
         loop {
             std::thread::park();
         }

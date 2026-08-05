@@ -60,9 +60,22 @@ content is read out of the archive as a file is opened, with no up-front extract
 whole archive into memory up front** and refuses anything whose total uncompressed size exceeds
 2 GiB, extract those instead.
 
-A mount is **read-only**. You can browse it and open files from it, but nothing is ever written back
-into the archive, and unmounting removes the mount directory, so a file you edit and save inside it
-is discarded, not stored. Copy what you need out of the mount, or use `cram x`.
+**The archive is never modified.** By default a mount is for reading: unmounting removes the mount
+directory, so a file you edit inside it is discarded. If the folder ends up holding files that are
+not in the archive, it is kept rather than deleted, and Cram says so.
+
+`cram mount --writable` keeps them on purpose. The archive stays the immutable base and the mount
+folder becomes everything that has diverged from it, so a program can write settings, saves and new
+files into the mount and find them again next time. Re-mounting the same archive on the same folder
+resumes over what is there: a modified file wins over the archive's copy, an untouched one still
+comes from the archive, and a deleted one stays deleted. Nothing is ever written back into the
+`.cram`; **deleting the mount folder is how you reset to a pristine archive**, and the only way,
+since ProjFS has no way to un-tag a virtualization root.
+
+That last point matters for the case this was built for: a game archived once and mounted rather than
+installed keeps its saves and config beside it, and the archive it reads from cannot be changed by
+playing. It only captures writes that land *inside* the mount, so anything a program writes to
+`%APPDATA%` or the registry still goes there.
 
 Signing (`.cramsig`) and Reed-Solomon recovery (`.cramrec`) are sidecars computed over a file's bytes
 and work on **any file**, not just Cram's own formats. The self-extracting `.exe` does not:

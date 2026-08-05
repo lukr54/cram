@@ -74,10 +74,17 @@ pub(crate) struct MountInner {
     /// reparse tag, so only a folder this mount made is ours to delete; one the user already had is
     /// left alone, tag and all. The next mount there recovers it (see [`claim_root`]).
     created_root: bool,
+    /// A writable mount keeps its root between sessions: the files written into it *are* the point,
+    /// so it is never deleted and a re-mount resumes over what is already there.
+    writable: bool,
 }
 
 impl MountInner {
-    pub(crate) fn start(reader: Box<dyn RandomAccessReader>, root: &Path) -> Result<Self> {
+    pub(crate) fn start(
+        reader: Box<dyn RandomAccessReader>,
+        root: &Path,
+        writable: bool,
+    ) -> Result<Self> {
         // Checked up front so a machine without the optional feature gets the instructions to turn
         // it on, rather than an HRESULT from whichever call happened to run first.
         if !projfs_api::available() {
@@ -89,7 +96,10 @@ impl MountInner {
         // `Box::into_raw` and a successful `PrjStartVirtualizing` nothing owns the box, so an early
         // `?` return here would leak the whole MountState (reader + model). Ordering it this way
         // means the only raw-pointer window is the virtualization call, whose failure arm reclaims.
-        let created_root = claim_root(root)?;
+        let created_root = claim_root(root, writable)?;
+        // A root that is already tagged has been marked once and cannot be marked again; marking is a
+        // one-time act and virtualizing over an existing root is the ordinary resume path.
+        let already_tagged = is_projfs_root(root);
         let root_w = wide(&root.to_string_lossy());
         let instance_id = random_guid()?;
 
@@ -100,8 +110,10 @@ impl MountInner {
         }));
 
         let result = (|| unsafe {
-            projfs_api::mark_directory_as_placeholder(PCWSTR(root_w.as_ptr()), &instance_id)
-                .map_err(|e| ArchiveError::Backend(format!("ProjFS mark placeholder: {e}")))?;
+            if !already_tagged {
+                projfs_api::mark_directory_as_placeholder(PCWSTR(root_w.as_ptr()), &instance_id)
+                    .map_err(|e| ArchiveError::Backend(format!("ProjFS mark placeholder: {e}")))?;
+            }
 
             let callbacks = PRJ_CALLBACKS {
                 StartDirectoryEnumerationCallback: Some(start_enum),
@@ -127,6 +139,7 @@ impl MountInner {
                 state,
                 root: root.to_path_buf(),
                 created_root,
+                writable,
             }),
             Err(e) => {
                 // Reclaim the leaked state box on the failure path.
@@ -152,8 +165,21 @@ impl Drop for MountInner {
         // there, so a pre-existing root keeps its residue and `claim_root` deals with it next time.
         // Best-effort scrub; `remove_dir_all` can choke on dead placeholders, so fall back to
         // `cmd /c rmdir` which tolerates them.
-        if self.created_root {
-            force_remove_dir(&self.root);
+        // ...unless the user put something there. A mount is writable at the filesystem level
+        // whatever this crate intends: ProjFS turns a modified placeholder into a full file and a
+        // deleted one into a tombstone, and both survive the mount. Deleting the root on the way out
+        // therefore threw away save games, settings and anything else written into it, silently and
+        // with the folder gone. Keep it instead and say why.
+        if self.created_root && !self.writable {
+            if projfs_api::holds_user_changes(&self.root) {
+                eprintln!(
+                    "{} holds files that are not in the archive, so it was left in place.",
+                    self.root.display()
+                );
+                eprintln!("Delete the folder yourself once you no longer need them.");
+            } else {
+                force_remove_dir(&self.root);
+            }
         }
     }
 }
@@ -165,7 +191,7 @@ impl Drop for MountInner {
 /// back intact: refusing is the only answer that cannot lose data. The one exception is an empty
 /// root still carrying the ProjFS tag from a mount that died without unmounting, which is otherwise
 /// unmountable for good and has nothing in it to lose.
-fn claim_root(root: &Path) -> Result<bool> {
+fn claim_root(root: &Path, writable: bool) -> Result<bool> {
     let mut entries = match std::fs::read_dir(root) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -177,6 +203,11 @@ fn claim_root(root: &Path) -> Result<bool> {
     let empty = entries.next().is_none();
     let tagged = is_projfs_root(root);
 
+    // A writable mount resuming its own overlay: the folder is tagged because *we* tagged it, and
+    // what it holds is what was written into it last time. That is the feature, not residue.
+    if writable && tagged {
+        return Ok(false);
+    }
     if !empty {
         let why = if tagged {
             "still holds what an earlier mount of it left behind. Delete the folder and mount again"
