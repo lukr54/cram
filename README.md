@@ -22,6 +22,7 @@ has a native format (`.cram`) that stores repeated data once and losslessly repa
 - [Using it](#using-it)
   - [Command reference](#command-reference)
   - [Photos: ~23% smaller, and still byte-for-byte the same files](#photos-23-smaller-and-still-byte-for-byte-the-same-files)
+  - [Downloading, and handing a browser download to Cram](#downloading-and-handing-a-browser-download-to-cram)
   - [Finding duplicates across drives](#finding-duplicates-across-drives)
   - [The Explorer right-click menu (Windows)](#the-explorer-right-click-menu-windows)
   - [What a damaged archive does](#what-a-damaged-archive-does)
@@ -395,6 +396,32 @@ It is on by default; `cram a --no-recompress` turns it off. Archives that use it
 (see [docs/CRAM_FORMAT.md](docs/CRAM_FORMAT.md)), which older readers refuse outright rather than
 misread, and the standalone `cram-extract` recovery tool reverses it too, so a photo archive stays
 recoverable with the small independent decoder.
+
+### Downloading, and handing a browser download to Cram
+
+`cram dl` fetches a file over several connections at once, resumes where it stopped, and can
+unpack it while it is still arriving:
+
+```sh
+cram dl "https://example.com/big.zip" -o D:\Downloads
+cram dl "https://example.com/big.zip" --extract D:\Games\thing   # unpack as it downloads
+cram dl "https://a.example/f.iso" "https://b.example/f.iso"      # two URLs = mirrors of one file
+```
+
+`--discover` looks for more mirrors, `-n` sets the connection count and `--auto` ramps it while
+watching throughput, and `--sha256 <hex>` refuses the file unless it matches. A Metalink
+(`FILE.meta4`) supplies the mirrors and the checksum on its own.
+
+To use it on something you were about to download in Firefox: **right-click the link, Copy Link,
+and pass it to `cram dl`.** That is the whole manual route, and it is worth knowing because the
+per-connection resume and the extract-while-downloading are the parts you cannot get from the
+browser.
+
+**It will not work for a download that needs your session.** If the file sits behind a login, the
+URL alone is not enough — the cookies are, and the browser will not hand those to another program.
+A Firefox add-on that does the hand-off properly, cookies included, is signed and in testing; it
+is not published yet, and this README will link it when it is. Until then, `cram dl` covers
+anything you can reach with a plain link.
 
 ### Finding duplicates across drives
 
