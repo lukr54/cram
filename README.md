@@ -1,17 +1,79 @@
 # Cram
 
-Cram is a multi-format archive tool. One `cram` command lists, extracts, creates, tests, converts and
-mounts archives, signs them and builds parity sidecars for them, finds duplicate files across your
-drives, plus a native format (`.cram`) that stores repeated data once and losslessly repacks JPEGs.
+A multi-format archive tool. One `cram` command lists, extracts, creates, tests, converts and mounts
+archives, signs them, builds parity sidecars, and finds duplicate files across your drives. It also
+has a native format (`.cram`) that stores repeated data once and losslessly repacks JPEGs.
 
-This repository is the **engine and the command line**. The `cram` CLI is free and fully featured;
-nothing in it is restricted. It is written in Rust, and Windows (the GNU/mingw toolchain), Linux and
-Apple Silicon macOS each build and run the full test suite. Archive **mount** is Windows-only (see
-[Limitations](#limitations)).
-Everything is pure Rust **except the UnRAR C++ decoder**, which is always compiled in because it is
-what reads RAR; the optional `zstd-c` feature links C libzstd.
+## Speed
 
-Licensed under **MIT OR Apache-2.0**.
+Creating an archive from 2.8 GB and 42,151 files, on a 24-thread Ryzen 9 5900X. Each tool at its
+own default effort, median of three runs:
+
+| | create | archive | peak memory |
+|---|---|---|---|
+| **Cram** | **6.9 s** | 1.99 GB | 2.6 GB |
+| 7-Zip 26.01 `-mx=5 -mmt=24` | 65.5 s | 2.30 GB | 7.4 GB |
+| WinRAR 7.12 `-m3 -s -mt24` | 84.1 s | 1.99 GB | 0.3 GB |
+
+Both competitors are given every thread explicitly; Cram sizes its own from the machine. RAR gets
+`-s` because 7-Zip is solid by default and RAR is not, and measuring RAR without it would cost it
+10% of its ratio for a reason that has nothing to do with RAR.
+
+**9.4× faster than 7-Zip and 12.1× faster than WinRAR**, matching WinRAR's ratio and beating
+7-Zip's by 13%. At `--fast` it creates the same corpus in 2.8 s, which is 23× 7-Zip's default, and
+still writes 12% less than 7-Zip does.
+
+**The size column depends on your data and the speed column does not.** That corpus is 15%
+duplicate content, which `.cram` stores once and no setting on either competitor can collapse. On
+corpora that never repeat themselves (Silesia, enwik9, a kernel checkout) Cram stays 6–11× faster
+than 7-Zip's default and writes 9–19% *larger*. Deduplication needs something to deduplicate.
+
+### Check it yourself
+
+The corpus is **[a 2.22 GiB download](https://drive.proton.me/urls/FYRM6FM454#zf8BLhcKK4ew)**,
+2,800,604,582 bytes and 42,151 files unpacked:
+
+```
+sha256  5be1b545ec9535834904a6436e6abf27a0fd607190851e314624e8a2db53faa7
+```
+
+It also rebuilds itself byte for byte from public sources with `python3
+tools/corpus/make-corpus.py`, so you do not have to trust the link or us: it carries its own
+`MANIFEST.sha256` and a `CORPUS.id` to check against. `tools/corpus/bench-corpus.sh` re-runs the
+whole table, and [`BENCHMARKS.md`](BENCHMARKS.md) states the method in full, including where Cram
+loses. Those rows are in the same tables as the ones above.
+
+## Download
+
+Cram 1.0.0, from the [releases page](https://github.com/lukr54/cram/releases/latest):
+
+| | |
+|---|---|
+| Windows | [`cram-latest-x86_64-pc-windows-gnu.zip`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-pc-windows-gnu.zip) |
+| Linux (x86-64) | [`cram-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-v1.0.0-x86_64-unknown-linux-gnu.tar.gz) |
+| macOS (Apple Silicon) | [`cram-v1.0.0-aarch64-apple-darwin.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-v1.0.0-aarch64-apple-darwin.tar.gz) |
+| Cram Studio, Windows GUI | [`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) |
+
+Every release publishes a `SHA256SUMS` for each platform. **Nothing is code-signed yet**, so Windows
+SmartScreen warns on the first run of a downloaded binary and macOS keeps it quarantined until you
+clear the flag. `cram update` replaces an existing install and verifies the published checksum
+before it writes anything.
+
+## Free, and a paid GUI
+
+The engine and the `cram` command line are **MIT OR Apache-2.0**, and nothing in the command line is
+held back: every format, every effort level, encryption, mounting, deduplication, recovery sidecars
+and signing are in the free tool. That is not a trial and it does not expire.
+
+**Cram Studio** is a Windows desktop app for people who would rather not use a terminal. It is a
+separate proprietary product under its own EULA, and it is paid. If the command line suits you, you
+do not need it.
+
+This repository is the engine and the command line. It is written in Rust, and Windows (the
+GNU/mingw toolchain), Linux and Apple Silicon macOS each build and run the full test suite. Archive
+**mount** is Windows-only (see [Limitations](#limitations)). Everything is pure Rust **except the
+UnRAR C++ decoder**, which is always compiled in because it is what reads RAR; the optional
+`zstd-c` feature links C libzstd.
 
 ---
 
@@ -415,23 +477,8 @@ abnormally, the command reports it as an error and the shell it was launched fro
 
 ## Design notes
 
-These describe how Cram works, not a measured comparison against anything else — nothing in this
-section is a performance claim.
-
-For measured numbers see [`BENCHMARKS.md`](BENCHMARKS.md), and for the corpus and harness they come
-from see [`tools/corpus`](tools/corpus).
-
-The benchmark corpus is **[available as a download](https://drive.proton.me/urls/FYRM6FM454#zf8BLhcKK4ew)**
-— 2.22 GiB zipped, 2,800,604,582 bytes and 42,151 files unpacked:
-
-```
-sha256  5be1b545ec9535834904a6436e6abf27a0fd607190851e314624e8a2db53faa7
-```
-
-You do not have to trust either the link or us. The corpus rebuilds itself byte-for-byte from public
-sources with `python3 tools/corpus/make-corpus.py`, and carries its own `MANIFEST.sha256` and a
-`CORPUS.id` you can compare against the one quoted in `BENCHMARKS.md`. The download is a convenience
-over a 2.8 GB rebuild, not the source of truth.
+These describe how Cram works, not a measured comparison against anything else. Nothing in this
+section is a performance claim; for those see [`BENCHMARKS.md`](BENCHMARKS.md).
 
 - **Parallel extraction** on the formats with a random-access boundary, ZIP, ISO and `.cram`, where
   entries can be decoded independently. Sequential formats (7z, tar, RAR, bare streams) stream
