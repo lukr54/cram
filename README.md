@@ -419,8 +419,19 @@ These describe how Cram works, not a measured comparison against anything else â
 section is a performance claim.
 
 For measured numbers see [`BENCHMARKS.md`](BENCHMARKS.md), and for the corpus and harness they come
-from see [`tools/corpus`](tools/corpus). The corpus builds itself from public sources against pinned
-checksums, so the whole table can be reproduced rather than taken on trust.
+from see [`tools/corpus`](tools/corpus).
+
+The benchmark corpus is **[available as a download](https://drive.proton.me/urls/FYRM6FM454#zf8BLhcKK4ew)**
+â€” 2.22 GiB zipped, 2,800,604,582 bytes and 42,151 files unpacked:
+
+```
+sha256  5be1b545ec9535834904a6436e6abf27a0fd607190851e314624e8a2db53faa7
+```
+
+You do not have to trust either the link or us. The corpus rebuilds itself byte-for-byte from public
+sources with `python3 tools/corpus/make-corpus.py`, and carries its own `MANIFEST.sha256` and a
+`CORPUS.id` you can compare against the one quoted in `BENCHMARKS.md`. The download is a convenience
+over a 2.8 GB rebuild, not the source of truth.
 
 - **Parallel extraction** on the formats with a random-access boundary, ZIP, ISO and `.cram`, where
   entries can be decoded independently. Sequential formats (7z, tar, RAR, bare streams) stream

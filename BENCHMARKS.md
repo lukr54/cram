@@ -319,14 +319,20 @@ per level and across the commit that introduced the lane pool.
 
 ## Reproducing
 
-The Cram corpus builds itself from public sources, and the build is checked against pinned digests
-so a different upstream file stops it rather than silently changing the corpus:
+The Cram corpus is [a 2.22 GiB download](https://drive.proton.me/urls/FYRM6FM454#zf8BLhcKK4ew),
+sha256 `5be1b545ec9535834904a6436e6abf27a0fd607190851e314624e8a2db53faa7`.
+
+It also builds itself from public sources, checked against pinned digests so a different upstream
+file stops the build rather than silently changing the corpus:
 
 ```sh
 python3 tools/corpus/make-corpus.py --out ./cram-corpus-1.0
 cat cram-corpus-1.0/CORPUS.id
 # deb5f932d27a913ad6da2b994be7e66bffd03d6bf8546abd3de8ca7344efe599
 ```
+
+Both routes give the same corpus. `CORPUS.id` is a digest over `MANIFEST.sha256`, which lists every
+file, so downloading and building are equally checkable and neither requires trusting the other.
 
 Then the whole table, with the method above already encoded in it:
 

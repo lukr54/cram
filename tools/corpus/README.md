@@ -3,12 +3,27 @@
 A 2.8 GB, 42,151-file corpus built entirely from material anyone can download and redistribute, so
 the numbers measured on it can be checked by someone who is not us.
 
+## Get it
+
+**[Download the corpus](https://drive.proton.me/urls/FYRM6FM454#zf8BLhcKK4ew)** — 2.22 GiB zipped.
+
+```
+cram-corpus-1.0.zip
+2,382,361,690 bytes
+sha256  5be1b545ec9535834904a6436e6abf27a0fd607190851e314624e8a2db53faa7
+```
+
+Or build it yourself, which produces the same corpus byte for byte:
+
 ```sh
 python3 make-corpus.py --out ./cram-corpus-1.0
 ./bench-corpus.sh ./cram-corpus-1.0 /tmp/bench 3
 ```
 
-Needs Python 3.8+ and about 8 GB of free disk. Nothing else — no curl, no unzip, no git.
+Building needs Python 3.8+ and about 8 GB of free disk. Nothing else — no curl, no unzip, no git.
+
+The download is a convenience over a 2.8 GB rebuild, not the source of truth. Whichever route you
+take, the corpus carries its own `MANIFEST.sha256` and a `CORPUS.id` to check it against.
 
 ## What is in it, and why
 
