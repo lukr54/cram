@@ -1851,15 +1851,47 @@ impl CramArchiveWriter {
     /// Print the serial/parallel split to stderr when `CRAM_PROFILE` is set. Diagnostic only: no
     /// caller parses this and nothing about the archive depends on it.
     fn report_profile(&self) {
-        if std::env::var_os("CRAM_PROFILE").is_none() {
-            return;
-        }
         use crate::engine::prof as eprof;
         use std::sync::atomic::Ordering::Relaxed;
         let p = &self.prof;
         let wall = self.start.elapsed().as_nanos().max(1);
         let ms = |n: u128| n as f64 / 1e6;
         let pct = |n: u128| (n as f64 / wall as f64) * 100.0;
+
+        // The headline split, recorded whether or not `CRAM_PROFILE` is set. "Cram is slow on my
+        // machine" is a bug report too, and today answering it needs an environment variable the
+        // reporter will never have heard of. These are a handful of numbers, gathered once at the
+        // end of a create.
+        {
+            let d = crate::diag::diag();
+            d.metric("create wall", format!("{:.1} ms", ms(wall)));
+            d.metric(
+                "commit (serial)",
+                format!("{:.1} ms, {:.1}%", ms(p.chunk_nanos), pct(p.chunk_nanos)),
+            );
+            d.metric(
+                "chunk lanes",
+                format!(
+                    "{} lanes over {} files, waited {:.1} ms",
+                    self.prep.lanes.workers,
+                    self.prep_prof.files.load(Relaxed),
+                    ms(p.prep_wait_nanos)
+                ),
+            );
+            d.metric(
+                "pack workers",
+                format!(
+                    "{}, blocked {:.1} ms over {} stalls",
+                    p.workers,
+                    ms(p.drain_nanos),
+                    p.stalls
+                ),
+            );
+        }
+
+        if std::env::var_os("CRAM_PROFILE").is_none() {
+            return;
+        }
         eprintln!("--- cram create profile ---");
         eprintln!("wall            {:9.1} ms", ms(wall));
         // The commit stage is what is left on one thread once chunking moved to the pool: a dedup
@@ -2532,32 +2564,22 @@ impl CramReader {
     /// `decodes / packs` is the number to read. 1.0 means every pack was decompressed exactly once,
     /// which is the floor; above that is redundant work, either a worker racing another onto the
     /// same pack or a pack evicted and fetched again.
-    fn report_pack_profile(&self) {
+    /// How this archive is put together and how hard it was to read, as text.
+    ///
+    /// One computation feeding two consumers: `CRAM_PROFILE` prints it, and a diagnostic report
+    /// carries it as the archive section. Keeping them separate would let the thing a maintainer
+    /// reads in a bug report drift from the thing they see when they run it themselves.
+    fn pack_profile_text(&self) -> Option<String> {
+        use std::fmt::Write as _;
         use std::sync::atomic::Ordering::Relaxed;
-        if std::env::var_os("CRAM_PROFILE").is_none() {
-            return;
-        }
         let (d, h, b) = (
             packprof::DECODES.load(Relaxed),
             packprof::HITS.load(Relaxed),
             packprof::BYTES.load(Relaxed),
         );
         if d == 0 && h == 0 {
-            return;
+            return None;
         }
-        let packs = self.packs.len().max(1) as f64;
-        eprintln!("--- cram pack profile ---");
-        eprintln!("packs in archive  {:9}", self.packs.len());
-        eprintln!(
-            "pack decodes      {d:9}   {:.2} per pack   ({:.0} MiB decompressed)",
-            d as f64 / packs,
-            b as f64 / (1024.0 * 1024.0),
-        );
-        eprintln!(
-            "cache hits        {h:9}   {:.1}% of {} requests",
-            (h as f64 / (h + d).max(1) as f64) * 100.0,
-            h + d,
-        );
         // How each pack was actually encoded. A pack the writer judged incompressible is kept raw,
         // and pack sizing changes that judgement: on silesia a 16 MiB target produced an archive 26%
         // larger than either 8 or 32 MiB, which a shift toward STORE would explain and nothing about
@@ -2574,10 +2596,40 @@ impl CramReader {
                 _ => zstd += 1,
             }
         }
-        eprintln!(
+        let packs = self.packs.len().max(1) as f64;
+        let mut s = String::new();
+        let _ = writeln!(s, "format            .cram");
+        let _ = writeln!(s, "packs in archive  {:9}", self.packs.len());
+        let _ = writeln!(
+            s,
+            "pack decodes      {d:9}   {:.2} per pack   ({:.0} MiB decompressed)",
+            d as f64 / packs,
+            b as f64 / (1024.0 * 1024.0),
+        );
+        let _ = writeln!(
+            s,
+            "cache hits        {h:9}   {:.1}% of {} requests",
+            (h as f64 / (h + d).max(1) as f64) * 100.0,
+            h + d,
+        );
+        let _ = writeln!(
+            s,
             "pack codecs       store {store}, xz {xz}, zstd {zstd}   ({:.0} MiB stored raw)",
             store_raw as f64 / (1024.0 * 1024.0),
         );
+        Some(s)
+    }
+
+    fn report_pack_profile(&self) {
+        let Some(text) = self.pack_profile_text() else {
+            return;
+        };
+        // Recorded whether or not diagnostics are on: it is one string per archive, and it is the
+        // section a maintainer reads first in a bug report.
+        crate::diag::diag().set_archive(&text);
+        if std::env::var_os("CRAM_PROFILE").is_some() {
+            eprint!("--- cram pack profile ---\n{text}");
+        }
     }
 
     /// The whole-extraction decompression budget (see [`RE_DECODE_FACTOR`]).

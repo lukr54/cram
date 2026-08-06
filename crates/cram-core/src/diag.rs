@@ -338,6 +338,10 @@ pub struct Diag {
     ring: Mutex<VecDeque<Event>>,
     dropped: AtomicU64,
     cap: usize,
+    /// How the archive in play is put together. Set by the format backend, which is the only thing
+    /// that knows, and read when a report is written. One string rather than a ring entry because
+    /// the newest one wins and the old ones are noise.
+    archive: Mutex<Option<String>>,
 }
 
 static DIAG: OnceLock<Diag> = OnceLock::new();
@@ -352,6 +356,7 @@ pub fn diag() -> &'static Diag {
         // Enough to cover a failing run's neighbourhood without letting a long job hold a
         // gigabyte of strings.
         cap: 20_000,
+        archive: Mutex::new(None),
     })
 }
 
@@ -427,6 +432,19 @@ impl Diag {
         self.push(Event::Note(scrub(&msg.into())));
     }
 
+    /// Describe the archive being read or written. Costs one small string per archive, so it is
+    /// recorded whether or not detailed diagnostics are on: it is the section a maintainer reads
+    /// first, and it is exactly what a reporter cannot be asked to work out by hand.
+    pub fn set_archive(&self, summary: impl Into<String>) {
+        if let Ok(mut a) = self.archive.lock() {
+            *a = Some(summary.into());
+        }
+    }
+
+    pub fn archive_summary(&self) -> Option<String> {
+        self.archive.lock().ok().and_then(|a| a.clone())
+    }
+
     /// Everything recorded so far, oldest first.
     pub fn events(&self) -> Vec<Event> {
         self.ring
@@ -444,6 +462,9 @@ impl Diag {
     pub fn clear(&self) {
         if let Ok(mut r) = self.ring.lock() {
             r.clear();
+        }
+        if let Ok(mut a) = self.archive.lock() {
+            *a = None;
         }
         self.dropped.store(0, Ordering::Relaxed);
     }
@@ -647,10 +668,17 @@ pub fn render(header: &ReportHeader) -> String {
         s.push_str("\n\n");
     }
 
-    if !header.archive.is_empty() {
+    // Same fallback as the operation: the backend knows the archive's shape and the caller does
+    // not, so whatever it recorded stands in when the caller had nothing.
+    let archive = if header.archive.is_empty() {
+        d.archive_summary().unwrap_or_default()
+    } else {
+        header.archive.clone()
+    };
+    if !archive.is_empty() {
         s.push_str("-- archive ------------------------------------------------------------\n");
-        s.push_str(&scrub(&header.archive));
-        s.push_str("\n\n");
+        s.push_str(&scrub(&archive));
+        s.push('\n');
     }
 
     if let Some(err) = &header.error {
@@ -769,6 +797,17 @@ pub fn write_report(header: &ReportHeader, stamp: &str) -> crate::error::Result<
 mod tests {
     use super::*;
 
+    /// The recorder is process-global, which is right for one CLI invocation and wrong for a test
+    /// binary running several tests at once: without this, one test's events land in another's
+    /// ring and the failure looks like a bug in the code under test. Any test that touches
+    /// `diag()` takes this first.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not wedge every test after it.
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn a_shape_describes_without_naming() {
         let s = PathShape::of(r"D:\Clients\Meridian\build\auth.dll", Some(1148928), false);
@@ -822,7 +861,30 @@ mod tests {
     }
 
     #[test]
+    fn the_archive_summary_reaches_a_report_without_recording_being_on() {
+        // The pack layout and the create timings are the two things a "why is this slow" report
+        // needs, and both are gathered during the run. If they only landed when detailed recording
+        // was on, the common case -- a user who has not turned anything on -- would report nothing
+        // useful.
+        let _g = exclusive();
+        let d = diag();
+        d.clear();
+        d.set_full(false);
+        d.set_archive("format            .cram\npacks in archive          7\n");
+        d.metric("create wall", "21.1 ms");
+        let out = render(&ReportHeader::default());
+        assert!(out.contains("packs in archive"), "{out}");
+        assert!(out.contains("create wall"), "{out}");
+        d.clear();
+        assert!(
+            d.archive_summary().is_none(),
+            "clear() has to drop the archive too, or a report describes the previous job"
+        );
+    }
+
+    #[test]
     fn recording_is_off_until_asked() {
+        let _g = exclusive();
         let d = diag();
         d.clear();
         d.set_full(false);

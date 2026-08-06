@@ -169,6 +169,7 @@ fn extract_tar_stream(
                 );
             }
             Ok(n) => {
+                crate::diag::diag().entry(entry.name(), Some(n), "ok");
                 report.extracted += 1;
                 report.bytes += n;
                 sink.on_file_done(&entry);
@@ -290,6 +291,7 @@ fn extract_zip_stream(
             Ok(n)
         }) {
             Ok(n) => {
+                crate::diag::diag().entry(entry.name(), Some(n), "ok");
                 report.extracted += 1;
                 report.bytes += n;
                 sink.on_file_done(&entry);

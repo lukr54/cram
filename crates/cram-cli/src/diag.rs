@@ -92,19 +92,25 @@ pub fn header() -> ReportHeader {
     }
 }
 
-/// Write a report for a failed run, if the user opted in. Returns where it went.
+/// Write a report describing the run that just happened. `err` is `None` when it succeeded.
 ///
-/// Only reached when detailed diagnostics are on, which is the permission: someone who turned
-/// recording on did it to capture a failure, and the recording dies with this process, so a later
-/// `diag report` would find nothing.
-pub fn write_failure_report(args: &[String], err: &str) -> Option<PathBuf> {
-    if !core_diag::diag().is_full() {
-        return None;
-    }
+/// Everything worth reporting -- the timings, the archive's structure, the entries that failed --
+/// is gathered during the run and lives in this process, so it has to be written here or not at
+/// all.
+pub fn write_outcome_report(args: &[String], err: Option<&str>) -> Option<PathBuf> {
     let mut h = header();
     h.operation = redacted_command(args);
-    h.error = Some(err.to_string());
+    h.error = err.map(str::to_string);
     core_diag::write_report(&h, &core_diag::stamp()).ok()
+}
+
+/// Write a report for a failed run when the user has opted in, either standing (the setting) or for
+/// this one run (`--diag-report`, which `main` has already stripped from `args`, hence the flag).
+pub fn write_failure_report(args: &[String], err: &str, asked: bool) -> Option<PathBuf> {
+    if !core_diag::diag().is_full() && !asked {
+        return None;
+    }
+    write_outcome_report(args, Some(err))
 }
 
 const USAGE: &str = "\

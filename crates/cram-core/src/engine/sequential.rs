@@ -114,6 +114,7 @@ pub fn run(
             }
             Ok(n) => {
                 restore_mtime(&outpath, entry.modified);
+                crate::diag::diag().entry(entry.name(), Some(n), "ok");
                 report.extracted += 1;
                 report.bytes += n;
                 sink.on_file_done(&entry);

@@ -260,6 +260,10 @@ cram diag <status|on|off|report|where>            write a diagnostic file for a 
                                                   Detailed per-entry recording is off by default,
                                                   costs a little speed, and is turned on with
                                                   `diag on`
+cram <any command> --diag-report                  write a report about that run, succeed or fail.
+                                                  Timings and archive structure only exist while
+                                                  the command runs, so this is how to report a
+                                                  command that worked but was slow
 cram --version                                    version + which optional features are compiled in
 ```
 

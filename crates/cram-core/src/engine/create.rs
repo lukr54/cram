@@ -349,6 +349,7 @@ pub fn create(
                     })?;
                 }
             }
+            crate::diag::diag().entry(item.entry.name(), Some(item.entry.size), "add");
             sink.on_file_done(&item.entry);
         }
         writer.finish()

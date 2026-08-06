@@ -74,9 +74,17 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--full-paths") {
         cram_core::diag::diag().set_full_paths(true);
     }
+    let want_report = args.iter().any(|a| a == "--diag-report");
     // One event, always, so even a report written with recording off says what was run. The
-    // password never reaches it.
+    // password never reaches it. Taken from the full command line, before the filter below.
     cram_core::diag::diag().op("command", diag::redacted_command(&args));
+    // The diagnostics flags belong to every verb and to none of them, so they come out before
+    // dispatch: each verb's parser rejects what it does not recognise, which is the behaviour that
+    // catches typos and has to stay.
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != "--diag-report" && a != "--full-paths")
+        .collect();
     // RAR is decoded by the UnRAR C++ library, which can fault the *whole process* on a crafted
     // archive (why the fuzz harness excludes it). When a verb would read a RAR and we are not already
     // the sacrificial worker, run the command in a child process so a fault kills only the child; the
@@ -120,14 +128,26 @@ fn main() -> ExitCode {
         Some("make-sfx") => make_sfx(&args),
         // Archive verbs return `Result` and share one error rendering + exit code.
         _ => match run(&args) {
-            Some(Ok(())) => ExitCode::SUCCESS,
+            Some(Ok(())) => {
+                // "It worked, but it took four minutes" is a bug report too, and the timings that
+                // answer it are gathered during the run and gone when the process exits. Without
+                // this the performance numbers could only ever be seen when something also failed,
+                // which is exactly not the slow-but-working case.
+                if want_report {
+                    match diag::write_outcome_report(&args, None) {
+                        Some(p) => println!("cram: diagnostic report written to {}", p.display()),
+                        None => eprintln!("cram: could not write a diagnostic report"),
+                    }
+                }
+                ExitCode::SUCCESS
+            }
             Some(Err(e)) => {
                 eprintln!("cram: {e}");
                 if args.get(1).map(String::as_str) != Some("diag") {
                     // With diagnostics on the report is written here, because the recording is in
                     // this process and dies with it. With them off nothing is written and the user
                     // is told how to get one, rather than having a file appear uninvited.
-                    match diag::write_failure_report(&args, &e.to_string()) {
+                    match diag::write_failure_report(&args, &e.to_string(), want_report) {
                         Some(p) => eprintln!("cram: diagnostic report written to {}", p.display()),
                         None => eprintln!(
                             "cram: to capture this for a bug report, run `cram diag on`, \
@@ -329,6 +349,9 @@ usage: cram <command> …
        safe to attach in public; --full-paths includes them if a maintainer asks.
        Detailed per-entry recording is off by default and costs a little speed when on:
        `diag on`, reproduce the problem, then `diag report`
+  --diag-report                       works on any command above: write a report about that
+       run, whether it succeeded or failed. Timings and the archive's structure only exist
+       while the command runs, so this is how to report one that worked but was slow
   --version                           version + which optional features are compiled in";
 
 /// The usage block as *context for an error*, so it goes to stderr and stays out of a pipe. When it

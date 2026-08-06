@@ -172,9 +172,14 @@ replaced before the command line is recorded.
 
 *Detailed recording is opt-in.* Off by default, because an event per entry across tens of thousands
 of files is a real cost on a tool whose point is speed. With it off, a report still describes the
-build, the machine, the error and the failed entries — everything reconstructable after the fact.
-With it on, Cram also writes a report when an operation fails, since the recording lives in that
-process and would be gone by the time anyone asked for it.
+build, the machine, the error, the failed entries, the archive's pack layout and codec mix, and the
+create timings — everything reconstructable after the fact. With it on, a per-entry trace is added,
+and Cram also writes a report when an operation fails, since the recording lives in that process and
+would be gone by the time anyone asked for it.
+
+*`--diag-report` works on any command* and writes a report about that run whether it succeeded or
+not. "It worked, but it took four minutes" is a bug report too, and the timings that answer it exist
+only while the command is running.
 
 ### Security
 
