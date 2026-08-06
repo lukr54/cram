@@ -79,6 +79,17 @@ libraries. A dependency that pulled in a runtime DLL the way `cram.exe` pulls in
 `cram --version` prints which of these are compiled in, worth checking before you report a bug,
 since a `zstd-c` build writes different `.cram` bytes than the pure-Rust default.
 
+`cram diag report` writes that and the rest of what a bug report needs — the machine profile that
+decides Cram's thread and pack sizing, the archive's pack layout and codec mix, the create timings,
+and every entry that failed — into one text file you can attach. Nothing is sent anywhere. File and
+folder names are described by shape rather than included, so it is safe to attach to a public issue
+without reading it first; `--full-paths` includes the real names if a maintainer asks.
+
+Two things worth knowing when you use it. `cram <any command> --diag-report` writes a report for
+that run whether it succeeded or failed, which is how to report something that worked but was slow —
+the timings only exist while the command is running. And `cram diag on` adds a per-entry trace,
+which costs a little speed and is therefore off until you ask for it.
+
 ### Mounting
 
 `cram mount` additionally needs the optional Windows feature `Client-ProjFS`, which is off by

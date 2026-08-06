@@ -300,6 +300,39 @@ on any file at all.
 
 ---
 
+## 7a. Diagnostics
+
+[`diag.rs`](../crates/cram-core/src/diag.rs) collects what a bug report needs and writes it as one
+text file. It has no network code and nothing else in the tree calls out either; a report is a file
+on disk and moving it is the user's action. That is the design, not a setting.
+
+Three constraints shape it.
+
+**Cost.** Per-entry recording sits in the hot loop of every extract and create path, so the enable
+flag is a relaxed `AtomicBool` checked before anything is allocated, and detailed recording is **off
+by default**. What is *always* gathered is the cheap half: the archive's pack layout and codec mix
+(one string, from [`pack_profile_text`](../crates/cram-core/src/formats/cram.rs)), the create timing
+split, and every entry that failed. Failures funnel through
+[`Report::push_failure`](../crates/cram-core/src/error.rs), so recording at that one point covers
+every backend.
+
+**Privacy.** For an archiver the entry names *are* the sensitive material, and reports are meant to
+be attachable to a public issue without being read first. `PathShape` therefore describes an entry
+rather than naming it — extension, size, depth, name length, alphabet — while keeping the flags that
+are *themselves* the bug: a Windows reserved device name, a trailing dot or space, control
+characters, an over-long path. Redaction that hid those would hide the faults most worth reporting.
+Free text goes through `scrub`, deliberately conservative, because an over-eager scrubber that eats
+the error message is a worse failure than a leaked directory name.
+
+**Provenance.** The machine block is not boilerplate. Cram sizes thread counts, chunk lanes and pack
+targets from [`hw.rs`](../crates/cram-core/src/hw.rs), so a fault that only appears at three chunk
+lanes cannot be reproduced from a report that does not say the reporter had four cores.
+
+The on/off setting lives in one file shared by the CLI and Studio. Two settings files would mean
+turning diagnostics on in the app and finding the command line had never heard about it.
+
+---
+
 ## 8. The mount
 
 [`cram-mount`](../crates/cram-mount) projects an archive into the filesystem via Windows ProjFS,

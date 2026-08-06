@@ -415,8 +415,12 @@ abnormally, the command reports it as an error and the shell it was launched fro
 
 ## Design notes
 
-These describe how Cram works, not a measured comparison against anything else. This repository
-contains no benchmark harness, so nothing here is a performance claim.
+These describe how Cram works, not a measured comparison against anything else — nothing in this
+section is a performance claim.
+
+For measured numbers see [`BENCHMARKS.md`](BENCHMARKS.md), and for the corpus and harness they come
+from see [`tools/corpus`](tools/corpus). The corpus builds itself from public sources against pinned
+checksums, so the whole table can be reproduced rather than taken on trust.
 
 - **Parallel extraction** on the formats with a random-access boundary, ZIP, ISO and `.cram`, where
   entries can be decoded independently. Sequential formats (7z, tar, RAR, bare streams) stream

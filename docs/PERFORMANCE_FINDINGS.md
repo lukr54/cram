@@ -265,6 +265,11 @@ The chunker is a single thread on the critical path, and every extra compression
 away from it. The same effect was measured independently on 16-thread Windows, where 11 rayon threads
 beat 16 by 13%.
 
+> **Superseded in part by finding 15.** Chunking moved onto a pool in `e7eb57b`, so it is no longer
+> one thread. The conclusion below still stands for the compressing levels — `--auto` gains nothing
+> from more chunk lanes and the pack compressor remains the constraint — but "single thread on the
+> critical path" now describes only the commit stage.
+
 **So the optimum compression concurrency is BELOW the core count, not equal to it.** `derive_plan`'s
 `workers: hw.logical` for `Op::Create` is the wrong answer, and wiring it in unchanged would make
 create slower on every machine with more cores than the current clamp. Whatever replaces the clamp
@@ -479,6 +484,53 @@ the `zstd-c` feature, so "auto" ran XZ preset 6 rather than the zstd path that s
 rows are unaffected, and were confirmed byte-identical across two independent runs. Auto still needs
 measuring with the feature enabled, and it matters more than `--best` does, being what anyone gets
 without passing a flag.
+
+## 15. The chunker is no longer one thread, and the win is mostly pipelining, not parallelism
+
+Finding 9 above concluded that "the chunker is a single thread on the critical path, and every extra
+compression worker takes cores away from it". That was true when it was written and is no longer:
+`e7eb57b` moved chunking onto a pool of lanes. This records what the pool is actually worth, because
+the first number measured for it was wrong and got as far as a written claim before the repeat run
+caught it.
+
+Round-robin across configurations rather than all repeats of one config back to back, on the public
+corpus (2.8 GB, 42,151 files, 15% duplicate). Medians; `store` n=5, `fast` n=3.
+
+| lanes | `--store` | `--fast` |
+|---|---|---|
+| pre-pool (`8909a1e`) | 6.95 s | 6.20 s |
+| 1 | 5.86 s | 5.65 s |
+| 2 | 4.70 s | 4.56 s |
+| 24 | 4.08 s | 3.96 s |
+
+**`--store` gains 1.70x, `--fast` 1.57x, `--auto` gains nothing** — 10.73 to 10.97 s across every
+lane count from 1 to 24, which is noise. At `--auto` the pack compressor is the whole cost and the
+chunker was never in the way. Twenty-four lanes there cost 70% more CPU and a further gigabyte of
+RSS for no wall-clock at all, which is why `prepare_lanes` caps the compressing case at 3.
+
+**Most of the first jump is pipelining, not parallelism.** Serial `--store` spends 7.79 core-seconds;
+one lane spends 7.99 — the same work — but finishes in 5.86 s instead of 6.95 because the lane
+overlaps the read with the hash. The serial build sat at 55% CPU on a warm cache, under one core.
+Everything past two lanes is worth about 15% more.
+
+Two traps, both paid for:
+
+- **A single sample is worthless here.** The first sweep measured `pre --store` once at 14.16 s and
+  `w=1` once at 10.95 s, and both were stalls; a 1.8x disagreement between two runs of the same
+  binary on the same bytes is what prompted the round-robin. A curve drawn through a stall is not a
+  curve. The published 3.46x that came out of it was wrong and was retracted.
+- **Ordering, not sample count, was the fix.** Running every repeat of a config back to back puts any
+  slow patch of the machine entirely on one config, where it reads as that config's number.
+
+Output was byte-identical across every lane count and across the pre/post commit boundary — 24 runs
+per level, three levels — which is the reproducibility guarantee holding on real files rather than on
+a fixture. `crates/cram-core/tests/chunk_lanes.rs` pins it at 1, 2, 4 and 16.
+
+Shipped lane counts: `--store` gets 12 (`packs_are_cheap` is `matches!(policy, PackPolicy::Store)`),
+`--fast` and `--auto` get 3. **`--fast` at 12 lanes measures about 7% faster for 380 MB more RSS**,
+which is a trade rather than a free win and has not been taken.
+
+---
 
 ## Fixed since this document was written
 
