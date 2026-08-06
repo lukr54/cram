@@ -7,10 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.0.0] - 2026-08-06
 
 The first public release of the Cram engine and command line. Everything below is new, so there is
-nothing to list as changed or fixed. This becomes `## [1.0.0] - <date>` when the tag is pushed.
+nothing to list as changed or fixed.
 
 The release will also carry the **Cram Studio** installer as an asset. Studio is a separate,
 proprietary product under its own EULA; the MIT OR Apache-2.0 licence covers the engine and CLI in
@@ -218,4 +218,10 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
   directories are stored, and the `.cram` format stores no timestamps by design.
 - **Nothing is code-signed**, so Windows SmartScreen warns on first run of a downloaded binary.
 
-[Unreleased]: https://github.com/lukr54/cram/compare/main...HEAD
+<!-- These trail the last section, so the release workflow's notes extractor (which reads from a
+     "## [x.y.z]" heading to the next one, or to EOF) picks them up along with 1.0.0's notes. That
+     is harmless: a link reference definition renders as nothing. Worth knowing before anyone
+     "fixes" the published notes by moving them. -->
+
+[1.0.0]: https://github.com/lukr54/cram/releases/tag/v1.0.0
+[Unreleased]: https://github.com/lukr54/cram/compare/v1.0.0...HEAD
