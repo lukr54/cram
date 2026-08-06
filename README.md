@@ -66,8 +66,9 @@ held back: every format, every effort level, encryption, mounting, deduplication
 and signing are in the free tool. That is not a trial and it does not expire.
 
 **Cram Studio** is a Windows desktop app for people who would rather not use a terminal. It is a
-separate proprietary product under its own EULA, and it is paid. If the command line suits you, you
-do not need it.
+separate proprietary product under its own EULA. The download is free and a Pro upgrade unlocks
+some of its features; the command line is not affected either way. If the terminal suits you, you
+do not need Studio at all.
 
 This repository is the engine and the command line. It is written in Rust, and Windows (the
 GNU/mingw toolchain), Linux and Apple Silicon macOS each build and run the full test suite. Archive
