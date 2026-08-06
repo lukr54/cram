@@ -575,12 +575,27 @@ section is a performance claim; for those see [`BENCHMARKS.md`](BENCHMARKS.md).
 Cram Studio is a separate Windows desktop application built on this engine. Its source is not in
 this repository, and nothing in this repository depends on it.
 
+![The Cram Studio library, listing archives with their packed size and how much deduplication saved on each](docs/img/studio-library-dark.png)
+
+The library tracks archives wherever they are on disk and shows what each one cost. The figures
+above are real, from archives built out of the [public benchmark corpus](tools/corpus): 689 MB from
+1.06 GB with 210 MB removed by deduplication on a folder that contains its own backup, and 1.1 GB
+from 1.1 GB on a folder of photographs, where there is nothing to find and it says so.
+
+![Creating an archive: choosing between .zip, .7z, .tar and .cram, three effort levels, and encryption, signing and recovery options](docs/img/studio-new-archive-light.png)
+
+Creating one is the same set of choices the CLI exposes: container, effort, and whether to encrypt,
+sign or write a recovery record. Studio follows the system light and dark theme.
+
 **Studio is proprietary and sold under its own EULA.** The MIT OR Apache-2.0 licence on this page
 covers the engine and the CLI in this repository and nothing else. The Studio installer ships as an
 asset on this repository's Releases page —
 [`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) —
 and that installer is **not** covered by those licences. A proprietary `.exe` on the Releases page
 of an MIT/Apache repository is deliberate, not an oversight.
+
+The download is free. A Pro upgrade unlocks deduplication reporting, signing, parity and mounting
+inside the GUI; all of those are in the free command line without restriction.
 
 ---
 
