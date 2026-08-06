@@ -4,6 +4,36 @@ A multi-format archive tool. One `cram` command lists, extracts, creates, tests,
 archives, signs them, builds parity sidecars, and finds duplicate files across your drives. It also
 has a native format (`.cram`) that stores repeated data once and losslessly repacks JPEGs.
 
+**[Download](#download)** · [Benchmarks](BENCHMARKS.md) · [Roadmap](ROADMAP.md) ·
+[Changelog](CHANGELOG.md) · [Limitations](#limitations)
+
+<details>
+<summary>Contents</summary>
+
+- [Speed](#speed)
+  - [Check it yourself](#check-it-yourself)
+- [Download](#download)
+- [Free, and a paid GUI](#free-and-a-paid-gui)
+- [Formats](#formats)
+- [Install](#install)
+  - [Windows](#windows)
+  - [Linux and macOS](#linux-and-macos)
+  - [Building from source](#building-from-source)
+- [Using it](#using-it)
+  - [Command reference](#command-reference)
+  - [Photos: ~23% smaller, and still byte-for-byte the same files](#photos-23-smaller-and-still-byte-for-byte-the-same-files)
+  - [Finding duplicates across drives](#finding-duplicates-across-drives)
+  - [The Explorer right-click menu (Windows)](#the-explorer-right-click-menu-windows)
+  - [What a damaged archive does](#what-a-damaged-archive-does)
+- [Design notes](#design-notes)
+- [Limitations](#limitations)
+- [Cram Studio](#cram-studio)
+- [Repository layout](#repository-layout)
+- [Security](#security)
+- [License](#license)
+
+</details>
+
 ## Speed
 
 Creating an archive from 2.8 GB and 42,151 files, on a 24-thread Ryzen 9 5900X. Each tool at its
@@ -509,8 +539,11 @@ section is a performance claim; for those see [`BENCHMARKS.md`](BENCHMARKS.md).
   without it.
 - **Mounting 7z / tar / RAR / a bare compressed file decodes the whole archive into RAM**, capped at
   2 GiB; above that the mount is refused. Only ZIP, ISO and `.cram` are projected lazily.
-- **A mount is read-only, and its directory is removed on unmount.** Edits saved into a mounted
-  folder never reach the archive and do not survive the unmount (see ‡ above).
+- **Nothing is ever written back into an archive by a mount.** By default the mount directory is
+  removed on unmount, so a file edited inside it is discarded; `cram mount --writable` keeps the
+  directory instead, and everything written into it lives there rather than in the archive (see ‡
+  above). Deleting that folder is the only way to reset to a pristine archive, because ProjFS
+  cannot un-tag a virtualization root.
 - **A large RAR entry is written to a scratch file first.** The RAR decoder hands an entry back in
   one piece rather than in chunks, so anything too big to hold in memory is extracted by UnRAR
   straight to a scratch file beside the archive and streamed from there, then deleted. The threshold

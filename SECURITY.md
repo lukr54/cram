@@ -13,9 +13,18 @@ features are.
 
 ## Supported versions
 
-**No binary release has shipped yet.** Until the first `v*` tag is pushed, fixes land on `main` and
-are available by building from source. Once v1.0.0 is published, `1.0.x` is the supported line;
-there is nothing earlier and nothing to backport to.
+| version | supported |
+|---|---|
+| 1.0.x | yes |
+| < 1.0 | there is nothing earlier |
+
+**1.0.0 is the first release** (6 August 2026), so `1.0.x` is the supported line and there is
+nothing to backport to. A fix ships in the next patch release; between releases it is on `main` and
+available by building from source.
+
+`cram --version` reports the version and which optional features the binary carries. That matters
+in a report: a `zstd-c` build writes different `.cram` bytes than the pure-Rust default, so the two
+are not interchangeable when reproducing something.
 
 ---
 
@@ -166,6 +175,12 @@ For guaranteed content integrity on those, pair the archive with `cram sign` or 
 the whole file), or use a format that carries per-entry integrity. The README's **Limitations** section
 states this per format.
 
-**Released binaries are not Authenticode-signed.** There is no code-signing certificate, so Windows
-cannot vouch for a downloaded `cram.exe` or `cram-extract.exe` and SmartScreen warns on first run.
-`cram sign` signs *archives*; it has nothing to do with Windows executable trust.
+**Released binaries are not Authenticode-signed or notarised.** There is no code-signing
+certificate, so Windows cannot vouch for a downloaded `cram.exe`, `cram-extract.exe` or the Cram
+Studio installer, and SmartScreen warns on first run; macOS keeps a downloaded binary quarantined
+until the flag is cleared. What you *can* verify is the download itself: every release publishes a
+`SHA256SUMS` per platform, `install.sh` checks it before installing anything, and `cram update`
+refuses to install an artifact whose checksum does not match. That authenticates the bytes against
+the release, which is not the same as an OS-level trust decision about the publisher.
+
+`cram sign` signs *archives*; it has nothing to do with Windows or macOS executable trust.
