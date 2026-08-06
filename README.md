@@ -162,37 +162,33 @@ and work on **any file**, not just Cram's own formats. The self-extracting `.exe
 
 ## Install
 
-**No binary release has been published yet.** There is no tag, the Releases page is empty, and
-everything in this section starts working the moment a `v*` tag is pushed. Until then, build from
-source — see [Building from source](#building-from-source) below.
+### Windows
 
-Once the first release exists, Windows x86-64 binaries ship as a single zip,
-`cram-<tag>-x86_64-pc-windows-gnu.zip`, alongside `SHA256SUMS.windows` and a version-free
-`cram-latest-x86_64-pc-windows-gnu.zip` so a permanent
-`https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-pc-windows-gnu.zip`
-link keeps working. The zip holds `cram.exe`, `cram-extract.exe`, `cram_shell.dll` (the Explorer
-right-click menu, which does nothing until you run `cram shell install`) and `libwinpthread-1.dll`,
-which `cram.exe` links against and will not start without. Keep the contents together. They are
-**not code-signed**, so SmartScreen will warn on first run (see [Limitations](#limitations)).
+[`cram-latest-x86_64-pc-windows-gnu.zip`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-pc-windows-gnu.zip),
+or the versioned `cram-v1.0.0-x86_64-pc-windows-gnu.zip` from the
+[releases page](https://github.com/lukr54/cram/releases/latest). Both are the same bytes; the
+version-free name exists so a `releases/latest/download/…` link keeps working across releases.
+`SHA256SUMS.windows` is published beside them.
 
-`cram update` then fetches the next release, checks it against the SHA-256 the release publishes,
-and replaces itself. It refuses to install anything it cannot verify. Run against an empty Releases
-page today it reports that no published release exists yet.
+The zip holds `cram.exe`, `cram-extract.exe`, `cram_shell.dll` (the Explorer right-click menu, which
+does nothing until you run `cram shell install`) and `libwinpthread-1.dll`, which `cram.exe` links
+against and will not start without. Keep the contents together. They are **not code-signed**, so
+SmartScreen will warn on first run (see [Limitations](#limitations)).
+
+`cram update` fetches the next release, checks it against the SHA-256 that release publishes, and
+replaces itself. It refuses to install anything it cannot verify.
 
 ### Linux and macOS
 
-The `cram` CLI runs on Linux x86-64 and on Apple Silicon macOS. Once a release is published, install
-it with:
+The `cram` CLI runs on Linux x86-64 and on Apple Silicon macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/lukr54/cram/main/install.sh | sh
 ```
 
-The script resolves the newest release from the GitHub API, so it exits with "could not determine the
-latest release" until one exists; build from source in the meantime.
-
-It installs two binaries into `~/.local/bin` (no root, no daemon, nothing else touched) — `cram` and
-`cram-extract`, which `cram make-sfx` shells out to — and re-running it upgrades them.
+The script resolves the newest release from the GitHub API and installs two binaries into
+`~/.local/bin` (no root, no daemon, nothing else touched): `cram`, and `cram-extract`, which
+`cram make-sfx` shells out to. Re-running it upgrades them.
 Prefer to read before you pipe to a shell? Download [`install.sh`](install.sh), read it, then run it.
 The tarball is also attached to each release if you'd rather place the binary yourself. Archive
 **mount** (`cram mount`) is Windows-only (it uses ProjFS); every other verb works identically.
@@ -546,9 +542,11 @@ Cram Studio is a separate Windows desktop application built on this engine. Its 
 this repository, and nothing in this repository depends on it.
 
 **Studio is proprietary and sold under its own EULA.** The MIT OR Apache-2.0 licence on this page
-covers the engine and the CLI in this repository and nothing else. When the Studio installer is
-published as an asset on this repository's Releases page, that installer is not covered by those
-licences.
+covers the engine and the CLI in this repository and nothing else. The Studio installer ships as an
+asset on this repository's Releases page —
+[`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) —
+and that installer is **not** covered by those licences. A proprietary `.exe` on the Releases page
+of an MIT/Apache repository is deliberate, not an oversight.
 
 ---
 
