@@ -44,6 +44,11 @@ use cram_core::{engine, formats, sniff};
 /// registry writes, and the platform check lives inside.
 mod shell;
 
+/// `diag`: the opt-in recording setting and the report a user attaches to a bug report. The
+/// redaction and the recording live in `cram_core::diag`; this owns the setting file and the
+/// build/machine header.
+mod diag;
+
 /// `update` needs HTTP, so it rides the same opt-in feature as `dl`. The shipped release binaries
 /// are built with it; a bare `cargo build` gets the stub below.
 #[cfg(feature = "download")]
@@ -63,6 +68,15 @@ fn update_cmd(_args: &[String]) -> Result<()> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    // Before any work: honour the stored diagnostics setting. Off unless the user turned it on, so
+    // for almost everybody this reads one small file and changes nothing.
+    diag::apply_stored_setting();
+    if args.iter().any(|a| a == "--full-paths") {
+        cram_core::diag::diag().set_full_paths(true);
+    }
+    // One event, always, so even a report written with recording off says what was run. The
+    // password never reaches it.
+    cram_core::diag::diag().op("command", diag::redacted_command(&args));
     // RAR is decoded by the UnRAR C++ library, which can fault the *whole process* on a crafted
     // archive (why the fuzz harness excludes it). When a verb would read a RAR and we are not already
     // the sacrificial worker, run the command in a child process so a fault kills only the child; the
@@ -109,6 +123,18 @@ fn main() -> ExitCode {
             Some(Ok(())) => ExitCode::SUCCESS,
             Some(Err(e)) => {
                 eprintln!("cram: {e}");
+                if args.get(1).map(String::as_str) != Some("diag") {
+                    // With diagnostics on the report is written here, because the recording is in
+                    // this process and dies with it. With them off nothing is written and the user
+                    // is told how to get one, rather than having a file appear uninvited.
+                    match diag::write_failure_report(&args, &e.to_string()) {
+                        Some(p) => eprintln!("cram: diagnostic report written to {}", p.display()),
+                        None => eprintln!(
+                            "cram: to capture this for a bug report, run `cram diag on`, \
+                             reproduce it, and attach the file it writes"
+                        ),
+                    }
+                }
                 ExitCode::FAILURE
             }
             // A typo that exits 0 is worse than one that fails loudly: `cram exract deps.zip -o
@@ -256,6 +282,7 @@ fn run(args: &[String]) -> Option<Result<()>> {
         Some("dedup") | Some("dupes") => dedup_cmd(args),
         Some("update") | Some("upgrade") => update_cmd(args),
         Some("shell") => shell::shell_cmd(args),
+        Some("diag") | Some("diagnostics") => diag::diag_cmd(args),
         _ => return None,
     })
 }
@@ -296,6 +323,12 @@ usage: cram <command> …
   update [--check] [--force]          install the latest published release
        downloads it, verifies the published SHA-256, replaces this install;
        --check only reports what is available
+  diag <status|on|off|report|where>   diagnostics for bug reports
+       `report` writes a text file you can attach to an email or an issue. Nothing is
+       ever sent anywhere. Names are described by shape, not included, so a report is
+       safe to attach in public; --full-paths includes them if a maintainer asks.
+       Detailed per-entry recording is off by default and costs a little speed when on:
+       `diag on`, reproduce the problem, then `diag report`
   --version                           version + which optional features are compiled in";
 
 /// The usage block as *context for an error*, so it goes to stderr and stays out of a pipe. When it

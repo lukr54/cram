@@ -42,6 +42,11 @@ A useful report contains:
 - **which binary**: `cram` or `cram-extract`,
 - the version (`cram --version`), and your OS and its version.
 
+`cram diag report` writes all of the above except the file itself, plus the machine profile that
+decides Cram's thread and pack sizing, into one text file you can attach. It is written locally and
+sent nowhere. File and folder names are described by shape rather than included, so a report is safe
+to attach to a public issue; pass `--full-paths` only if we ask.
+
 ### What to expect
 
 Cram is maintained by Nexal IT (Ulysses Horkan EI). There is no 24/7 security team. Our targets:

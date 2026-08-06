@@ -213,11 +213,18 @@ pub fn run(
                 }));
                 match outcome {
                     Ok(Ok(EntryOutcome::Wrote(bytes))) => {
+                        // Returns immediately unless the user opted into detailed diagnostics; the
+                        // check is a relaxed atomic load, which is why it can sit in the per-entry
+                        // path of the parallel extractor at all.
+                        crate::diag::diag().entry(entries[i].name(), Some(bytes), "ok");
                         let mut r = report.lock().unwrap();
                         r.extracted += 1;
                         r.bytes += bytes;
                     }
-                    Ok(Ok(EntryOutcome::Skipped)) => report.lock().unwrap().skipped += 1,
+                    Ok(Ok(EntryOutcome::Skipped)) => {
+                        crate::diag::diag().entry(entries[i].name(), None, "skip");
+                        report.lock().unwrap().skipped += 1
+                    }
                     Ok(Err(ArchiveError::Cancelled)) => {}
                     Ok(Err(e)) => report.lock().unwrap().push_failure(entries[i].name(), e),
                     Err(panic) => report.lock().unwrap().push_failure(

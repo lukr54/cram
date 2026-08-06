@@ -74,6 +74,13 @@ impl Report {
         self.failed.is_empty() && !self.cancelled
     }
     pub fn push_failure(&mut self, name: impl Into<String>, err: impl std::fmt::Display) {
-        self.failed.push((name.into(), err.to_string()));
+        let name = name.into();
+        let err = err.to_string();
+        // Every backend funnels its per-entry failures through here, so recording at this one
+        // point puts them in a diagnostic report whatever produced them. Failures are rare, so
+        // this costs nothing on a healthy run, and they are the whole reason to write a report --
+        // hence recorded even when detailed diagnostics are off.
+        crate::diag::diag().failed(&name, None, &err);
+        self.failed.push((name, err));
     }
 }

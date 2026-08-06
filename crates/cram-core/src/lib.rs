@@ -36,6 +36,7 @@
 //! `cram-recovery`, and `cram-sign` crates, and the unified `cram` CLI in `cram-cli`.
 
 pub mod codec;
+pub mod diag;
 pub mod engine;
 pub mod error;
 pub mod format;

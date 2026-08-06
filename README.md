@@ -251,6 +251,15 @@ cram update [--check] [--force]                   download the latest published 
                                                   published SHA-256 and replace this install.
                                                   --check reports and changes nothing. Needs a
                                                   build with the `download` feature.
+cram diag <status|on|off|report|where>            write a diagnostic file for a bug report
+                                                  `report` produces a text file you can attach to
+                                                  an email or an issue. Nothing is ever sent
+                                                  anywhere. File and folder names are described by
+                                                  shape, not included, so it is safe to attach in
+                                                  public; --full-paths includes them if asked.
+                                                  Detailed per-entry recording is off by default,
+                                                  costs a little speed, and is turned on with
+                                                  `diag on`
 cram --version                                    version + which optional features are compiled in
 ```
 

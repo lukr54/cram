@@ -155,6 +155,27 @@ Conversion does not carry encryption across: `-p` opens an encrypted *source*, `
 encrypts the *destination*, and converting an encrypted archive without `--encrypt` writes a
 readable, unencrypted copy.
 
+**`cram diag`**, a diagnostic report a user can attach to a bug report, in the CLI and in Studio.
+It records the build, the machine profile that decides Cram's thread and pack sizing, the archive's
+structure, the failing error and the entries that failed.
+
+*Nothing is ever sent anywhere.* There is no telemetry in Cram and no code in either binary that
+could upload a report; it is a text file on disk, and sending it is something the user does by hand.
+
+*Names are redacted by default.* For an archiver the paths are the sensitive part, so an entry is
+described by its shape — extension, size, depth, name length, alphabet, and flags for the cases that
+are themselves the bug (a reserved device name, a trailing dot, control characters, an over-long
+path) — rather than by its name. That makes a report safe to attach to a public issue without
+reading it first. `--full-paths` includes the real names for anyone who would rather just send them.
+Passwords never reach a report: the value after `-p`, `--password`, `--encrypt` or `--key` is
+replaced before the command line is recorded.
+
+*Detailed recording is opt-in.* Off by default, because an event per entry across tens of thousands
+of files is a real cost on a tool whose point is speed. With it off, a report still describes the
+build, the machine, the error and the failed entries — everything reconstructable after the fact.
+With it on, Cram also writes a report when an operation fails, since the recording lives in that
+process and would be gone by the time anyone asked for it.
+
 ### Security
 
 - A single centralized path-traversal (zip-slip) guard every backend must funnel entry names through,
