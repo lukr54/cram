@@ -1501,7 +1501,13 @@ mod net_tests {
         Flaky,
         /// Correct SIZE + Range support, but serves DIFFERENT bytes everywhere (wrong/stale/malicious).
         Wrong,
-        /// Correct bytes, but delays every real (large) chunk by 2 s; a reachable but slow mirror.
+        /// Correct bytes, but delays every real (large) chunk by 8 s; a reachable but slow mirror.
+        ///
+        /// The delay is deliberately far longer than the work being raced against it. The test that
+        /// uses this asserts the download finishes before the slow mirror could deliver anything,
+        /// so what matters is the RATIO between "the real work" and "the stall", not either number.
+        /// At 2 s the assertion sat 500 ms above the real work, which is inside the range a loaded
+        /// CI runner varies by, and it failed there while passing locally six times out of six.
         Slow,
         /// Correct bytes, each real chunk paced by 150 ms; a per-request-latency source where more
         /// parallel connections raise aggregate throughput (exercises adaptive ramping).
@@ -1573,7 +1579,7 @@ mod net_tests {
                                 // range stays instant so verification isn't held up).
                                 Mode::Slow => {
                                     if len > 128 * 1024 {
-                                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                                        tokio::time::sleep(Duration::from_millis(8000)).await;
                                     }
                                     let b = body(start, end);
                                     let mut v = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\n\r\n", b.len()).into_bytes();
@@ -1673,7 +1679,7 @@ mod net_tests {
     async fn tail_redundancy_beats_a_slow_mirror() {
         let total: u64 = 6 * 1024 * 1024; // 6 exact 1 MiB chunks
         let fast = serve(total, true).await;
-        let slow = serve_mode(total, Mode::Slow).await; // 2 s per real chunk
+        let slow = serve_mode(total, Mode::Slow).await; // 8 s per real chunk
         let out = scratch(&format!("rdm_tail_{}.bin", fast.port()));
         let _ = std::fs::remove_file(&out);
         let prog = Arc::new(Progress::new());
@@ -1699,9 +1705,14 @@ mod net_tests {
             total,
             "exact byte count, no double-count from the raced duplicate"
         );
+        // 3 s against an 8 s stall. The point is that the download never waited on the slow mirror,
+        // and any number between "the real work" and 8 s proves it; this one is far enough above
+        // the work that a slow runner cannot cross it, and far enough below 8 s that a regression
+        // cannot hide under it. Timing assertions that sit close to the thing they measure are how
+        // a green suite turns intermittently red for no reason.
         assert!(
-            elapsed < Duration::from_millis(1500),
-            "tail redundancy should finish well under the 2 s slow-chunk delay, took {elapsed:?}"
+            elapsed < Duration::from_secs(3),
+            "tail redundancy should finish long before the 8 s slow-chunk delay, took {elapsed:?}"
         );
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(sidecar_path(&out));
