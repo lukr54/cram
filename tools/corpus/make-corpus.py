@@ -379,6 +379,11 @@ def write_checksums(out):
     log(f"      corpus id {corpus_id}")
     os.utime(os.path.join(out, "MANIFEST.sha256"), (MTIME, MTIME))
     os.utime(os.path.join(out, "CORPUS.id"), (MTIME, MTIME))
+    # And the root last of all. Writing those two files into it updated the directory's own mtime,
+    # after `stamp` had already been round it, so without this the top-level directory carries the
+    # build time while everything inside it carries the fixed one. The corpus id does not notice --
+    # it is computed over file contents -- but an archive of the corpus directory would.
+    os.utime(out, (MTIME, MTIME))
 
 
 if __name__ == "__main__":
