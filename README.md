@@ -658,6 +658,20 @@ together; every source file carries a module-level doc comment for the local det
 Cram parses untrusted input. To report a vulnerability, follow
 [SECURITY.md](SECURITY.md), please do not open a public issue for one.
 
+## How this was built
+
+Cram was built with heavy use of an LLM. The code, most of the documentation and this README were
+largely machine-written. I set the direction, made the design decisions, ran and checked the
+benchmarks, and I am responsible for anything wrong in it.
+
+An earlier commit removed em-dashes across the whole tree, including from `.gitignore` and CI
+comments. That reads as covering tracks, and it is fair to read it that way.
+
+None of the above changes what can be checked independently: the benchmark corpus is published and
+rebuilds byte-identically, the numbers reproduce on your own hardware, the `.cram` format is
+specified in [docs/CRAM_FORMAT.md](docs/CRAM_FORMAT.md) so a reader can be written without reading
+this source, and the test suite runs on Windows, Linux and macOS in CI. Judge it on those.
+
 ## License
 
 Dual-licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
