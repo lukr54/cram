@@ -419,11 +419,13 @@ browser.
 
 **It will not work for a download that needs your session.** If the file sits behind a login, the
 URL alone is not enough — the cookies are, and the browser will not hand those to another program.
-A Firefox add-on that does the hand-off properly, cookies included, is built and working, but it is
-**not published and not currently signed**: an earlier build was signed in July and then found to be
-missing its off switch, so it was withdrawn rather than distributed. The replacement has to go
-through review again. This README will link it once it is signed. Until then, `cram dl` covers
-anything you can reach with a plain link.
+A Firefox add-on does the hand-off properly, cookies included. It is **signed by Mozilla** (id
+`cram-handoff@nexalit.fr`, version 1.0.0) but distributed **unlisted**, so it has no page on
+addons.mozilla.org and is not yet offered for download here; this README will link it when it is.
+Until then, `cram dl` covers anything you can reach with a plain link.
+
+The add-on needs Cram Studio: it talks to a native-messaging host that the Studio installer
+registers, so the command line alone is not enough for this one feature.
 
 The add-on needs `cookies` and `<all_urls>` to do its job, which is a lot to ask for, so it is worth
 being plain about why: it reads the cookies **for the URL you are downloading** in order to attach
