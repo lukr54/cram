@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 description = "Detached ed25519 signatures for any file (incl. .cram): prove authorship + integrity, not just that it decompresses"
+keywords = ["ed25519", "signature", "signing", "integrity", "cram"]
+categories = ["cryptography"]
+readme = "README.md"
 
 # A signature is a separate `.cramsig` file computed over the archive's bytes, so it adds no coupling to
 #, and never changes, the frozen `.cram` v1 format (or any other file). It lets a publisher vouch for

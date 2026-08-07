@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 description = "Segmented, resumable, multi-source download engine (library, no GUI). Powers Cram's Downloads pane and the browser hand-off."
+keywords = ["download", "resume", "metalink", "http", "mirrors"]
+categories = ["network-programming"]
+readme = "README.md"
 
 # Shared with the sibling `rdm` project, where this engine originated. It lives INSIDE this repo
 # rather than being referenced by a path outside it: an out-of-tree `path = "../../../rdm/..."`

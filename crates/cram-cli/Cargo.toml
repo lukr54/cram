@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 description = "Cram, the single `cram` command line: list/extract/create/test/convert/download/mount/rec/sign/verify/keygen/make-sfx"
+# `cram` itself has been taken on crates.io since 2019 by an unrelated crate, so the install name
+# carries the suffix while the binary stays `cram`: `cargo install cram-cli`, then run `cram`.
+keywords = ["archive", "compression", "zip", "7z", "cli"]
+categories = ["command-line-utilities", "compression", "filesystem"]
+readme = "README.md"
 
 # The one unified operator binary. It owns argument parsing for the archive verbs (calling cram-core's
 # engine) and delegates the sidecar/mount tools to their crates' `cli::main`. The self-extractor stub
@@ -14,14 +19,17 @@ description = "Cram, the single `cram` command line: list/extract/create/test/co
 name = "cram"
 path = "src/main.rs"
 
+# The internal crates carry BOTH a path and a version: cargo builds against the path in this
+# workspace and rewrites the dependency to the version when packaging for crates.io. Without the
+# version, `cargo publish` refuses the crate outright.
 [dependencies]
-cram-core = { path = "../cram-core" }
+cram-core = { path = "../cram-core", version = "1.0.0" }
 # Reading the release JSON for `cram update`. Optional, so a default build (no `download`) does not
 # compile it; already in the graph via rdm-core, so it costs nothing extra in a shipped build.
 serde_json = { version = "1", optional = true }
-cram-mount = { path = "../cram-mount" }
-cram-recovery = { path = "../cram-recovery" }
-cram-sign = { path = "../cram-sign" }
+cram-mount = { path = "../cram-mount", version = "1.0.0" }
+cram-recovery = { path = "../cram-recovery", version = "1.0.0" }
+cram-sign = { path = "../cram-sign", version = "1.0.0" }
 
 [features]
 default = []

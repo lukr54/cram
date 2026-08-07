@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 description = "Cram archive manager, core engine (adaptive parallelism, hardware auto-detect, codecs)"
+keywords = ["archive", "compression", "zip", "7z", "deduplication"]
+categories = ["compression", "filesystem"]
+readme = "README.md"
 
 [lib]
 name = "cram_core"
@@ -92,7 +95,7 @@ image = { version = "0.25", optional = true, default-features = false, features 
 # resolution regardless of features, which is why this crate is vendored in-tree at crates/rdm-core
 # rather than referenced outside the repo. A client download opens no LISTENING socket, so this does
 # not carry the rdm-gui Defender concern (that was an unsigned GUI *listener*).
-rdm-core = { path = "../rdm-core", optional = true }
+rdm-core = { path = "../rdm-core", version = "0.1.0", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 # Mirror discovery (Metalink) builds a client and calls `rdm_core::discover`. Pinned to reqwest 0.12
 # so the `Client` type unifies with rdm-core's (same crate in the graph). The TLS backend is chosen

@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+# Deliberately NOT published, unlike the rest of the workspace. This is a cdylib that Explorer loads
+# by CLSID after `cram shell install` registers it; nothing can depend on it as a crate, and a
+# registry-touching DLL is not something anyone should pull in from a registry of libraries.
+publish = false
 description = "Cram's Windows Explorer context menu: a COM IContextMenu handler that puts extract/test/create on the right-click menu"
 
 # An in-process COM server, so Explorer can load it. Windows-only in practice: on every other

@@ -7,9 +7,18 @@ version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lukr54/cram"
-# Cram ships as GitHub-release binaries, not crates.io packages (and the graph has path deps that
-# could not publish anyway). Crates opt in with `publish.workspace = true` to make that intent explicit.
-publish = false
+# Cram is published to crates.io so `cargo install cram-cli` works, which is how this audience expects
+# to install a Rust CLI. The binary is still `cram`; only the crate name carries the suffix, because
+# `cram` on crates.io has been held since 2019 by an unrelated abandoned crate.
+#
+# Publishing the CLI forces publishing its whole dependency graph -- cargo will not accept a crate
+# whose dependencies are not on the registry. cram-core, cram-mount, cram-recovery, cram-sign and
+# rdm-core therefore go up too. They are implementation details of the CLI rather than libraries
+# offered for general use, and each says so in its own description; a breaking change to any of them
+# is a major version bump like anything else.
+#
+# cram-shell opts OUT below: it is a COM cdylib that Explorer loads, useless as a dependency.
+publish = true
 
 [profile.release]
 opt-level = 3
