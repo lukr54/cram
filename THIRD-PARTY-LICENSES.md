@@ -5370,7 +5370,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ## MIT License
 
 Applies to:
-- `cram-cli` 1.0.0
+- `cram-cli` 1.0.1
 - `cram-core` 1.0.0
 - `cram-extract` 1.0.0
 - `cram-mount` 1.0.0
