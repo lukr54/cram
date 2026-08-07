@@ -1,6 +1,12 @@
 [package]
 name = "cram-cli"
-version.workspace = true
+# Deliberately not `version.workspace = true`. 1.0.0 went to crates.io without the windows-gnu link
+# flags (they were only in .cargo/config.toml, which is not published) and could not link there. A
+# published version is immutable, so the fix in build.rs only reaches anyone as a new number. The
+# other crates in the workspace are unaffected and stay at 1.0.0; this depends on them as ^1.0.0,
+# which the published 1.0.0 satisfies. The divergence from the v1.0.0 git tag is the point: the
+# crates.io package genuinely differs from what that tag builds.
+version = "1.0.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

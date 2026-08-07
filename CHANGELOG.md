@@ -7,6 +7,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [cram-cli 1.0.1] - 2026-08-07
+
+A crates.io-only release. The published binaries and the `v1.0.0` tag are unaffected, and no other
+crate in the workspace changed, so they remain at 1.0.0.
+
+### Fixed
+
+- `cargo install cram-cli` failed to link on the **windows-gnu** toolchain. The three link flags
+  that build needs (`-static`, `--allow-multiple-definition`, `-ladvapi32`) lived only in
+  `.cargo/config.toml`, which cargo does not include in a published `.crate`, so installing from the
+  registry linked without them and hit a `pthread_*` multiple-definition error. They are now emitted
+  from a build script, which is published, gated on the target actually being windows-gnu. Linux and
+  macOS were never affected, nor was windows-msvc.
+
+---
+
 ## [1.0.0] - 2026-08-06
 
 The first public release of the Cram engine and command line. Everything below is new, so there is
