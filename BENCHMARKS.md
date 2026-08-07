@@ -294,6 +294,20 @@ is a different measurement and it has not been done.
 in 2.58 s and takes 15 s to write to NVMe. On a 120 MB/s HDD every tool in this document would be
 pinned to the disk and the decoder column would stop mattering at all.
 
+**Whether extraction is write-bound at all is a property of your drive, not of any archiver here.**
+Measured 2026-08-07 with `calibrate --recalibrate --write-probe` on two machines: the benchmark
+box decodes DEFLATE at 948 MiB/s on one core against an 84 MiB/s sustained write wall, a ratio of
+11.3, so a single worker already outruns the disk by an order of magnitude. A desktop NVMe in the
+same room decodes at 674 MiB/s against a 757 MiB/s wall, a ratio of 0.89, where one decoding thread
+does not saturate the drive and a second has real work to do. The same tool is write-bound on one
+and roughly balanced on the other, which is why the engine measures rather than assuming. Run that
+command to find out which regime you are in; do not assume this table's answer is yours.
+
+**Both drives stepped down at ~2 GiB written**, from 349 to 84 MiB/s and from 1218 to 757 MiB/s, as
+the SLC cache filled. Any extraction benchmark whose output fits under that is measuring cache
+rather than disk. The extraction runs above go to tmpfs and avoid the question entirely; the create
+runs write ~2 GB and land on the knee.
+
 **Nothing here measures Windows**, which is the platform Cram is built for first. These are Linux
 numbers on one machine, and the Windows file-open path is measurably different — see
 [`docs/PERFORMANCE_FINDINGS.md`](docs/PERFORMANCE_FINDINGS.md) §7, where `File::open` dominates
