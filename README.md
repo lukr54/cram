@@ -84,11 +84,13 @@ Cram 1.0.0, from the [releases page](https://github.com/lukr54/cram/releases/lat
 | Linux (x86-64) | [`cram-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-v1.0.0-x86_64-unknown-linux-gnu.tar.gz) |
 | macOS (Apple Silicon) | [`cram-v1.0.0-aarch64-apple-darwin.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-v1.0.0-aarch64-apple-darwin.tar.gz) |
 | Cram Studio, Windows GUI | [`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) |
+| Firefox hand-off add-on | [`cram-handoff-latest.xpi`](https://github.com/lukr54/cram/releases/latest/download/cram-handoff-latest.xpi) — [what it does](#downloading-and-handing-a-browser-download-to-cram), needs Studio |
 
 Every release publishes a `SHA256SUMS` for each platform. **Nothing is code-signed yet**, so Windows
 SmartScreen warns on the first run of a downloaded binary and macOS keeps it quarantined until you
 clear the flag. `cram update` replaces an existing install and verifies the published checksum
-before it writes anything.
+before it writes anything. The add-on is the exception: it is signed by Mozilla, because Firefox
+will not install an unsigned one.
 
 ## Free, and a paid GUI
 
@@ -419,13 +421,19 @@ browser.
 
 **It will not work for a download that needs your session.** If the file sits behind a login, the
 URL alone is not enough — the cookies are, and the browser will not hand those to another program.
-A Firefox add-on does the hand-off properly, cookies included. It is **signed by Mozilla** (id
-`cram-handoff@nexalit.fr`, version 1.0.0) but distributed **unlisted**, so it has no page on
-addons.mozilla.org and is not yet offered for download here; this README will link it when it is.
-Until then, `cram dl` covers anything you can reach with a plain link.
+A Firefox add-on does the hand-off properly, cookies included:
+**[`cram-handoff-latest.xpi`](https://github.com/lukr54/cram/releases/latest/download/cram-handoff-latest.xpi)**.
 
-The add-on needs Cram Studio: it talks to a native-messaging host that the Studio installer
-registers, so the command line alone is not enough for this one feature.
+**It needs Cram Studio.** The add-on talks to a native-messaging host that only the Studio installer
+registers, so the command line on its own is not enough for this one feature. Install Studio first,
+then in its Downloads pane tick *Accept downloads from your browser*. Click the link above in
+Firefox and it will offer to install; afterwards, restart Firefox fully. A **Cram** button appears in
+the toolbar and turns the automatic hand-off on and off — the right-click *Download with Cram* menu
+works either way.
+
+It is signed by Mozilla (id `cram-handoff@nexalit.fr`, version 1.0.0) but distributed **unlisted**,
+so it has no page on addons.mozilla.org: this release is the only place to get it. Its checksum is
+published as `SHA256SUMS.addon`, and Firefox checks Mozilla's signature on install regardless.
 
 The add-on needs `cookies` and `<all_urls>` to do its job, which is a lot to ask for, so it is worth
 being plain about why: it reads the cookies **for the URL you are downloading** in order to attach

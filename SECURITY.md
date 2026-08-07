@@ -97,9 +97,13 @@ Anything below, reachable by feeding Cram a file you control:
   directory, its state directory, or your signing keys.
 - **Missing hardening with no demonstrated impact.** Very welcome as a normal issue or PR, just not
   as an advisory.
-- **Cram Studio**, the Windows GUI. Its installer is published on this repository's Releases page
-  but its source is not in this repository and the private repo cannot take a report. Send Studio
-  findings to <cram-support@nexalit.fr>.
+- **Cram Studio**, the Windows GUI, and the **Firefox hand-off add-on**
+  (`cram-handoff@nexalit.fr`). Both are published on this repository's Releases page, but their
+  source is in a private repository that cannot take a report. Send findings to
+  <cram-support@nexalit.fr>, and say in the subject that it is a security report. The add-on holds
+  `cookies` and `<all_urls>`, so a way to make it read cookies for a site the user is not downloading
+  from, or to reach the native-messaging host from a page, is worth reporting even though it is out
+  of scope for an advisory here.
 - **The ProjFS requirement.** `cram mount` needs the optional Windows feature `Client-ProjFS`, which
   is off by default and takes an elevated `Enable-WindowsOptionalFeature` to turn on. That is
   Windows' design, not a Cram flaw. Every other command works without it.
