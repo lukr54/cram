@@ -419,9 +419,17 @@ browser.
 
 **It will not work for a download that needs your session.** If the file sits behind a login, the
 URL alone is not enough — the cookies are, and the browser will not hand those to another program.
-A Firefox add-on that does the hand-off properly, cookies included, is signed and in testing; it
-is not published yet, and this README will link it when it is. Until then, `cram dl` covers
+A Firefox add-on that does the hand-off properly, cookies included, is built and working, but it is
+**not published and not currently signed**: an earlier build was signed in July and then found to be
+missing its off switch, so it was withdrawn rather than distributed. The replacement has to go
+through review again. This README will link it once it is signed. Until then, `cram dl` covers
 anything you can reach with a plain link.
+
+The add-on needs `cookies` and `<all_urls>` to do its job, which is a lot to ask for, so it is worth
+being plain about why: it reads the cookies **for the URL you are downloading** in order to attach
+them to Cram's own request, and it does that for any site because a download can start anywhere. It
+declares `data_collection_permissions: none` to Mozilla, sends nothing anywhere, and talks only to a
+native-messaging host on your own machine.
 
 ### Finding duplicates across drives
 
