@@ -5,6 +5,12 @@ on:
     branches: [master, main]
     tags: ['v*']
   pull_request:
+  # A push only starts a run if GitHub delivers the webhook. During the Actions incident of
+  # 2026-08-06 delivery was throttled to ~15%, so a push could land and produce no run at all --
+  # not a red run, silence. `gh run rerun` cannot help there, because there is no run to re-run.
+  # This is the manual way in. Dispatching on a `v*` tag will also run the release jobs, since
+  # those are gated on the ref rather than the event.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
