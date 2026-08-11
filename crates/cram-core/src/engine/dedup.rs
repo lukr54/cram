@@ -54,6 +54,15 @@ const READ_BUF: usize = 256 * 1024;
 /// Upper bound on concurrent readers per volume: hashing is I/O-bound long before BLAKE3 is the wall.
 const MAX_READERS_PER_VOLUME: usize = 8;
 
+/// Depth past which the walk starts checking for a directory cycle. Chosen so no genuine tree pays
+/// for it: the deepest real tree measured on a developer machine here was 13 levels, and even a
+/// pathological build tree is two orders of magnitude short of this.
+const CYCLE_GUARD_DEPTH: u32 = 1_000;
+
+/// How often a running walk reports what it has found. Long enough that a whole-drive scan does not
+/// flood the UI, short enough that the thing never looks hung -- which is what it did look like.
+const SCAN_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Knobs for a duplicate scan.
 #[derive(Clone, Debug)]
 pub struct DedupOptions {
@@ -386,8 +395,12 @@ fn walk(
     unreadable: &mut u64,
     sink: &dyn ProgressSink,
 ) -> Result<()> {
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(path) = stack.pop() {
+    // Depth rides along only to arm the cycle guard below; the descent itself does not care.
+    let mut stack: Vec<(PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
+    let mut seen_deep: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+    let mut dirs: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    while let Some((path, depth)) = stack.pop() {
         if sink.is_cancelled() {
             return Err(ArchiveError::Cancelled);
         }
@@ -405,6 +418,20 @@ fn walk(
             continue;
         }
         if meta.is_dir() {
+            // Past this depth a tree is no longer plausibly a tree, so start paying for a cycle
+            // check. Skipping symlinks and mount points covers every reparse tag std classifies as
+            // a link, but a directory carrying any OTHER tag is not a link to std and is descended
+            // into -- and since the walk stopped being able to overflow the stack, such a cycle
+            // would run forever and grow the heap instead, which is quieter than what it replaced.
+            //
+            // The identity lookup costs an open per directory, so it is armed by depth rather than
+            // paid on every scan: a normal tree never reaches it and is charged nothing.
+            if depth > CYCLE_GUARD_DEPTH {
+                match file_identity(&path) {
+                    Some(id) if !seen_deep.insert(id) => continue, // already walked; a cycle
+                    _ => {}
+                }
+            }
             let entries = match std::fs::read_dir(&path) {
                 Ok(e) => e,
                 Err(_) => {
@@ -412,11 +439,22 @@ fn walk(
                     continue;
                 }
             };
+            dirs += 1;
             // Children are pushed in reverse so they pop in `read_dir` order, leaving the traversal
             // order identical to the recursion this replaces.
-            let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            let mut children: Vec<(PathBuf, u32)> = entries
+                .flatten()
+                .map(|e| (e.path(), depth.saturating_add(1)))
+                .collect();
             children.reverse();
             stack.append(&mut children);
+            // The walk has no total to report a fraction against -- that is what it is computing --
+            // so it reports what it has found. Rate-limited because a whole-drive scan visits
+            // hundreds of thousands of directories and each call crosses into the UI.
+            if last_report.elapsed() >= SCAN_REPORT_INTERVAL {
+                last_report = std::time::Instant::now();
+                sink.on_scan_progress(out.len() as u64, dirs);
+            }
         } else if meta.is_file() && meta.len() >= min_size.max(1) && !is_reclaim_scratch(&path) {
             out.push(ScannedFile {
                 size: meta.len(),
@@ -1143,6 +1181,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(found, 2, "both copies {DEPTH} directories down");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past `CYCLE_GUARD_DEPTH` the walk starts resolving each directory's filesystem identity to
+    /// notice a cycle. A false positive there would silently skip real directories, which is the
+    /// failure this whole area keeps producing, so the guard is checked against a legitimately deep
+    /// tree: every distinct directory must still be walked and the file at the bottom still found.
+    ///
+    /// Not run on macOS, where `PATH_MAX` is 1024 and a tree deep enough to arm the guard cannot be
+    /// addressed by absolute path at all.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_cycle_guard_does_not_reject_a_legitimately_deep_tree() {
+        let depth = (CYCLE_GUARD_DEPTH + 200) as usize;
+        let dir = scratch("cycleguard");
+        let mut deep = dir.clone();
+        for _ in 0..depth {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let body = vec![0x77u8; 4096];
+        write(&deep.join("one.bin"), &body);
+        write(&deep.join("two.bin"), &body);
+
+        let sink = Progress::new(0, 0);
+        let rep = scan(std::slice::from_ref(&dir), &DedupOptions::default(), &sink).unwrap();
+        assert_eq!(
+            rep.exact_groups().map(|g| g.files.len()).sum::<usize>(),
+            2,
+            "both copies {depth} levels down, with the guard armed for the last 200"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -15,6 +15,13 @@ pub trait ProgressSink: Sync {
     fn on_file_done(&self, entry: &Entry);
     /// One entry started (optional; default no-op).
     fn on_entry_start(&self, _entry: &Entry) {}
+    /// A walk is still enumerating and has found this much so far.
+    ///
+    /// Absolute counts rather than a fraction, because a directory walk has no total to divide by
+    /// until it has finished: the only honest thing to show while it runs is what it has seen.
+    /// Callers rate-limit this themselves — it sits in a loop that can run to hundreds of thousands
+    /// of directories. Default: no-op, so a sink that does not care is unaffected.
+    fn on_scan_progress(&self, _files: u64, _dirs: u64) {}
     /// Cooperative cancellation, engines check this between chunks/entries.
     fn is_cancelled(&self) -> bool;
     /// Cooperative pause. Engines call this at the same points they check
