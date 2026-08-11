@@ -168,8 +168,23 @@ pub fn scan(
     sink: &dyn ProgressSink,
 ) -> Result<DedupReport> {
     let mut report = DedupReport::default();
+    let d = crate::diag::diag();
+    d.checkpoint_begin("dedup scan");
+    d.op(
+        "command",
+        format!(
+            "dedup {} root(s), min_size={}, similar_images={}",
+            roots.len(),
+            opts.min_size,
+            opts.similar_images
+        ),
+    );
 
     // ---- 1. Walk ------------------------------------------------------------------------------
+    // The longest silent stretch of the whole operation: on a whole drive this is minutes during
+    // which nothing is reported, because there is no total to report progress against until it is
+    // done. That silence is exactly what made a crash in here impossible to place.
+    d.checkpoint_phase("walk (finding files)");
     let mut files: Vec<ScannedFile> = Vec::new();
     for root in collapse_roots(roots) {
         walk(
@@ -182,6 +197,9 @@ pub fn scan(
     }
     report.files_scanned = files.len() as u64;
     report.bytes_scanned = files.iter().map(|f| f.size).sum();
+    d.metric("files found", report.files_scanned.to_string());
+    d.metric("bytes found", report.bytes_scanned.to_string());
+    d.metric("unreadable", report.unreadable.to_string());
 
     // ---- 2. Size gate -------------------------------------------------------------------------
     // A unique size cannot have a byte-identical twin, so those files are never read at all.
@@ -195,12 +213,15 @@ pub fn scan(
         .flat_map(|v| v.iter().copied())
         .collect();
 
+    d.metric("size-gate candidates", candidates.len().to_string());
+
     // ---- 3. Partial-hash gate -----------------------------------------------------------------
     // Only worth doing for files big enough that 128 KiB is meaningfully cheaper than the whole file.
     let (big, small): (Vec<usize>, Vec<usize>) = candidates
         .iter()
         .partition(|&&i| files[i].size >= PARTIAL_MIN_SIZE);
     if !big.is_empty() {
+        d.checkpoint_phase("partial hash");
         let partial = hash_pass(&files, &big, HashMode::Partial, sink, &mut report)?;
         // Survivors are those still sharing (size, partial hash) with someone else.
         let mut buckets: HashMap<(u64, [u8; 32]), Vec<usize>> = HashMap::new();
@@ -216,6 +237,7 @@ pub fn scan(
     }
 
     // ---- 4. Full hash, the confirmation ------------------------------------------------------
+    d.checkpoint_phase("full hash");
     let full = hash_pass(&files, &candidates, HashMode::Full, sink, &mut report)?;
     let mut exact: HashMap<(u64, [u8; 32]), Vec<usize>> = HashMap::new();
     for (&i, h) in &full {
@@ -247,6 +269,7 @@ pub fn scan(
 
     // ---- 5. Visually-similar images (opt-in, report-only) -------------------------------------
     if opts.similar_images && !sink.is_cancelled() {
+        d.checkpoint_phase("perceptual hash (similar images)");
         // Feed one representative per exact group plus every non-duplicated file, so an exact set does
         // not also reappear as a "similar" finding.
         let mut already: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -273,6 +296,12 @@ pub fn scan(
         })
     });
     report.cancelled = sink.is_cancelled();
+    d.metric("duplicate groups", report.groups.len().to_string());
+    d.metric("reclaimable bytes", report.reclaimable().to_string());
+    // Reached only by getting all the way here. Everything else -- an error return, a panic, a
+    // process that dies outright -- leaves the checkpoint on disk, which is what makes its presence
+    // evidence rather than noise.
+    d.checkpoint_end();
     Ok(report)
 }
 
@@ -339,46 +368,62 @@ fn is_reclaim_scratch(path: &Path) -> bool {
     }
 }
 
-/// Recursively collect regular files at or above `min_size`. Symlinks are never followed, that would
-/// invent "duplicates" that are really one file, and could loop forever. Unreadable directories are
+/// Collect regular files at or above `min_size`. Symlinks are never followed, that would invent
+/// "duplicates" that are really one file, and could loop forever. Unreadable directories are
 /// counted and skipped rather than aborting a scan that may span many drives.
+///
+/// The descent uses an explicit stack rather than recursion, because recursion put a hard ceiling
+/// on how deep a tree could be scanned at all. Each recursive frame cost 3,264 bytes here (eight
+/// register saves plus a `sub $0xc78,%rsp` prologue, measured on the shipped binary), so a scan
+/// running on a 2 MiB worker thread died at roughly 640 levels. It died badly: a stack overflow on
+/// Windows is a hardware exception, not a Rust panic, so nothing unwinds, the panic hook never
+/// runs, no diagnostic is written and the process simply vanishes. Depth is now bounded by the heap
+/// instead, which no real tree reaches.
 fn walk(
-    path: &Path,
+    root: &Path,
     min_size: u64,
     out: &mut Vec<ScannedFile>,
     unreadable: &mut u64,
     sink: &dyn ProgressSink,
 ) -> Result<()> {
-    if sink.is_cancelled() {
-        return Err(ArchiveError::Cancelled);
-    }
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => {
-            *unreadable += 1;
-            return Ok(());
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if sink.is_cancelled() {
+            return Err(ArchiveError::Cancelled);
         }
-    };
-    if meta.file_type().is_symlink() {
-        return Ok(());
-    }
-    if meta.is_dir() {
-        let entries = match std::fs::read_dir(path) {
-            Ok(e) => e,
+        // Rate-limited to once a second inside, and `out.len()` is cumulative across roots, so this
+        // is a relaxed atomic load per directory in the common case.
+        crate::diag::diag().checkpoint_tick(out.len() as u64, Some(&path));
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
             Err(_) => {
                 *unreadable += 1;
-                return Ok(());
+                continue;
             }
         };
-        for entry in entries.flatten() {
-            walk(&entry.path(), min_size, out, unreadable, sink)?;
+        if meta.file_type().is_symlink() {
+            continue;
         }
-    } else if meta.is_file() && meta.len() >= min_size.max(1) && !is_reclaim_scratch(path) {
-        out.push(ScannedFile {
-            path: path.to_path_buf(),
-            size: meta.len(),
-            id: file_id(&meta),
-        });
+        if meta.is_dir() {
+            let entries = match std::fs::read_dir(&path) {
+                Ok(e) => e,
+                Err(_) => {
+                    *unreadable += 1;
+                    continue;
+                }
+            };
+            // Children are pushed in reverse so they pop in `read_dir` order, leaving the traversal
+            // order identical to the recursion this replaces.
+            let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            children.reverse();
+            stack.append(&mut children);
+        } else if meta.is_file() && meta.len() >= min_size.max(1) && !is_reclaim_scratch(&path) {
+            out.push(ScannedFile {
+                size: meta.len(),
+                id: file_id(&meta),
+                path,
+            });
+        }
     }
     Ok(())
 }
@@ -1050,6 +1095,54 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].files.len(), 2, "each path listed once");
         assert_eq!(g[0].reclaimable, 200 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scanning a deep tree must not cost stack in proportion to its depth.
+    ///
+    /// The walk used to recurse at 3,264 bytes of frame per level, so a scan on a 2 MiB worker
+    /// thread died at roughly 640 directories down. It died as a stack overflow, which on Windows
+    /// is a hardware exception rather than a Rust panic: nothing unwinds, the panic hook never
+    /// runs, no diagnostic is written, and the process simply disappears. A real 14,566-level tree
+    /// on a test machine is what found it.
+    ///
+    /// Depth is pinned indirectly, by giving the scan a deliberately small stack rather than a
+    /// 640-deep tree: macOS caps a path at 1024 bytes, so a tree deep enough to overflow a normal
+    /// stack cannot even be created there. 400 recursive frames would need 1.3 MB against the
+    /// 512 KiB below, while an iterative descent is flat in depth and fits whatever it is given.
+    ///
+    /// If recursion is ever reintroduced this test will not fail politely: it will overflow and
+    /// take the test binary down with it. That is still an unmistakable signal, and a guard-page
+    /// hit cannot be caught in-process to make it tidier.
+    #[test]
+    fn a_deep_tree_does_not_cost_stack() {
+        const DEPTH: usize = 400;
+        const STACK: usize = 512 * 1024;
+
+        let dir = scratch("deep");
+        let mut deep = dir.clone();
+        for _ in 0..DEPTH {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        // Two identical files at the bottom, so the scan has a finding to bring back up.
+        let body = vec![0x5Au8; 8 * 1024];
+        write(&deep.join("one.bin"), &body);
+        write(&deep.join("two.bin"), &body);
+
+        let root = dir.clone();
+        let found = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                let sink = Progress::new(0, 0);
+                let rep = scan(&[root], &DedupOptions::default(), &sink).unwrap();
+                rep.exact_groups().map(|g| g.files.len()).sum::<usize>()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(found, 2, "both copies {DEPTH} directories down");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

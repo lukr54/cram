@@ -342,6 +342,14 @@ pub struct Diag {
     /// that knows, and read when a report is written. One string rather than a ring entry because
     /// the newest one wins and the old ones are noise.
     archive: Mutex<Option<String>>,
+    /// What is running right now, mirrored to disk once a second. The ring above lives only in
+    /// memory, so a process that dies without unwinding -- a stack overflow is not a panic, and
+    /// takes the ring with it -- would otherwise leave nothing at all behind.
+    checkpoint: Mutex<Option<CheckpointState>>,
+    /// Milliseconds since `process_start` at the last checkpoint write. Read on every tick, so it
+    /// is an atomic and not part of the lock above.
+    checkpoint_last_ms: AtomicU64,
+    process_start: std::time::Instant,
 }
 
 static DIAG: OnceLock<Diag> = OnceLock::new();
@@ -357,6 +365,9 @@ pub fn diag() -> &'static Diag {
         // gigabyte of strings.
         cap: 20_000,
         archive: Mutex::new(None),
+        checkpoint: Mutex::new(None),
+        checkpoint_last_ms: AtomicU64::new(0),
+        process_start: std::time::Instant::now(),
     })
 }
 
@@ -556,6 +567,10 @@ pub fn apply_stored_setting() {
     if detailed_enabled() {
         diag().set_full(true);
     }
+    // Claim any checkpoint left by a run that died, here rather than lazily when a report is
+    // written: adoption is what clears the file, and doing it at a known point at start-up keeps it
+    // from happening halfway through a session, or not at all.
+    let _ = adopt_stale_checkpoints();
 }
 
 /// The machine section of a report. cram picks thread counts, chunk lanes and pack sizes from these
@@ -647,6 +662,22 @@ pub fn render(header: &ReportHeader) -> String {
     );
     s.push_str(&header.machine);
     s.push('\n');
+
+    // The headline, when there is one. A run that died without unwinding wrote no events and left
+    // no error, so this is the only thing in the report that can say what was happening -- and it
+    // is why "cram just vanished" is answerable at all.
+    let adopted = adopt_stale_checkpoints();
+    if !adopted.is_empty() {
+        s.push_str("-- a previous run did not finish --------------------------------------\n");
+        s.push_str(
+            "cram left a checkpoint behind, which only happens when it stopped without being\n\
+             able to tidy up: killed, out of memory, or a crash that unwinds nothing.\n\n",
+        );
+        for c in adopted {
+            s.push_str(c);
+            s.push('\n');
+        }
+    }
 
     // The caller's operation string wins; otherwise fall back to the last recorded command, so a
     // report written with recording off still says what was run.
@@ -778,6 +809,185 @@ pub fn stamp() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------------------------
+// The checkpoint: what survives a run that dies without unwinding
+// ---------------------------------------------------------------------------------------------
+
+/// How often the running operation rewrites its checkpoint.
+const CHECKPOINT_INTERVAL_MS: u64 = 1000;
+
+/// A checkpoint not rewritten within this long belongs to a process that is no longer updating it,
+/// which is the only portable way to tell a crashed run from a concurrently running one. A live run
+/// touches its file every second, so the margin is generous by a factor of sixty.
+const CHECKPOINT_STALE_MS: u128 = 60_000;
+
+/// The live checkpoint for this process. Per-pid, so a second cram running alongside cannot delete
+/// or overwrite the evidence of the first.
+fn checkpoint_path() -> Option<PathBuf> {
+    report_dir().map(|d| d.join(format!("running-{}.txt", std::process::id())))
+}
+
+/// State behind the checkpoint. Small, and only touched once a second.
+struct CheckpointState {
+    operation: String,
+    phase: String,
+    started: std::time::SystemTime,
+}
+
+/// The stale checkpoints adopted at start-up: what the previous run was doing when it died.
+static ADOPTED: OnceLock<Vec<String>> = OnceLock::new();
+
+impl Diag {
+    /// Begin an operation. Writes the first checkpoint immediately, so a run that dies in its first
+    /// second still leaves its name behind.
+    pub fn checkpoint_begin(&self, operation: impl Into<String>) {
+        if let Ok(mut cp) = self.checkpoint.lock() {
+            *cp = Some(CheckpointState {
+                operation: operation.into(),
+                phase: String::new(),
+                started: std::time::SystemTime::now(),
+            });
+        }
+        self.checkpoint_last_ms.store(0, Ordering::Relaxed);
+        self.write_checkpoint(0, None);
+    }
+
+    /// Name the stage now running. Phases are few, so this always writes.
+    pub fn checkpoint_phase(&self, phase: impl Into<String>) {
+        if let Ok(mut cp) = self.checkpoint.lock() {
+            let Some(state) = cp.as_mut() else { return };
+            state.phase = phase.into();
+        }
+        self.write_checkpoint(0, None);
+    }
+
+    /// Report progress within the current phase.
+    ///
+    /// **This sits in the per-item path of operations that visit hundreds of thousands of them**, so
+    /// the rate limit is checked with one relaxed atomic load before anything is locked, formatted
+    /// or written. In the overwhelmingly common case this function is that load and a comparison.
+    pub fn checkpoint_tick(&self, done: u64, current: Option<&Path>) {
+        let now = self.process_start.elapsed().as_millis() as u64;
+        let last = self.checkpoint_last_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < CHECKPOINT_INTERVAL_MS {
+            return;
+        }
+        // Losing this race means another thread is writing the checkpoint right now, which is just
+        // as good as writing it here.
+        if self
+            .checkpoint_last_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.write_checkpoint(done, current);
+    }
+
+    /// The operation finished under its own power. Removes the checkpoint, which is what makes a
+    /// leftover one mean "this run died".
+    pub fn checkpoint_end(&self) {
+        if let Ok(mut cp) = self.checkpoint.lock() {
+            *cp = None;
+        }
+        if let Some(p) = checkpoint_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    fn write_checkpoint(&self, done: u64, current: Option<&Path>) {
+        let Some(path) = checkpoint_path() else {
+            return;
+        };
+        let Ok(cp) = self.checkpoint.lock() else {
+            return;
+        };
+        let Some(state) = cp.as_ref() else { return };
+
+        let mut s = String::with_capacity(512);
+        s.push_str(
+            "cram was in the middle of this when the process stopped writing this file.\n\
+             If cram exited normally this file is deleted, so its presence means it did not.\n\n",
+        );
+        s.push_str(&format!("operation     {}\n", state.operation));
+        if !state.phase.is_empty() {
+            s.push_str(&format!("phase         {}\n", state.phase));
+        }
+        s.push_str(&format!("pid           {}\n", std::process::id()));
+        if let Ok(elapsed) = state.started.elapsed() {
+            s.push_str(&format!("running for   {:.1}s\n", elapsed.as_secs_f64()));
+        }
+        if done > 0 {
+            s.push_str(&format!("progress      {done} items\n"));
+        }
+        if let Some(c) = current {
+            // Scrubbed exactly like everything else, so a checkpoint is no more revealing than the
+            // report it ends up in. The shape still carries depth, which is the field that named
+            // this class of failure.
+            let shape = PathShape::of(&c.to_string_lossy(), None, self.keeps_full_paths());
+            s.push_str(&format!("current       {}\n", shape.render()));
+        }
+
+        // Written through a temp file and renamed, so a reader never catches a half-written
+        // checkpoint. Once a second, this costs nothing worth measuring.
+        let tmp = path.with_extension("tmp");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::File::create(&tmp) {
+            if f.write_all(s.as_bytes()).is_ok() && f.flush().is_ok() {
+                drop(f);
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+}
+
+/// Adopt any checkpoint left behind by a run that died, and return what they said.
+///
+/// Called once at start-up, before any work, so the evidence is taken before this process starts
+/// overwriting it. A checkpoint still being rewritten by a live process is left alone.
+pub fn adopt_stale_checkpoints() -> &'static [String] {
+    ADOPTED.get_or_init(|| report_dir().map(|d| adopt_from(&d)).unwrap_or_default())
+}
+
+/// The scan behind [`adopt_stale_checkpoints`], separated from the process-wide `OnceLock` so the
+/// rule it encodes -- fresh means a live run, stale means a dead one -- can actually be tested.
+fn adopt_from(dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for e in rd.flatten() {
+        let path = e.path();
+        let is_checkpoint = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("running-") && n.ends_with(".txt"))
+            .unwrap_or(false);
+        if !is_checkpoint {
+            continue;
+        }
+        // Age is measured from the last write, not from creation: a scan that has been running for
+        // an hour has an old file, but it is still being touched, and that one is alive.
+        let fresh = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .map(|age| age.as_millis() < CHECKPOINT_STALE_MS)
+            .unwrap_or(false);
+        if fresh {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            found.push(text);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    found
+}
+
 /// Write a report and return where it went.
 ///
 /// Only ever called from an explicit user action. Nothing in the library calls this on failure.
@@ -806,6 +1016,58 @@ mod tests {
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         // A panicking test must not wedge every test after it.
         TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A checkpoint left behind is the only evidence a hard death produces, so the rule that
+    /// decides which ones to believe is worth pinning: a file still being rewritten belongs to a
+    /// run that is alive, and only one that has gone quiet describes a run that died.
+    ///
+    /// Without this distinction the feature reports every concurrently running cram as a crash.
+    #[test]
+    fn only_a_checkpoint_that_stopped_being_written_counts_as_a_crash() {
+        let dir = std::env::temp_dir().join(format!("cram-cp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dead = dir.join("running-1111.txt");
+        let alive = dir.join("running-2222.txt");
+        let unrelated = dir.join("cram-diagnostic-20260811-120000.txt");
+        std::fs::write(
+            &dead,
+            "operation     dedup scan
+phase         walk
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &alive,
+            "operation     create
+",
+        )
+        .unwrap();
+        std::fs::write(&unrelated, "a past report").unwrap();
+
+        // Backdate the dead one past the staleness margin. `alive` keeps its just-now mtime, which
+        // is what a process rewriting it every second looks like.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&dead)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let found = adopt_from(&dir);
+        assert_eq!(found.len(), 1, "only the abandoned checkpoint is adopted");
+        assert!(found[0].contains("dedup scan"), "{:?}", found[0]);
+
+        assert!(
+            !dead.exists(),
+            "an adopted checkpoint is consumed, not re-reported forever"
+        );
+        assert!(alive.exists(), "a live run's checkpoint is left alone");
+        assert!(unrelated.exists(), "past reports are not checkpoints");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

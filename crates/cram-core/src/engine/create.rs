@@ -55,70 +55,102 @@ fn make_entry(
     })
 }
 
-/// Recurse a directory, emitting its own entry first, then its children under `prefix`.
+/// One thing still to walk: a directory to descend into, or a file whose metadata has already been
+/// taken from the directory entry that named it.
+enum Pending {
+    Dir(PathBuf, String),
+    File(PathBuf, String, fs::Metadata),
+}
+
+/// Walk a directory, emitting its own entry first, then its children under `prefix`.
+///
+/// The descent uses an explicit stack. It recursed until a deep tree was found to kill the process
+/// outright: a stack overflow on Windows is a hardware exception rather than a Rust panic, so
+/// nothing unwinds, no diagnostic is written, and `cram a` simply vanishes mid-archive. See the
+/// note on [`super::dedup::walk`], where the same defect was measured at 3,264 bytes of frame per
+/// level, giving out around 640 directories down.
+///
+/// Emission order is unchanged, and deliberately so, because it is the archive's layout: each
+/// directory's own entry, then its children sorted by name, with a subdirectory's whole subtree
+/// emitted before the next sibling. Children are pushed in reverse so they pop back in sorted
+/// order, and a file carries the `Metadata` already read from its directory entry so the walk costs
+/// no more syscalls than the recursion did.
 fn collect_dir(
     dir: &Path,
     prefix: &str,
     items: &mut Vec<CreateItem>,
     skipped: &mut Vec<String>,
 ) -> Result<()> {
-    let dir_mtime = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
-    if let Some(entry) = make_entry(prefix, 0, true, dir_mtime) {
-        items.push(CreateItem {
-            entry,
-            disk_path: None,
-            hint: WriteHint::default(),
-        });
-    }
-    // Sort children for a deterministic archive layout.
-    let mut children: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
-    children.sort_by_key(|e| e.file_name());
-    for child in children {
-        // Refuse a name that isn't UTF-8 rather than lossily replacing the undecodable units:
-        // `a\u{D800}.txt` and `a\u{D801}.txt` both became `a\u{FFFD}.txt`, so tar and `.cram` wrote
-        // two entries under one name and extraction destroyed the first file, with `cram a` and
-        // `cram x` both reporting success. `collect_input` below already refuses such a name one
-        // level up; this only makes the walk agree with it.
-        let file_name = child.file_name();
-        let Some(name) = file_name.to_str() else {
-            return Err(ArchiveError::Backend(format!(
-                "{}: file name is not valid UTF-8, archive entry names must be",
-                child.path().display()
-            )));
-        };
-        let child_name = format!("{prefix}/{name}");
-        let ft = child.file_type()?;
-        if ft.is_symlink() {
-            // NOT archived, and the caller is told so. The `.cram` index has no field for a link
-            // target -- `EntryMeta` is `is_dir | name | size | mode | chunk_ids` and `mode` is
-            // defined as permission bits only -- so representing one is a v1 format change, not a
-            // code change. Until that is decided, the honest behaviour is to say what was left out.
-            //
-            // Dropping them in silence was the actual bug: a kernel tree went in with 99 symlinks
-            // and came out with none, while `cram t` called the archive clean. For something sold on
-            // backup integrity, unreported loss is the worst failure mode there is.
-            //
-            // Dereferencing instead is not the safe default it looks like. 7-Zip and WinRAR do it,
-            // and on that same tree it silently duplicated 8,011 files behind twelve directory
-            // symlinks -- and it turns a link cycle into an unbounded walk.
-            skipped.push(child_name);
-            continue;
-        }
-        if ft.is_dir() {
-            collect_dir(&child.path(), &child_name, items, skipped)?;
-        } else if ft.is_file() {
-            let md = child.metadata()?;
-            let size = md.len();
-            if let Some(entry) = make_entry(&child_name, size, false, md.modified().ok()) {
-                items.push(CreateItem {
-                    entry,
-                    disk_path: Some(child.path()),
-                    hint: WriteHint::default(),
-                });
+    let mut stack: Vec<Pending> = vec![Pending::Dir(dir.to_path_buf(), prefix.to_string())];
+    while let Some(next) = stack.pop() {
+        let (path, name) = match next {
+            Pending::File(path, name, md) => {
+                let size = md.len();
+                if let Some(entry) = make_entry(&name, size, false, md.modified().ok()) {
+                    items.push(CreateItem {
+                        entry,
+                        disk_path: Some(path),
+                        hint: WriteHint::default(),
+                    });
+                }
+                continue;
             }
+            Pending::Dir(path, name) => (path, name),
+        };
+
+        let dir_mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        if let Some(entry) = make_entry(&name, 0, true, dir_mtime) {
+            items.push(CreateItem {
+                entry,
+                disk_path: None,
+                hint: WriteHint::default(),
+            });
         }
-        // Anything else (fifo, socket, device) has no archive representation either and is
-        // simply not a file; it is left out without comment.
+        // Sort children for a deterministic archive layout.
+        let mut children: Vec<_> = fs::read_dir(&path)?.collect::<std::io::Result<Vec<_>>>()?;
+        children.sort_by_key(|e| e.file_name());
+        let mut pending: Vec<Pending> = Vec::with_capacity(children.len());
+        for child in children {
+            // Refuse a name that isn't UTF-8 rather than lossily replacing the undecodable units:
+            // `a\u{D800}.txt` and `a\u{D801}.txt` both became `a\u{FFFD}.txt`, so tar and `.cram` wrote
+            // two entries under one name and extraction destroyed the first file, with `cram a` and
+            // `cram x` both reporting success. `collect_input` below already refuses such a name one
+            // level up; this only makes the walk agree with it.
+            let file_name = child.file_name();
+            let Some(child_base) = file_name.to_str() else {
+                return Err(ArchiveError::Backend(format!(
+                    "{}: file name is not valid UTF-8, archive entry names must be",
+                    child.path().display()
+                )));
+            };
+            let child_name = format!("{name}/{child_base}");
+            let ft = child.file_type()?;
+            if ft.is_symlink() {
+                // NOT archived, and the caller is told so. The `.cram` index has no field for a link
+                // target -- `EntryMeta` is `is_dir | name | size | mode | chunk_ids` and `mode` is
+                // defined as permission bits only -- so representing one is a v1 format change, not a
+                // code change. Until that is decided, the honest behaviour is to say what was left out.
+                //
+                // Dropping them in silence was the actual bug: a kernel tree went in with 99 symlinks
+                // and came out with none, while `cram t` called the archive clean. For something sold on
+                // backup integrity, unreported loss is the worst failure mode there is.
+                //
+                // Dereferencing instead is not the safe default it looks like. 7-Zip and WinRAR do it,
+                // and on that same tree it silently duplicated 8,011 files behind twelve directory
+                // symlinks -- and it turns a link cycle into an unbounded walk.
+                skipped.push(child_name);
+                continue;
+            }
+            if ft.is_dir() {
+                pending.push(Pending::Dir(child.path(), child_name));
+            } else if ft.is_file() {
+                pending.push(Pending::File(child.path(), child_name, child.metadata()?));
+            }
+            // Anything else (fifo, socket, device) has no archive representation either and is
+            // simply not a file; it is left out without comment.
+        }
+        pending.reverse();
+        stack.append(&mut pending);
     }
     Ok(())
 }
@@ -371,5 +403,61 @@ pub fn create(
             let _ = fs::remove_file(&staging);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The order `collect_dir` emits members in *is* the archive's layout, so it is pinned here
+    /// rather than left to whatever a walk happens to produce. The contract: a directory's own
+    /// entry first, then its children sorted by name, and a subdirectory's whole subtree before the
+    /// next sibling.
+    ///
+    /// This exists because the walk was converted from recursion to an explicit stack (a deep tree
+    /// overflowed the stack and killed the process), and a stack pops in reverse. Nothing else in
+    /// the suite would have caught the order silently inverting: `tests/reproducible.rs` proves the
+    /// same input twice gives identical bytes, which stays true under any consistent order.
+    #[test]
+    fn members_are_emitted_depth_first_in_sorted_order() {
+        let dir = std::env::temp_dir().join(format!("cram-create-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // b/ sorts between the two loose files, so a subtree really does interrupt the sibling run.
+        for d in ["a_dir", "b_dir/inner"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        for f in [
+            "a_dir/two.txt",
+            "a_dir/one.txt",
+            "b_dir/inner/deep.txt",
+            "b_dir/mid.txt",
+            "zz_last.txt",
+            "aa_first.txt",
+        ] {
+            File::create(dir.join(f)).unwrap();
+        }
+
+        let (mut items, mut skipped) = (Vec::new(), Vec::new());
+        collect_dir(&dir, "root", &mut items, &mut skipped).unwrap();
+        let got: Vec<&str> = items.iter().map(|i| i.entry.name()).collect();
+
+        assert_eq!(
+            got,
+            vec![
+                "root",
+                "root/a_dir",
+                "root/a_dir/one.txt",
+                "root/a_dir/two.txt",
+                "root/aa_first.txt",
+                "root/b_dir",
+                "root/b_dir/inner",
+                "root/b_dir/inner/deep.txt",
+                "root/b_dir/mid.txt",
+                "root/zz_last.txt",
+            ]
+        );
+        assert!(skipped.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
