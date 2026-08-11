@@ -811,6 +811,53 @@ pub mod similar {
     /// Largest distance the banded index can serve without missing matches (see [`find`]).
     pub const MAX_DISTANCE: u32 = 15;
 
+    /// Side of the square colour fingerprint used to *confirm* a candidate pair.
+    ///
+    /// The dHash is a 9×8 greyscale gradient — 72 pixels — which is all a candidate stage needs and
+    /// nowhere near enough to decide. A terminal screenshot at that size is a dark rectangle: a
+    /// missing word changes no bits at all, so a thousand unrelated CLI captures hash alike and, via
+    /// the transitive union below, collapse into one group. 64×64 in colour is where "the same shot
+    /// retaken" and "a different shot entirely" stop looking the same.
+    #[cfg(feature = "phash")]
+    const VERIFY_DIM: u32 = 64;
+
+    /// Mean absolute channel difference, 0..1, above which a candidate pair is rejected.
+    ///
+    /// Chosen by measurement, not taste. Over synthetic terminal captures and photos, at 64x64:
+    ///
+    /// | must stay together      |        | must separate            |        |
+    /// |-------------------------|--------|--------------------------|--------|
+    /// | photo, resized to half  | 0.0002 | two different terminals  | 0.0132 |
+    /// | terminal retake, 1 word | 0.0009 | two different photos     | 0.0341 |
+    /// | photo, half + JPEG q70  | 0.0029 |                          |        |
+    /// | photo, half + JPEG q40  | 0.0037 |                          |        |
+    ///
+    /// The lower bound is set by lossy re-encoding, not by the retakes: a resized JPEG of the same
+    /// photo is the case this feature exists to catch, and it is far noisier than two captures of
+    /// one screen. 0.007 is the geometric mean of the worst keep (0.0037) and the closest separate
+    /// (0.0132), so it sits ~1.9x from each.
+    ///
+    /// That margin is real but not generous, and these are synthetic images. A corpus that pushes
+    /// past it will show up as a group that should have split (raise it) or a retake that was missed
+    /// (lower it). This constant is the knob.
+    const VERIFY_MAX_DIFF: f32 = 0.007;
+
+    /// Aspect ratios differing by more than this are never the same picture. Cheap, and it separates
+    /// terminal captures taken at different window sizes before any pixel is compared.
+    const VERIFY_ASPECT_TOL: f32 = 0.10;
+
+    /// A small colour thumbnail, kept only long enough to confirm the pairs the hash proposed.
+    ///
+    /// Colour on purpose. Greyscale is right for the *hash*, where discarding chroma is what makes a
+    /// re-encoded copy still match — JPEG subsamples chroma, profiles come and go, hues drift. None
+    /// of that applies here: this compares two decoded images directly, and screenshots are lossless
+    /// PNG. Meanwhile terminal output is full of colour signal, and Rec. 601 luma will happily map a
+    /// red error dump and a green success run onto the same greys.
+    struct Fingerprint {
+        aspect: f32,
+        px: Vec<u8>, // VERIFY_DIM * VERIFY_DIM * 3, RGB
+    }
+
     /// Extensions decoded for perceptual hashing. HEIC/HEIF (modern iPhone photos) and RAW are absent:
     /// decoding them needs a C library, and adding one would break the pure-Rust build. Those files are
     /// still covered by exact-duplicate detection, which is format-agnostic.
@@ -870,8 +917,10 @@ pub mod similar {
             }
         }
 
-        // ---- union-find over confirmed pairs ----
-        let mut uf = UnionFind::new(hashes.len());
+        // ---- candidate pairs, from the hash alone ----
+        // Collected rather than unioned on sight. The hash is a filter, not a verdict: it decides
+        // what is worth looking at, and the pixels decide what actually matches.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
         for members in index.values() {
             if members.len() < 2 || members.len() > 4096 {
                 // A band shared by thousands of images is a degenerate bucket (e.g. flat-colour
@@ -881,13 +930,37 @@ pub mod similar {
             for (a_pos, &a) in members.iter().enumerate() {
                 for &b in &members[a_pos + 1..] {
                     if (hashes[a].1 ^ hashes[b].1).count_ones() <= distance {
-                        uf.union(a, b);
+                        pairs.push(if a < b { (a, b) } else { (b, a) });
                     }
                 }
             }
             if sink.is_cancelled() {
                 return Vec::new();
             }
+        }
+        // The banded index offers the same pair once per band it shares.
+        pairs.sort_unstable();
+        pairs.dedup();
+
+        // ---- confirm each pair against the actual pixels ----
+        // Only images that reached a candidate pair are decoded again, so this is bounded by what
+        // the hash proposed rather than by the size of the scan.
+        let mut needed: Vec<usize> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+        needed.sort_unstable();
+        needed.dedup();
+        let prints = fingerprints(&needed, &hashes, sink);
+
+        let mut uf = UnionFind::new(hashes.len());
+        for (a, b) in pairs {
+            match (prints.get(&a), prints.get(&b)) {
+                // Unreadable a second time: fall back to the hash's opinion rather than silently
+                // dropping a finding the user would otherwise have seen.
+                (Some(x), Some(y)) if !verify(x, y) => {}
+                _ => uf.union(a, b),
+            }
+        }
+        if sink.is_cancelled() {
+            return Vec::new();
         }
 
         // ---- materialize groups ----
@@ -914,6 +987,36 @@ pub mod similar {
     }
 
     /// Decode + perceptually hash each image. Returns the ones that decoded, paired with their hash.
+    /// Decode the candidates to fingerprints, in parallel, exactly as the hash pass does.
+    #[cfg(feature = "phash")]
+    fn fingerprints(
+        needed: &[usize],
+        hashes: &[(ScannedFile, u64)],
+        sink: &dyn ProgressSink,
+    ) -> HashMap<usize, Fingerprint> {
+        use rayon::prelude::*;
+        needed
+            .par_iter()
+            .filter_map(|&slot| {
+                if sink.is_cancelled() {
+                    return None;
+                }
+                fingerprint(&hashes[slot].0.path).map(|f| (slot, f))
+            })
+            .collect()
+    }
+
+    /// Without `phash` nothing is ever hashed, so nothing is ever a candidate and this is never
+    /// reached. It exists so the crate still builds without the feature, exactly like `hash_images`.
+    #[cfg(not(feature = "phash"))]
+    fn fingerprints(
+        _needed: &[usize],
+        _hashes: &[(ScannedFile, u64)],
+        _sink: &dyn ProgressSink,
+    ) -> HashMap<usize, Fingerprint> {
+        HashMap::new()
+    }
+
     #[cfg(feature = "phash")]
     fn hash_images(
         images: &[&ScannedFile],
@@ -951,6 +1054,51 @@ pub mod similar {
         _unreadable: &mut u64,
     ) -> Vec<(ScannedFile, u64)> {
         Vec::new()
+    }
+
+    /// Decode an image down to a small colour square for comparison. Squashed to a fixed square
+    /// rather than fitted: both sides of a comparison are distorted identically, so it costs
+    /// nothing, and the aspect ratio is kept separately where it does real work.
+    #[cfg(feature = "phash")]
+    fn fingerprint(path: &std::path::Path) -> Option<Fingerprint> {
+        let img = image::open(path).ok()?;
+        let (w, h) = (img.width().max(1), img.height().max(1));
+        let small = image::imageops::resize(
+            &img.to_rgb8(),
+            VERIFY_DIM,
+            VERIFY_DIM,
+            image::imageops::FilterType::Triangle,
+        );
+        Some(Fingerprint {
+            aspect: w as f32 / h as f32,
+            px: small.into_raw(),
+        })
+    }
+
+    /// Is this candidate pair actually the same picture?
+    ///
+    /// The hash said "maybe"; this says yes or no. Mean absolute difference over every channel,
+    /// after an aspect-ratio gate that rejects the easy cases without touching a pixel.
+    fn verify(a: &Fingerprint, b: &Fingerprint) -> bool {
+        // Relative difference, so the tolerance means the same thing for a 4:3 shot and a 21:9 one.
+        let (lo, hi) = if a.aspect < b.aspect {
+            (a.aspect, b.aspect)
+        } else {
+            (b.aspect, a.aspect)
+        };
+        if lo <= 0.0 || (hi - lo) / lo > VERIFY_ASPECT_TOL {
+            return false;
+        }
+        if a.px.len() != b.px.len() || a.px.is_empty() {
+            return false;
+        }
+        let sum: u64 =
+            a.px.iter()
+                .zip(b.px.iter())
+                .map(|(x, y)| u64::from(x.abs_diff(*y)))
+                .sum();
+        let mean = sum as f32 / (a.px.len() as f32 * 255.0);
+        mean <= VERIFY_MAX_DIFF
     }
 
     /// **dHash**: downscale to 9×8 greyscale and emit one bit per horizontal neighbour pair,
@@ -1301,6 +1449,94 @@ mod tests {
     /// The two claims the perceptual feature lives or dies by: a photo matches its own resized copy
     /// (recall), and two different photos never match (no false positives; the dangerous
     /// direction, since a false pair invites a human to delete a photo that isn't a duplicate).
+    /// A synthetic terminal capture: dark background, a few rows of light "text" blocks.
+    #[cfg(feature = "phash")]
+    fn synthetic_terminal(seed: u32, words: usize) -> image::RgbImage {
+        let (w, h) = (960u32, 540u32);
+        let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([12, 12, 14]));
+        let mut rng = seed.wrapping_mul(2654435761).wrapping_add(1);
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        // Rows of short bright runs, the shape of a wall of monospaced output.
+        for i in 0..words {
+            let row = (i / 8) as u32;
+            let y = 20 + row * 18;
+            if y + 9 >= h {
+                break;
+            }
+            let x = 16 + ((i % 8) as u32) * 112 + (next() % 12);
+            let len = 40 + (next() % 60);
+            let shade = 170 + (next() % 70) as u8;
+            for dy in 0..9u32 {
+                for dx in 0..len.min(w - x - 1) {
+                    img.put_pixel(x + dx, y + dy, image::Rgb([shade, shade, shade]));
+                }
+            }
+        }
+        img
+    }
+
+    /// The case this stage exists for. A wall of terminal output hashes to almost nothing at 9×8 --
+    /// it is a dark rectangle -- so every CLI screenshot on a disk lands in one candidate bucket and
+    /// the transitive union then welds them into a single group of hundreds. Confirming candidates
+    /// against the actual pixels is what tells "the same shot, retaken" from "a different shot".
+    #[cfg(feature = "phash")]
+    #[test]
+    fn two_different_terminal_captures_do_not_group() {
+        let dir = scratch("terminal");
+        // Same *kind* of image, different content: the real corpus, in miniature.
+        let a = dir.join("run-a.png");
+        let b = dir.join("run-b.png");
+        synthetic_terminal(1, 40).save(&a).unwrap();
+        synthetic_terminal(2, 40).save(&b).unwrap();
+
+        // And a genuine re-take: the same capture with one "word" missing, which is exactly the
+        // pair a user wants found.
+        let c = dir.join("retake-full.png");
+        let d = dir.join("retake-cut.png");
+        synthetic_terminal(3, 40).save(&c).unwrap();
+        synthetic_terminal(3, 39).save(&d).unwrap();
+
+        let sink = Progress::new(0, 0);
+        let opts = DedupOptions {
+            similar_images: true,
+            ..Default::default()
+        };
+        let rep = scan(std::slice::from_ref(&dir), &opts, &sink).unwrap();
+        let groups: Vec<Vec<String>> = rep
+            .similar_groups()
+            .map(|g| {
+                let mut v: Vec<String> = g
+                    .files
+                    .iter()
+                    .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                v.sort();
+                v
+            })
+            .collect();
+
+        let together = |x: &str, y: &str| {
+            groups
+                .iter()
+                .any(|g| g.iter().any(|n| n == x) && g.iter().any(|n| n == y))
+        };
+
+        assert!(
+            !together("run-a.png", "run-b.png"),
+            "two different terminal captures must not be called similar; groups: {groups:?}"
+        );
+        assert!(
+            together("retake-full.png", "retake-cut.png"),
+            "a retake of the same screen, one word short, is exactly what should be found; groups: {groups:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "phash")]
     #[test]
     fn similar_finds_resized_copy_but_not_different_photos() {
