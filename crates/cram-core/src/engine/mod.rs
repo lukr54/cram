@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::codec::plan::{block_count, plan_codec};
-use crate::error::{Report, Result};
+use crate::error::{ArchiveError, Report, Result};
 use crate::hw::{self, HwProfile, Op, Rates, Topology};
 use crate::progress::ProgressSink;
 use crate::secret::PasswordProvider;
@@ -45,6 +45,7 @@ pub mod reclaim;
 pub mod sequential;
 pub mod skip;
 pub mod stream;
+pub mod unwind;
 pub mod verify;
 
 /// Knobs for an extraction job (fixed for the whole job). Grows as Phase-1+ features land.
@@ -187,13 +188,27 @@ pub fn extract(
         )
     };
 
+    // Cancelling should leave the destination as it was found, so the engines record what they
+    // bring into existence and nothing else. See `unwind`: a file that was already there is never
+    // ours to remove, even when this run overwrote it.
+    let created = unwind::CreatedLog::default();
+
     // Random-access (ZIP) → tuned parallel per-entry; everything else → sequential stream.
-    if reader.as_random_access().is_some() {
+    let out = if reader.as_random_access().is_some() {
         let ra = reader.as_random_access().unwrap();
-        parallel::run(ra, dest, plan.workers, opts.skip_existing, sink)
+        parallel::run(ra, dest, plan.workers, opts.skip_existing, sink, &created)
     } else {
-        sequential::run(reader.as_mut(), dest, opts.skip_existing, sink)
+        sequential::run(reader.as_mut(), dest, opts.skip_existing, sink, &created)
+    };
+
+    // Only on cancellation. A run that failed part-way leaves its output alone: the user did not ask
+    // for it to stop, and what landed may be the more useful half of a bad archive.
+    let cancelled =
+        matches!(out, Err(ArchiveError::Cancelled)) || matches!(&out, Ok(r) if r.cancelled);
+    if cancelled {
+        created.unwind();
     }
+    out
 }
 
 /// A `Write` shared by both engine paths: reports written bytes to the sink and aborts when

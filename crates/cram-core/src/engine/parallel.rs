@@ -99,6 +99,7 @@ pub fn run(
     workers: usize,
     skip_existing: bool,
     sink: &dyn ProgressSink,
+    created: &super::unwind::CreatedLog,
 ) -> Result<Report> {
     let entries = ra.entries();
     fs::create_dir_all(dest)?;
@@ -109,6 +110,7 @@ pub fn run(
     let mut dir_times: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
     for e in entries.iter().filter(|e| e.is_dir()) {
         let p = e.path.join_under(dest);
+        created.note_dir(&p);
         let _ = fs::create_dir_all(&p);
         if let Some(t) = e.modified {
             dir_times.push((p, t));
@@ -209,7 +211,7 @@ pub fn run(
                 // the whole extraction, one bad entry in a big archive can't take down the rest or
                 // crash the host process (which matters for the GUI, which extracts in-process).
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    extract_one(ra, dest, i, &entries[i], skip_existing, sink)
+                    extract_one(ra, dest, i, &entries[i], skip_existing, sink, created)
                 }));
                 match outcome {
                     Ok(Ok(EntryOutcome::Wrote(bytes))) => {
@@ -267,6 +269,7 @@ fn extract_one(
     entry: &Entry,
     skip_existing: bool,
     sink: &dyn ProgressSink,
+    created: &super::unwind::CreatedLog,
 ) -> Result<EntryOutcome> {
     if sink.is_cancelled() {
         return Err(ArchiveError::Cancelled);
@@ -282,8 +285,10 @@ fn extract_one(
 
     sink.on_entry_start(entry);
     if let Some(parent) = outpath.parent() {
+        created.note_dir(parent);
         fs::create_dir_all(parent)?;
     }
+    created.note_file(&outpath);
     let file = File::create(&outpath)?;
     let mut writer = ProgressWriter::new(BufWriter::with_capacity(WRITE_BUF, file), sink);
 
@@ -412,7 +417,7 @@ mod dest_race_tests {
         .unwrap();
         let ra = reader.as_random_access().expect("zip is random-access");
         let out = dir.join("out");
-        let report = run(ra, &out, 4, false, &NullSink).unwrap();
+        let report = run(ra, &out, 4, false, &NullSink, &Default::default()).unwrap();
 
         assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
         if dest_is_case_insensitive(&out) {
@@ -483,7 +488,7 @@ mod dest_race_tests {
         .unwrap();
         let ra = reader.as_random_access().expect("zip is random-access");
         let out = dir.join("out");
-        let report = run(ra, &out, 4, false, &NullSink).unwrap();
+        let report = run(ra, &out, 4, false, &NullSink, &Default::default()).unwrap();
 
         assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
         // Both entries are written either way. Where they land on one file the group is serialised

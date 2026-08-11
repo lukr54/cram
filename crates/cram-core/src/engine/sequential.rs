@@ -24,6 +24,7 @@ pub fn run(
     dest: &Path,
     skip_existing: bool,
     sink: &dyn ProgressSink,
+    created: &super::unwind::CreatedLog,
 ) -> Result<Report> {
     fs::create_dir_all(dest)?;
     let mut report = Report::default();
@@ -58,6 +59,7 @@ pub fn run(
 
         let outpath = entry.path.join_under(dest);
         if entry.is_dir() {
+            created.note_dir(&outpath);
             let _ = fs::create_dir_all(&outpath);
             if let Some(t) = entry.modified {
                 dir_times.push((outpath, t));
@@ -79,12 +81,14 @@ pub fn run(
         // failure and continues rather than aborting the whole job. Drain the (already-buffered)
         // body first so the reader stays in sync for the next entry.
         if let Some(parent) = outpath.parent() {
+            created.note_dir(parent);
             if let Err(e) = fs::create_dir_all(parent) {
                 let _ = io::copy(&mut es.body, &mut io::sink());
                 report.push_failure(entry.name(), e);
                 continue;
             }
         }
+        created.note_file(&outpath);
         let file = match File::create(&outpath) {
             Ok(f) => f,
             Err(e) => {
