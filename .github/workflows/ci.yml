@@ -23,7 +23,7 @@ jobs:
     name: build + test (windows-gnu)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Add the bundled MinGW toolchain to PATH
         shell: pwsh
@@ -71,7 +71,7 @@ jobs:
     env:
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # g++ builds the UnRAR C++ dependency; build-essential is preinstalled on the runner image but
       # pinned here so the job is self-describing and survives an image change.
@@ -108,7 +108,7 @@ jobs:
     env:
       CARGO_BUILD_TARGET: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the Rust target
         run: rustup target add aarch64-apple-darwin
@@ -135,7 +135,7 @@ jobs:
     name: secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Scan the tree for credential-shaped strings
@@ -186,7 +186,7 @@ jobs:
     env:
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: Swatinem/rust-cache@v2
 
@@ -227,7 +227,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Add the bundled MinGW toolchain to PATH
         shell: pwsh
@@ -325,7 +325,7 @@ jobs:
     env:
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the C/C++ toolchain
         run: sudo apt-get update && sudo apt-get install -y build-essential
@@ -369,7 +369,7 @@ jobs:
     env:
       CARGO_BUILD_TARGET: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the Rust target
         run: rustup target add aarch64-apple-darwin
