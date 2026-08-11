@@ -6,7 +6,7 @@ name = "cram-cli"
 # other crates in the workspace are unaffected and stay at 1.0.0; this depends on them as ^1.0.0,
 # which the published 1.0.0 satisfies. The divergence from the v1.0.0 git tag is the point: the
 # crates.io package genuinely differs from what that tag builds.
-version = "1.0.1"
+version = "1.0.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

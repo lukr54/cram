@@ -7,6 +7,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.2] - 2026-08-11
+
+Skips 1.0.1, which the CLI already used for a crates.io-only release. `cram --version` and Studio's
+updater both compare their own version against the release tag, so the two have to agree, and every
+crate here is on 1.0.2 rather than leaving the CLI a version ahead of everything else.
+
+### Fixed
+
+- **A directory tree deeper than about 640 levels killed the process.** Both tree walks recursed.
+  Each frame of the duplicate-scan walk costs 3,264 bytes on the shipped Windows binary, so a scan
+  running on a 2 MiB worker thread ran out of stack and died with `0xc00000fd`. It died silently: a
+  stack overflow is a hardware exception rather than a Rust panic, so nothing unwinds, no error is
+  reported and no diagnostic is written — `cram dedup` and Cram Studio both simply disappeared.
+  Found by scanning a drive that happened to hold a 14,566-level tree. Both walks now carry their
+  own stack, so depth is bounded by memory rather than by the thread it runs on. `cram a` had the
+  same defect on the create side and is fixed with it; archive member order is unchanged, and now
+  has a test that says so.
+
+### Added
+
+- **A checkpoint that outlives a run which dies without unwinding.** The event log lives in memory
+  and dies with the process, so a crash left nothing at all to read, and the duplicate-scan engine
+  recorded nothing even with detailed diagnostics switched on. A running operation now mirrors its
+  operation, phase, item count and current depth to a file once a second, and deletes it on a clean
+  finish — so a file left behind is itself evidence that the run did not finish, and says where it
+  had got to. `cram diag report` adopts it into the next report. Cost is one atomic load per item,
+  and a checkpoint another process is still rewriting is left alone.
+
 ## [cram-cli 1.0.1] - 2026-08-07
 
 A crates.io-only release. The published binaries and the `v1.0.0` tag are unaffected, and no other
