@@ -29,13 +29,13 @@ path = "src/main.rs"
 # workspace and rewrites the dependency to the version when packaging for crates.io. Without the
 # version, `cargo publish` refuses the crate outright.
 [dependencies]
-cram-core = { path = "../cram-core", version = "1.0.0" }
+cram-core = { path = "../cram-core", version = "1.0.2" }
 # Reading the release JSON for `cram update`. Optional, so a default build (no `download`) does not
 # compile it; already in the graph via rdm-core, so it costs nothing extra in a shipped build.
 serde_json = { version = "1", optional = true }
-cram-mount = { path = "../cram-mount", version = "1.0.0" }
-cram-recovery = { path = "../cram-recovery", version = "1.0.0" }
-cram-sign = { path = "../cram-sign", version = "1.0.0" }
+cram-mount = { path = "../cram-mount", version = "1.0.2" }
+cram-recovery = { path = "../cram-recovery", version = "1.0.2" }
+cram-sign = { path = "../cram-sign", version = "1.0.2" }
 
 [features]
 default = []
