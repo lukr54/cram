@@ -157,12 +157,17 @@ fn dict_mib(level: u32) -> u64 {
 ///
 /// Physical cores, not logical: LZMA2's match finder is memory-bound enough that SMT siblings buy
 /// very little, and halving the thread count halves the memory.
+///
+/// **Budgeted against TOTAL ram, not available ram.** Available memory is whatever else happens to
+/// be running, so keying off it made the same machine produce different archives at different times
+/// — and an archiver whose output and timings depend on whether a browser is open cannot be
+/// benchmarked, by its users or by us. Total RAM is a property of the machine. A quarter of it is
+/// conservative enough that the difference rarely bites, and when it does, swapping is the honest
+/// signal rather than a silently different result.
 fn lzma_threads(level: u32) -> u32 {
     let hw = crate::hw::HwProfile::detect();
     let per_thread = dict_mib(level).saturating_mul(11).max(1);
-    // A quarter of what is free. Create is not the only thing on the machine, and the alternative
-    // to being conservative here is swapping, which costs far more than the threads were worth.
-    let budget_mib = (hw.ram_avail / (1024 * 1024)) / 4;
+    let budget_mib = (hw.ram_total / (1024 * 1024)) / 4;
     let by_memory = (budget_mib / per_thread).max(1);
     let by_cores = hw.physical.max(1) as u64;
     by_memory.min(by_cores).clamp(1, 64) as u32
