@@ -217,6 +217,7 @@ pub fn create(
         return Err(ArchiveError::Backend("no input files to add".into()));
     }
 
+    let create_t0 = std::time::Instant::now();
     // Plan the full member list up front (also sizes the progress bar).
     let walk_t0 = std::time::Instant::now();
     let mut items = Vec::new();
@@ -386,6 +387,45 @@ pub fn create(
         }
         writer.finish()
     })();
+    // The `.cram` writer prints its own detailed profile, but the walk and the probe run before any
+    // writer exists and belong to the engine. Printing them here means every backend gets the same
+    // breakdown, which is what the ZIP work needed: the serial head of a create is invisible from
+    // inside a writer, and it is where the time was.
+    if std::env::var_os("CRAM_PROFILE").is_some() {
+        let ms = |n: u64| n as f64 / 1e6;
+        let wall = create_t0.elapsed().as_nanos() as f64 / 1e6;
+        let walk = super::prof::WALK_NANOS.load(Relaxed);
+        let probe = super::prof::PROBE_NANOS.load(Relaxed);
+        let open = super::prof::OPEN_NANOS.load(Relaxed);
+        let opens = super::prof::OPEN_COUNT.load(Relaxed);
+        let pct = |n: f64| if wall > 0.0 { n / wall * 100.0 } else { 0.0 };
+        eprintln!("-- engine create ------------------------------------------------");
+        eprintln!(
+            "wall            {wall:9.1} ms  {} entries planned",
+            items.len()
+        );
+        eprintln!(
+            "walk (serial)   {:9.1} ms  {:5.1}%   runs to completion before the writer exists",
+            ms(walk),
+            pct(ms(walk))
+        );
+        eprintln!(
+            "probe (serial)  {:9.1} ms  {:5.1}%",
+            ms(probe),
+            pct(ms(probe))
+        );
+        eprintln!(
+            "open (serial)   {:9.1} ms  {:5.1}%   {} files{}",
+            ms(open),
+            pct(ms(open)),
+            opens,
+            if opens == 0 {
+                ", writer took paths and opens them on its own threads"
+            } else {
+                ""
+            }
+        );
+    }
     match result {
         Ok(mut report) => {
             // What the walk refused to archive travels back with the result. A caller that prints
