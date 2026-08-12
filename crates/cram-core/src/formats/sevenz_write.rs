@@ -25,19 +25,20 @@
 //! method is applied to the data first, so bytes are compressed *then* encrypted.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Cursor, Read};
 use std::path::Path;
 use std::time::Instant;
 
 use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_rust2::{
     ArchiveEntry, ArchiveWriter as SzWriter, EncoderConfiguration, EncoderMethod, Error as SzError,
-    Password,
+    Password, SourceReader,
 };
 
 use crate::error::{ArchiveError, Result};
 use crate::format::Codec;
 use crate::model::Entry;
+use crate::probe;
 use crate::secret::{HeaderMode, Secret};
 use crate::writer::{ArchiveWriter, CreateOptions, CreateReport, Level, WriteHint};
 
@@ -54,6 +55,99 @@ fn map_sz(e: SzError) -> ArchiveError {
 /// default is 8 (~256 rounds), which makes offline password guessing ~2000× cheaper. The decoder
 /// side (ours and 7-Zip's) accepts up to 24.
 const AES_CYCLES_POWER: u8 = 19;
+
+/// Target size of one solid block, in source bytes.
+///
+/// Non-solid (one pack per entry) cost 23% of archive size against 7-Zip on a 41,305-file tree,
+/// because every small file got its own LZMA2 dictionary and nothing was ever shared between them.
+/// It also pinned create to one core: a pack is compressed inline into the output stream, so packs
+/// cannot overlap.
+///
+/// 64 MiB is a compromise, not a tuned number. Bigger blocks compress better and extract less
+/// randomly: pulling one file out of a solid block means decompressing the block up to it, which is
+/// what `cram mount` and single-entry extraction pay. At 64 MiB a 1.2 GB tree is ~19 blocks, which
+/// still leaves full-archive extraction parallel across them.
+const SOLID_BLOCK_BYTES: u64 = 64 << 20;
+
+/// Set to `0` to go back to one independently-decodable pack per entry: smaller random-access cost,
+/// much larger archive, single-threaded create.
+const ENV_SOLID: &str = "CRAM_7Z_SOLID";
+
+/// Overrides [`SOLID_BLOCK_BYTES`], in bytes.
+const ENV_BLOCK: &str = "CRAM_7Z_BLOCK";
+
+/// One entry's content, waiting for its block to be flushed: the probe's sample chained in front of
+/// the still-open handle it was read from.
+///
+/// Three shapes were measured on a 41,305-file tree, and the differences between them are all about
+/// how many times each byte gets read.
+///
+/// - **Buffered bytes** (read the whole entry up front): 127.8s. Correct, but it splits the work
+///   into phases -- the disk runs with the compressor idle, then the reverse.
+/// - **Handle, seeked back to zero after sampling**: 136.6s, the worst of the three. The probe
+///   sample is larger than most files in a source tree, so rewinding re-reads nearly everything.
+/// - **Sample chained in front of the handle** (this): one read per byte, and
+///   `push_archive_entries` pulls from it while compressing, so the two overlap.
+///
+/// A bare path is not an option: `takes_paths` stops the engine probing inline, and a block must
+/// know every entry's verdict before it can choose its single method chain.
+///
+/// `Bytes` exists only for `conv`, which supplies a reader with no file behind it.
+enum BlockSource {
+    Stream(io::Chain<Cursor<Vec<u8>>, File>),
+    Bytes(Cursor<Vec<u8>>),
+}
+
+impl Read for BlockSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            BlockSource::Stream(s) => s.read(buf),
+            BlockSource::Bytes(c) => c.read(buf),
+        }
+    }
+}
+
+/// Cap on entries per block, independent of [`SOLID_BLOCK_BYTES`]. A block holds one open handle per
+/// entry, so a tree of 1 KB files would otherwise reach ~65,000 handles before the byte ceiling
+/// noticed.
+const SOLID_BLOCK_ENTRIES: usize = 4096;
+
+/// LZMA2 dictionary size for a preset, in MiB (the xz preset table). Needed because encoder memory
+/// is a multiple of the dictionary, and the dictionary grows 8× between the default level and
+/// `--small`.
+fn dict_mib(level: u32) -> u64 {
+    match level {
+        0 => 1,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 4,
+        5 | 6 => 8,
+        7 => 16,
+        8 => 32,
+        _ => 64,
+    }
+}
+
+/// How many threads LZMA2 may use, bounded by memory as well as by cores.
+///
+/// Each encoder thread holds its own match-finder state, roughly 11× the dictionary. That is ~88 MB
+/// per thread at the default level and ~700 MB at `--small`, so a fixed thread count that is fine
+/// for one level will exhaust a small machine at another. Measured peak RSS with 16 threads at
+/// level 6 was 997 MB, which is why this exists.
+///
+/// Physical cores, not logical: LZMA2's match finder is memory-bound enough that SMT siblings buy
+/// very little, and halving the thread count halves the memory.
+fn lzma_threads(level: u32) -> u32 {
+    let hw = crate::hw::HwProfile::detect();
+    let per_thread = dict_mib(level).saturating_mul(11).max(1);
+    // A quarter of what is free. Create is not the only thing on the machine, and the alternative
+    // to being conservative here is swapping, which costs far more than the threads were worth.
+    let budget_mib = (hw.ram_avail / (1024 * 1024)) / 4;
+    let by_memory = (budget_mib / per_thread).max(1);
+    let by_cores = hw.physical.max(1) as u64;
+    by_memory.min(by_cores).clamp(1, 64) as u32
+}
 
 /// Map the abstract [`Level`] onto LZMA2's 0–9 scale (`Auto`/`Balanced` → 6).
 fn lzma_level(level: Level) -> u32 {
@@ -89,6 +183,33 @@ pub struct SevenZArchiveWriter {
     /// Entries the adaptive probe stored verbatim (incompressible), for the report.
     stored: u64,
     start: Instant,
+    /// Whether to group entries into solid blocks. Off restores one pack per entry.
+    solid: bool,
+    /// Mirrors the engine's `adaptive` flag. With `takes_paths` on the engine stops probing
+    /// store-vs-compress inline, so the decision has to be made here instead.
+    adaptive: bool,
+    /// Target block size in source bytes.
+    solid_max: u64,
+    /// Threads for LZMA2's own chunked multi-threading, which only does anything inside a block
+    /// large enough to hold more than one chunk -- which is exactly what solid blocks create.
+    threads: u32,
+    /// The block being filled: entries, their unread sources, and total source bytes.
+    block: Vec<(ArchiveEntry, BlockSource)>,
+    block_bytes: u64,
+    /// Whether the open block is a COPY block. A pack has ONE method chain, so a change of
+    /// store-ness closes the block. On real trees that is rare (157 of 41,305 entries on the test
+    /// corpus); a corpus that alternated every entry would degenerate to one pack per entry, which
+    /// is merely today's behaviour.
+    block_store: bool,
+    /// Directory entries, written after every file block.
+    ///
+    /// They cannot ride inside a solid pack: `push_archive_entries` asserts one reader per entry and
+    /// a 7z directory has no stream. Writing them inline instead would close the open block every
+    /// time the walk stepped into a new directory -- 2,434 times on the test corpus, which is no
+    /// solid compression at all. Deferring them reorders the header, which 7z does not care about,
+    /// and it applies directory mtimes after their contents are written rather than before, which is
+    /// the order that actually preserves them.
+    dirs: Vec<ArchiveEntry>,
 }
 
 impl SevenZArchiveWriter {
@@ -120,7 +241,93 @@ impl SevenZArchiveWriter {
             in_bytes: 0,
             stored: 0,
             start: Instant::now(),
+            solid: std::env::var(ENV_SOLID).map(|v| v != "0").unwrap_or(true),
+            adaptive: opts.level == Level::Auto && opts.codec.is_none(),
+            solid_max: std::env::var(ENV_BLOCK)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(SOLID_BLOCK_BYTES)
+                .max(1),
+            threads: lzma_threads(lzma_level(opts.level)),
+            block: Vec::new(),
+            block_bytes: 0,
+            block_store: false,
+            dirs: Vec::new(),
         })
+    }
+
+    /// Compress and write the open block as one pack, then start a new one.
+    fn flush_block(&mut self) -> Result<()> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.block);
+        self.block_bytes = 0;
+        let methods = self.content_methods(self.block_store);
+
+        let mut entries = Vec::with_capacity(batch.len());
+        let mut readers = Vec::with_capacity(batch.len());
+        for (entry, source) in batch {
+            entries.push(entry);
+            readers.push(SourceReader::from(source));
+        }
+
+        let w = self.writer()?;
+        w.set_content_methods(methods);
+        // One pack for the whole batch. This is the solid part: every entry in it shares one LZMA2
+        // dictionary, which is where both the size win and the multi-threading come from.
+        w.push_archive_entries(entries, readers).map_err(map_sz)?;
+        Ok(())
+    }
+
+    /// Queue one entry into the open block, flushing first if this entry cannot share it.
+    fn push_into_block(
+        &mut self,
+        entry: &Entry,
+        source: BlockSource,
+        store: bool,
+        adaptive_store: bool,
+    ) -> Result<()> {
+        // A pack carries one method chain, so COPY and LZMA2 entries cannot share a block.
+        if !self.block.is_empty() && self.block_store != store {
+            self.flush_block()?;
+        }
+        self.block_store = store;
+        self.block
+            .push((ArchiveEntry::new_file(&arc_name(entry)), source));
+        self.block_bytes = self.block_bytes.saturating_add(entry.size);
+        self.entries += 1;
+        self.in_bytes += entry.size;
+        if adaptive_store {
+            self.stored += 1;
+        }
+        if self.block_bytes >= self.solid_max || self.block.len() >= SOLID_BLOCK_ENTRIES {
+            self.flush_block()?;
+        }
+        Ok(())
+    }
+
+    /// Write one entry as its own independently-decodable pack, streaming it. The pre-solid
+    /// behaviour, still used for `CRAM_7Z_SOLID=0`, for `conv`'s oversized entries, and for anything
+    /// too large to sit in a block.
+    fn add_file_direct(
+        &mut self,
+        entry: &Entry,
+        body: &mut dyn io::Read,
+        store: bool,
+        adaptive_store: bool,
+    ) -> Result<()> {
+        let methods = self.content_methods(store);
+        let sz_entry = ArchiveEntry::new_file(&arc_name(entry));
+        let w = self.writer()?;
+        w.set_content_methods(methods);
+        w.push_archive_entry(sz_entry, Some(body)).map_err(map_sz)?;
+        self.entries += 1;
+        self.in_bytes += entry.size;
+        if adaptive_store {
+            self.stored += 1;
+        }
+        Ok(())
     }
 
     fn writer(&mut self) -> Result<&mut SzWriter<File>> {
@@ -134,6 +341,20 @@ impl SevenZArchiveWriter {
     fn content_methods(&self, store: bool) -> Vec<EncoderConfiguration> {
         let compress: EncoderConfiguration = if store {
             EncoderConfiguration::new(EncoderMethod::COPY)
+        } else if self.solid && self.threads > 1 {
+            // LZMA2's own multi-threading splits the input into independent chunks, each clamped to
+            // at least the dictionary. That does nothing for a 27 KB entry in its own pack, which is
+            // why non-solid create could never use more than one core; inside a 64 MiB block it is
+            // several chunks and several threads. It costs some ratio -- matches no longer cross a
+            // chunk boundary -- but the dictionary is still shared by the thousands of small files
+            // *within* each chunk, which is where the solid win actually comes from.
+            //
+            // The chunk must be a FRACTION of the block. Passing the block size itself makes every
+            // block exactly one chunk and therefore one thread, which is how the first version of
+            // this got the solid size win and none of the speed. The library clamps up to the
+            // dictionary (8 MiB at preset 6), so on a 64 MiB block this lands at 8 chunks.
+            let chunk = (self.solid_max / u64::from(self.threads)).max(1);
+            Lzma2Options::from_level_mt(self.level, self.threads, chunk).into()
         } else {
             Lzma2Options::from_level(self.level).into()
         };
@@ -152,25 +373,85 @@ impl SevenZArchiveWriter {
 }
 
 impl ArchiveWriter for SevenZArchiveWriter {
+    fn takes_paths(&self) -> bool {
+        self.solid
+    }
+
+    fn add_path(&mut self, entry: &Entry, path: &Path, hint: WriteHint) -> Result<()> {
+        let file = File::open(path)
+            .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))?;
+
+        // Turning `takes_paths` on stops the engine probing inline, and a block must know every
+        // entry's verdict before it picks its single method chain. Same order of checks as
+        // `probe::classify_file`, sampled from the handle that is about to be kept -- getting this
+        // wrong took `sevenz_auto_stores_incompressible_per_entry` from 2 stored entries to 0, with
+        // no symptom but a larger archive.
+        let mut head = Vec::new();
+        let mut hint = hint;
+        if self.adaptive && entry.size > 0 {
+            match probe::ext_only_verdict(path) {
+                Some(verdict) => {
+                    hint = WriteHint {
+                        store: verdict.is_store(),
+                    }
+                }
+                None if entry.size >= probe::PROBE_MIN_SAMPLE => {
+                    (&file)
+                        .take(probe::PROBE_SAMPLE_BYTES)
+                        .read_to_end(&mut head)?;
+                    if !head.is_empty() {
+                        hint = WriteHint {
+                            store: probe::sample_verdict(&head).is_store(),
+                        };
+                    }
+                }
+                None => {}
+            }
+        }
+        // The sample goes back in front of the handle rather than being re-read. `head` is empty
+        // whenever no sampling happened, and chaining an empty cursor costs nothing.
+        let stream = Cursor::new(head).chain(file);
+
+        let store = hint.store || self.store_forced;
+        let adaptive_store = hint.store && !self.store_forced;
+        // An oversized entry never joins a block -- it is the one thing that could defeat the
+        // ceilings -- so flush what is open and stream it as its own pack.
+        if entry.size > self.solid_max {
+            self.flush_block()?;
+            let mut stream = stream;
+            return self.add_file_direct(entry, &mut stream, store, adaptive_store);
+        }
+        self.push_into_block(entry, BlockSource::Stream(stream), store, adaptive_store)
+    }
+
     fn add_file(&mut self, entry: &Entry, body: &mut dyn io::Read, hint: WriteHint) -> Result<()> {
         let store = hint.store || self.store_forced;
         let adaptive_store = hint.store && !self.store_forced;
-        // Swap the content-method chain for this entry, then push it as its own pack.
-        let methods = self.content_methods(store);
-        let sz_entry = ArchiveEntry::new_file(&arc_name(entry));
-        let w = self.writer()?;
-        w.set_content_methods(methods);
-        w.push_archive_entry(sz_entry, Some(body)).map_err(map_sz)?;
-        self.entries += 1;
-        self.in_bytes += entry.size;
-        if adaptive_store {
-            self.stored += 1;
+        if self.solid && entry.size <= self.solid_max {
+            // `conv` supplies a reader with no file behind it, so these bytes must be held.
+            let mut buf = Vec::with_capacity(entry.size.min(1 << 20) as usize);
+            body.read_to_end(&mut buf)?;
+            return self.push_into_block(
+                entry,
+                BlockSource::Bytes(Cursor::new(buf)),
+                store,
+                adaptive_store,
+            );
         }
-        Ok(())
+        if self.solid {
+            self.flush_block()?;
+        }
+        self.add_file_direct(entry, body, store, adaptive_store)
     }
 
     fn add_dir(&mut self, entry: &Entry) -> Result<()> {
         let sz_entry = ArchiveEntry::new_directory(&arc_name(entry));
+        if self.solid {
+            // Deferred to `finish`; see the `dirs` field for why.
+            self.dirs.push(sz_entry);
+            self.entries += 1;
+            return Ok(());
+        }
         self.writer()?
             .push_archive_entry(sz_entry, None::<io::Empty>)
             .map_err(map_sz)?;
@@ -179,6 +460,13 @@ impl ArchiveWriter for SevenZArchiveWriter {
     }
 
     fn finish(mut self: Box<Self>) -> Result<CreateReport> {
+        self.flush_block()?;
+        let dirs = std::mem::take(&mut self.dirs);
+        for dir in dirs {
+            self.writer()?
+                .push_archive_entry(dir, None::<io::Empty>)
+                .map_err(map_sz)?;
+        }
         let mut sz = self
             .sz
             .take()
