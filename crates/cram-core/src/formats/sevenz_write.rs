@@ -63,11 +63,24 @@ const AES_CYCLES_POWER: u8 = 19;
 /// It also pinned create to one core: a pack is compressed inline into the output stream, so packs
 /// cannot overlap.
 ///
-/// 64 MiB is a compromise, not a tuned number. Bigger blocks compress better and extract less
-/// randomly: pulling one file out of a solid block means decompressing the block up to it, which is
-/// what `cram mount` and single-entry extraction pay. At 64 MiB a 1.2 GB tree is ~19 blocks, which
-/// still leaves full-archive extraction parallel across them.
-const SOLID_BLOCK_BYTES: u64 = 64 << 20;
+/// 128 MiB, measured on a 1.19 GiB / 41,305-file tree at 8 threads with 8 MiB chunks:
+///
+/// | block | wall | peak RSS |
+/// |---|---|---|
+/// | 64 MiB | 104.9s | 786 MB |
+/// | **128 MiB** | **96.9s** | 854 MB |
+/// | 256 MiB | 96.5s | 968 MB |
+///
+/// 256 MiB buys nothing for the memory, and it costs on the other side of the trade. Two things get
+/// worse as blocks grow: pulling a *single* file out means decompressing its block up to that file,
+/// which is what `cram mount` and single-entry extraction pay; and full-archive extraction runs in
+/// parallel ACROSS blocks, so too few blocks caps it. This tree is ~10 blocks at 128 MiB and ~5 at
+/// 256 MiB — below the core count, where a bigger block would start buying create speed with
+/// extract speed.
+///
+/// For context, 7-Zip's own default is far more solid than this, so 128 MiB remains the
+/// random-access-friendly end of the choice rather than the aggressive one.
+const SOLID_BLOCK_BYTES: u64 = 128 << 20;
 
 /// Set to `0` to go back to one independently-decodable pack per entry: smaller random-access cost,
 /// much larger archive, single-threaded create.
@@ -75,6 +88,12 @@ const ENV_SOLID: &str = "CRAM_7Z_SOLID";
 
 /// Overrides [`SOLID_BLOCK_BYTES`], in bytes.
 const ENV_BLOCK: &str = "CRAM_7Z_BLOCK";
+
+/// Overrides the LZMA2 thread count, in place of [`lzma_threads`].
+const ENV_THREADS: &str = "CRAM_7Z_THREADS";
+
+/// Overrides the LZMA2 MT chunk size, in bytes. The library clamps it up to the dictionary.
+const ENV_CHUNK: &str = "CRAM_7Z_CHUNK";
 
 /// One entry's content, waiting for its block to be flushed: the probe's sample chained in front of
 /// the still-open handle it was read from.
@@ -193,6 +212,9 @@ pub struct SevenZArchiveWriter {
     /// Threads for LZMA2's own chunked multi-threading, which only does anything inside a block
     /// large enough to hold more than one chunk -- which is exactly what solid blocks create.
     threads: u32,
+    /// LZMA2 MT chunk size in bytes. Independent of the thread count on purpose: see
+    /// [`Self::content_methods`].
+    chunk: u64,
     /// The block being filled: entries, their unread sources, and total source bytes.
     block: Vec<(ArchiveEntry, BlockSource)>,
     block_bytes: u64,
@@ -248,7 +270,16 @@ impl SevenZArchiveWriter {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(SOLID_BLOCK_BYTES)
                 .max(1),
-            threads: lzma_threads(lzma_level(opts.level)),
+            threads: std::env::var(ENV_THREADS)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or_else(|| lzma_threads(lzma_level(opts.level)))
+                .clamp(1, 64),
+            chunk: std::env::var(ENV_CHUNK)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or_else(|| dict_mib(lzma_level(opts.level)) << 20)
+                .max(1),
             block: Vec::new(),
             block_bytes: 0,
             block_store: false,
@@ -351,10 +382,14 @@ impl SevenZArchiveWriter {
             //
             // The chunk must be a FRACTION of the block. Passing the block size itself makes every
             // block exactly one chunk and therefore one thread, which is how the first version of
-            // this got the solid size win and none of the speed. The library clamps up to the
-            // dictionary (8 MiB at preset 6), so on a 64 MiB block this lands at 8 chunks.
-            let chunk = (self.solid_max / u64::from(self.threads)).max(1);
-            Lzma2Options::from_level_mt(self.level, self.threads, chunk).into()
+            // this got the solid size win and none of the speed.
+            //
+            // It should NOT be block ÷ threads either, which was the second version: that pins the
+            // chunk count to the thread count, so every block ends with all threads draining a
+            // partial tail before the next one can start. Defaulting to the dictionary size -- the
+            // smallest the library will accept -- gives the most chunks a block can hold, so there
+            // is still work to pick up while the stragglers finish.
+            Lzma2Options::from_level_mt(self.level, self.threads, self.chunk).into()
         } else {
             Lzma2Options::from_level(self.level).into()
         };
