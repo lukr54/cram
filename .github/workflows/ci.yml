@@ -350,6 +350,12 @@ jobs:
           cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md README.md "$dist"/
           tar -czf "$dist.tar.gz" "$dist"
           sha256sum "$dist.tar.gz" > SHA256SUMS
+          # Version-free copy, for the same reason as the Windows one above: a
+          # /releases/latest/download/<asset> link only survives a release if the filename does not
+          # move with the tag. The README linked the versioned Linux and macOS names and both 404ed
+          # the moment 1.1.0 shipped. Deliberately not a second checksum entry, so there is exactly
+          # one authoritative hash per release. The upload glob below already matches it.
+          cp "$dist.tar.gz" cram-latest-x86_64-unknown-linux-gnu.tar.gz
 
       - name: Upload to the release
         env:
@@ -391,6 +397,8 @@ jobs:
           cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md README.md "$dist"/
           tar -czf "$dist.tar.gz" "$dist"
           shasum -a 256 "$dist.tar.gz" > SHA256SUMS.macos
+          # Version-free copy. See the Linux job for why. The upload glob already matches it.
+          cp "$dist.tar.gz" cram-latest-aarch64-apple-darwin.tar.gz
 
       - name: Upload to the release
         env:

@@ -38,7 +38,9 @@ has a native format (`.cram`) that stores repeated data once and losslessly repa
 ## Speed
 
 Creating an archive from 2.8 GB and 42,151 files, on a 24-thread Ryzen 9 5900X. Each tool at its
-own default effort, median of three runs:
+own default effort, median of three runs. **Measured on Cram 1.0.0** and not re-run since: 1.1.0
+changed duplicate scanning and the directory walk, not the compression path, but that is a reason to
+expect the numbers to hold rather than evidence that they do.
 
 | | create | archive | peak memory |
 |---|---|---|---|
@@ -76,13 +78,13 @@ loses. Those rows are in the same tables as the ones above.
 
 ## Download
 
-Cram 1.0.0, from the [releases page](https://github.com/lukr54/cram/releases/latest):
+Cram 1.1.0, from the [releases page](https://github.com/lukr54/cram/releases/latest):
 
 | | |
 |---|---|
 | Windows | [`cram-latest-x86_64-pc-windows-gnu.zip`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-pc-windows-gnu.zip) |
-| Linux (x86-64) | [`cram-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-v1.0.0-x86_64-unknown-linux-gnu.tar.gz) |
-| macOS (Apple Silicon) | [`cram-v1.0.0-aarch64-apple-darwin.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-v1.0.0-aarch64-apple-darwin.tar.gz) |
+| Linux (x86-64) | [`cram-latest-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-unknown-linux-gnu.tar.gz) |
+| macOS (Apple Silicon) | [`cram-latest-aarch64-apple-darwin.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-aarch64-apple-darwin.tar.gz) |
 | Cram Studio, Windows GUI | [`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) |
 | Firefox hand-off add-on | [`cram-handoff-latest.xpi`](https://github.com/lukr54/cram/releases/latest/download/cram-handoff-latest.xpi) — [what it does](#downloading-and-handing-a-browser-download-to-cram), needs Studio |
 
@@ -199,10 +201,11 @@ and work on **any file**, not just Cram's own formats. The self-extracting `.exe
 ### Windows
 
 [`cram-latest-x86_64-pc-windows-gnu.zip`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-pc-windows-gnu.zip),
-or the versioned `cram-v1.0.0-x86_64-pc-windows-gnu.zip` from the
+or the versioned `cram-v1.1.0-x86_64-pc-windows-gnu.zip` from the
 [releases page](https://github.com/lukr54/cram/releases/latest). Both are the same bytes; the
-version-free name exists so a `releases/latest/download/…` link keeps working across releases.
-`SHA256SUMS.windows` is published beside them.
+version-free name exists so a `releases/latest/download/…` link keeps working across releases, and
+every platform now has one. `SHA256SUMS.windows` covers the versioned name, which is the one
+`cram update` fetches and the single authoritative hash for the release.
 
 The zip holds `cram.exe`, `cram-extract.exe`, `cram_shell.dll` (the Explorer right-click menu, which
 does nothing until you run `cram shell install`) and `libwinpthread-1.dll`, which `cram.exe` links
@@ -459,18 +462,33 @@ It is built to stay cheap on collections far too large to hash end to end. Three
 a file whose **size** is unique in the whole set cannot have a byte-identical twin and is never read
 at all; same-size files are separated by a **partial hash** of their first and last 64 KiB; only what
 survives both is read in full and confirmed with **BLAKE3**. On a real pile the vast majority of bytes
-are never touched, the run prints how much it actually had to read. Reads are also scheduled per
+are never touched, the run prints how much it actually had to read, and it reports the running counts
+while it is still walking rather than going silent for the minutes a whole drive takes. Reads are also scheduled per
 drive: every volume is worked at once, but with one sequential reader on a spinning disk and several
 on an SSD, because parallel reads make an HDD slower rather than faster.
 
 `--similar` additionally finds images that *look* the same without being byte-identical, a resized
 copy, a re-save at lower quality, the version a messaging app recompressed. These are reported
-**separately and are never counted as reclaimable space**, because a perceptual hash cannot tell a
+**separately and are never counted as reclaimable space**, because no automatic test can tell a
 redundant re-encode from two different frames of a burst. They are a shortlist to look through by
-hand. `--similar-distance` tunes how alike is alike (0 = identical
-hash, default 8); it needs a build with the `phash` feature. HEIC/HEIF and camera RAW are not decoded
-for similarity (that needs a C library), though they are still covered by exact-duplicate detection,
+hand. It needs a build with the `phash` feature. HEIC/HEIF and camera RAW are not decoded for
+similarity (that needs a C library), though they are still covered by exact-duplicate detection,
 which never decodes anything.
+
+A perceptual hash alone is not enough to group by, and 1.1.0 stopped doing it. Hash matches were
+unioned, which is single-linkage clustering: A joins B and B joins C, so one bridging pair merges
+two sets that resemble each other not at all. One real scan put 936 different terminal screenshots
+in a single group. Tightening `--similar-distance` cannot fix that, because single-linkage always
+finds a bridge.
+
+The hash is now a **shortlist**. A proposed pair is confirmed against the pixels before anything is
+grouped: same aspect ratio within 10%, then a mean absolute difference no greater than 0.007 over a
+64x64 **colour** render. Colour is the point — throwing away chroma is what makes a hash robust, and
+it is also what makes two unrelated dark terminals look identical. Only images that reached a
+candidate pair are decoded again, so the cost is bounded by what the hash proposed rather than by
+the size of the scan; a file that has become unreadable since the first pass falls back to the
+hash's opinion rather than vanishing from the report. So `--similar-distance` (0 = identical hash,
+default 8) widens or narrows what gets *considered*, and the pixel test decides what is reported.
 
 #### Reclaiming the space
 
@@ -631,6 +649,13 @@ from 1.1 GB on a folder of photographs, where there is nothing to find and it sa
 
 Creating one is the same set of choices the CLI exposes: container, effort, and whether to encrypt,
 sign or write a recovery record. Studio follows the system light and dark theme.
+
+Duplicate results open as a gallery when they are photos or video, because a set of images cannot be
+judged from a list of paths: thumbnails, per-file or whole-row selection, and a full-size viewer
+that steps through a set with the arrows so two near-identical shots land in the same place on
+screen. Studio can also delete duplicates, which the command line deliberately never does — to the
+Recycle Bin, behind a button that has to be held. Everything the CLI reports is the same underneath;
+what Studio adds is being able to see it.
 
 **Studio is proprietary and sold under its own EULA.** The MIT OR Apache-2.0 licence on this page
 covers the engine and the CLI in this repository and nothing else. The Studio installer ships as an

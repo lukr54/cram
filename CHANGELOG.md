@@ -50,8 +50,12 @@ separate proprietary product under its own EULA.
   resemble each other not at all. Tightening the hash threshold could not have fixed it, because
   single-linkage always finds a bridge. A candidate pair is now verified against the pixels — same
   aspect ratio within 10%, and a mean absolute difference no greater than 0.007 over a 64-pixel
-  render. Measured on the case that produced the complaint: a genuine resized copy scores 0.0037,
-  two different captures of the same terminal score 0.0132.
+  colour render. Colour matters here: discarding chroma is what makes a *hash* robust, and it is
+  also what makes two unrelated dark terminals look identical. The threshold sits between the
+  noisiest thing that must stay together (a photo resized and re-encoded at JPEG q40, 0.0037) and
+  the closest thing that must separate (two different terminals, 0.0132) — about 1.9x from each. A
+  retake of the same terminal with one word changed scores 0.0009 and stays grouped. Those are
+  synthetic images, so treat the margin as real but not generous.
 
 - **A cancelled extraction took back more than it wrote.** It now removes only files and directories
   that did not exist when it created them, so cancelling an extraction into a folder that already

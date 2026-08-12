@@ -15,12 +15,14 @@ features are.
 
 | version | supported |
 |---|---|
-| 1.0.x | yes |
+| 1.1.x | yes |
+| 1.0.x | no — upgrade to 1.1.x |
 | < 1.0 | there is nothing earlier |
 
-**1.0.0 is the first release** (6 August 2026), so `1.0.x` is the supported line and there is
-nothing to backport to. A fix ships in the next patch release; between releases it is on `main` and
-available by building from source.
+**1.0.0 was the first release** (6 August 2026) and 1.1.0 is current (12 August 2026). Only the
+newest minor line is supported: there is one maintainer and no backport branch, so a fix ships in
+the next release rather than being carried backwards. Between releases it is on `main` and available
+by building from source.
 
 `cram --version` reports the version and which optional features the binary carries. That matters
 in a report: a `zstd-c` build writes different `.cram` bytes than the pure-Rust default, so the two

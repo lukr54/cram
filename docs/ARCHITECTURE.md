@@ -214,6 +214,22 @@ on and every volume is worked at once, but the reader count within a volume come
 [`hw`](../crates/cram-core/src/hw.rs) media detection the extractor uses: one sequential reader on a
 spinning disk, several on an SSD.
 
+`--similar` is a **two-stage** pipeline, and the split is the point. A dHash (9×8 greyscale, 72
+pixels) over a banded LSH index proposes candidate *pairs*; only then is each pair confirmed against
+a 64×64 colour render before the union-find joins anything. Grouping on the hash alone is
+single-linkage clustering, so a single bridging pair welds two unrelated sets together and no
+threshold prevents it — 72 greyscale pixels cannot tell two dark terminal captures apart. Only images
+that reached a candidate pair are decoded a second time, so the confirm stage is bounded by what the
+hash proposed rather than by the size of the scan.
+
+**Both tree walks carry their own stack** rather than recursing — the duplicate scan here and
+`engine::create`'s member collection. Recursion made depth a function of the thread's stack size, and
+a scan worker's 2 MiB ran out at roughly 640 levels and died with a hardware exception that unwinds
+nothing. Past 1,000 levels the scan walk also checks file identity and stops when it reaches
+somewhere it has already been, which is what bounds a directory cycle. Neither walk changed its
+emission order, and create's ordering has a test that says so. The scan reports counts through
+`Progress::on_scan_progress` while it is still walking, at most every 250 ms.
+
 `reclaim` ([`engine/reclaim.rs`](../crates/cram-core/src/engine/reclaim.rs)) is the acting half, kept
 in its own module so the read-only scan cannot accidentally reach a destructive path. `plan` filters
 on `GroupKind::Exact`, which is what keeps perceptual "similar" findings structurally unreachable from
