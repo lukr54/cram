@@ -143,7 +143,11 @@ fn main() -> ExitCode {
             }
             Some(Err(e)) => {
                 eprintln!("cram: {e}");
-                if args.get(1).map(String::as_str) != Some("diag") {
+                // Pointing at the wrong thing is not a bug report. A crash-style report for a typo
+                // buries the genuine ones and makes a tool that correctly said no look like it fell
+                // over.
+                let usage_mistake = matches!(e, cram_core::error::ArchiveError::NotAnArchive(_));
+                if !usage_mistake && args.get(1).map(String::as_str) != Some("diag") {
                     // With diagnostics on the report is written here, because the recording is in
                     // this process and dies with it. With them off nothing is written and the user
                     // is told how to get one, rather than having a file appear uninvited.

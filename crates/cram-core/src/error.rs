@@ -12,6 +12,12 @@ pub enum ArchiveError {
     #[error("unsupported or unrecognized archive format")]
     UnsupportedFormat,
 
+    /// A folder was given where an archive was expected. Its own variant because the alternative is
+    /// whatever the OS says about opening a directory as a file, and on Windows that is "Access is
+    /// denied" — which sends people hunting for a permissions problem that does not exist.
+    #[error("{0} is a folder, not an archive")]
+    NotAnArchive(String),
+
     #[error("corrupt archive: {0}")]
     Corrupt(String),
 

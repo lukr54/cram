@@ -104,6 +104,12 @@ fn sniff_ext(name: &str) -> Option<Format> {
 /// Detect the format of a file: read a prefix, match magic, then use the name to (a) upgrade a
 /// bare codec stream to a `.tar.*`, and (b) fall back when there's no magic.
 pub fn sniff_path(path: &Path) -> Result<Format> {
+    // Checked before the open, not after: every read verb funnels through here, and a directory
+    // handed to any of them would otherwise surface as the platform's error for opening a folder as
+    // a file. Naming the mistake is the whole point.
+    if path.is_dir() {
+        return Err(ArchiveError::NotAnArchive(path.display().to_string()));
+    }
     let mut head = [0u8; 512];
     let n = File::open(path)?.read(&mut head).unwrap_or(0);
     let head = &head[..n];
@@ -176,5 +182,21 @@ mod tests {
         let mut head = vec![0u8; 300];
         head[257..262].copy_from_slice(b"ustar");
         assert_eq!(sniff_bytes(&head).unwrap(), Format::tar(Codec::None));
+    }
+
+    /// A folder must be named as such rather than reported as whatever the platform says about
+    /// opening a directory as a file — on Windows that is "Access is denied", which reads as a
+    /// permissions fault.
+    #[test]
+    fn a_directory_is_not_an_archive() {
+        let dir = std::env::temp_dir().join("cram-sniff-dir-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = sniff_path(&dir).unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::NotAnArchive(_)),
+            "expected NotAnArchive, got {err:?}"
+        );
+        assert!(err.to_string().contains("is a folder, not an archive"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
