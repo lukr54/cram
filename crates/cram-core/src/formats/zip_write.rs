@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::time::{Instant, SystemTime};
 
@@ -35,10 +36,21 @@ const ZIP64_THRESHOLD: u64 = 0xFFFF_FFFF;
 /// storm, and a handful of huge entries parallelise poorly anyway.
 const PARALLEL_ENTRY_MAX: u64 = 64 << 20;
 
-/// Ceiling on bytes owned by in-flight jobs. Compression is faster than the disk can feed it on a
-/// tree of small files, so without this the queue would run ahead of the writer and the whole
-/// archive would be resident before the first byte landed.
-const PARALLEL_INFLIGHT_MAX: u64 = 256 << 20;
+/// Ceiling on source bytes owned by in-flight jobs, and the real memory bound. Compression is
+/// faster than the disk can feed it on a tree of small files, so without this the queue would run
+/// ahead of the writer and the whole archive would be resident before the first byte landed.
+/// Compressed output is held too, so peak residency is up to roughly twice this.
+const PARALLEL_INFLIGHT_MAX: u64 = 128 << 20;
+
+/// How many jobs may be outstanding, when the byte ceiling has not already stopped them.
+///
+/// This is deliberately far larger than the pool. It is not a memory bound -- `PARALLEL_INFLIGHT_MAX`
+/// is -- it exists to hide head-of-line stalls: the writer thread blocks on the *oldest* job, and
+/// entry durations on a real tree span three orders of magnitude, so a shallow queue leaves every
+/// worker idle while the writer waits on one slow file. Measured on a 41,305-file tree, 16 threads:
+/// depth 32 gave 11.24s, 128 gave 8.89s, 512 gave 7.81s, 2048 gave 6.68s, and 4096/8192 gave
+/// nothing further. The knee is here.
+const PARALLEL_DEPTH: usize = 2048;
 
 /// Set to any value to compress ZIP entries on the calling thread, as this backend did before the
 /// parallel path existed. The two produce byte-identical archives, so this is a diagnostic: if a
@@ -48,6 +60,10 @@ const ENV_SEQUENTIAL: &str = "CRAM_ZIP_SEQUENTIAL";
 /// Overrides [`PARALLEL_ENTRY_MAX`], in bytes. Exists so the oversized-entry fallback can be tested
 /// without writing a 64 MiB fixture.
 const ENV_ENTRY_MAX: &str = "CRAM_ZIP_ENTRY_MAX";
+
+/// Overrides [`PARALLEL_DEPTH`]. The knee is machine- and tree-shaped, so it is worth being able to
+/// re-find it on hardware that is not this one.
+const ENV_DEPTH: &str = "CRAM_ZIP_DEPTH";
 
 fn map_zip_write(e: ZipError) -> ArchiveError {
     match e {
@@ -235,7 +251,11 @@ impl ZipArchiveWriter {
             adaptive: opts.level == Level::Auto && opts.codec.is_none(),
             pending: VecDeque::new(),
             inflight_bytes: 0,
-            depth: (rayon::current_num_threads() * 2).max(2),
+            depth: std::env::var(ENV_DEPTH)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(PARALLEL_DEPTH)
+                .max(2),
             entry_max,
             prof_recv: 0,
             prof_parse: 0,
@@ -353,6 +373,17 @@ impl ZipArchiveWriter {
     }
 }
 
+/// Core-time spent inside the workers, summed across threads. Printed under `CRAM_PROFILE`.
+/// Compared against wall these say which phase is actually running wide, which is not something
+/// the writer thread's own wait time can distinguish.
+mod wprof {
+    use std::sync::atomic::AtomicU64;
+    pub static READ_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub static PROBE_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub static ZIP_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub static FILES: AtomicU64 = AtomicU64::new(0);
+}
+
 /// Compress one file into a complete single-entry ZIP, off the writer thread.
 ///
 /// The store-vs-compress decision is made here from the bytes already in hand. It must match
@@ -367,9 +398,13 @@ fn compress_one(
     adaptive: bool,
     hint: WriteHint,
 ) -> Result<DoneEntry> {
+    let t_read = Instant::now();
     let data = std::fs::read(&path)
         .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))?;
+    wprof::READ_NANOS.fetch_add(t_read.elapsed().as_nanos() as u64, Relaxed);
+    wprof::FILES.fetch_add(1, Relaxed);
 
+    let t_probe = Instant::now();
     let mut hint = hint;
     if adaptive && !data.is_empty() {
         match probe::ext_only_verdict(&path) {
@@ -393,14 +428,17 @@ fn compress_one(
     } else {
         method
     };
+    wprof::PROBE_NANOS.fetch_add(t_probe.elapsed().as_nanos() as u64, Relaxed);
 
     // No `large_file`: PARALLEL_ENTRY_MAX keeps every entry on this path far below 4 GiB, and the
     // caller streams anything bigger.
+    let t_zip = Instant::now();
     let opts = file_options(entry_method, level, None, false, modified);
     let mut inner = ZipCrateWriter::new(Cursor::new(Vec::with_capacity(data.len() / 2 + 512)));
     inner.start_file(name, opts).map_err(map_zip_write)?;
     io::Write::write_all(&mut inner, &data)?;
     let cursor = inner.finish().map_err(map_zip_write)?;
+    wprof::ZIP_NANOS.fetch_add(t_zip.elapsed().as_nanos() as u64, Relaxed);
     Ok(DoneEntry {
         zip_bytes: cursor.into_inner(),
         in_bytes: data.len() as u64,
@@ -532,6 +570,29 @@ impl ArchiveWriter for ZipArchiveWriter {
                 "raw_copy_file   {:9.1} ms   {:6.1} us/entry",
                 ms(self.prof_copy),
                 per(self.prof_copy)
+            );
+            let files = wprof::FILES.load(Relaxed).max(1);
+            let core = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed) as f64 / 1e6;
+            eprintln!(
+                "-- zip workers (summed over threads) -- pool {} threads, queue depth {} --",
+                rayon::current_num_threads(),
+                self.depth
+            );
+            eprintln!(
+                "read file       {:9.1} ms   {:6.1} us/file",
+                core(&wprof::READ_NANOS),
+                core(&wprof::READ_NANOS) * 1e3 / files as f64
+            );
+            eprintln!(
+                "probe           {:9.1} ms   {:6.1} us/file",
+                core(&wprof::PROBE_NANOS),
+                core(&wprof::PROBE_NANOS) * 1e3 / files as f64
+            );
+            eprintln!(
+                "build 1-entry   {:9.1} ms   {:6.1} us/file   ({} files)",
+                core(&wprof::ZIP_NANOS),
+                core(&wprof::ZIP_NANOS) * 1e3 / files as f64,
+                files
             );
         }
         let zw = self
