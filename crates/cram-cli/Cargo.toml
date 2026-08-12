@@ -2,11 +2,11 @@
 name = "cram-cli"
 # Deliberately not `version.workspace = true`. 1.0.0 went to crates.io without the windows-gnu link
 # flags (they were only in .cargo/config.toml, which is not published) and could not link there. A
-# published version is immutable, so the fix in build.rs only reaches anyone as a new number. The
-# other crates in the workspace are unaffected and stay at 1.0.0; this depends on them as ^1.0.0,
-# which the published 1.0.0 satisfies. The divergence from the v1.0.0 git tag is the point: the
-# crates.io package genuinely differs from what that tag builds.
-version = "1.0.2"
+# published version is immutable, so the fix in build.rs only reached anyone as a new number: 1.0.1,
+# which the rest of the workspace skipped. They have moved together since 1.0.2, so this is the same
+# number as the workspace today and the override is kept only so the two can diverge again if
+# another crates.io-only fix is ever needed.
+version = "1.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -29,13 +29,13 @@ path = "src/main.rs"
 # workspace and rewrites the dependency to the version when packaging for crates.io. Without the
 # version, `cargo publish` refuses the crate outright.
 [dependencies]
-cram-core = { path = "../cram-core", version = "1.0.2" }
+cram-core = { path = "../cram-core", version = "1.1.0" }
 # Reading the release JSON for `cram update`. Optional, so a default build (no `download`) does not
 # compile it; already in the graph via rdm-core, so it costs nothing extra in a shipped build.
 serde_json = { version = "1", optional = true }
-cram-mount = { path = "../cram-mount", version = "1.0.2" }
-cram-recovery = { path = "../cram-recovery", version = "1.0.2" }
-cram-sign = { path = "../cram-sign", version = "1.0.2" }
+cram-mount = { path = "../cram-mount", version = "1.1.0" }
+cram-recovery = { path = "../cram-recovery", version = "1.1.0" }
+cram-sign = { path = "../cram-sign", version = "1.1.0" }
 
 [features]
 default = []

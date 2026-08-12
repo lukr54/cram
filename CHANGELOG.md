@@ -7,6 +7,82 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.1.0] - 2026-08-12
+
+Mostly work on finding duplicates, and on what you can see and do with the result. The engine gains
+progress reporting and a verification pass; Cram Studio gains a gallery, a full-size viewer and the
+ability to delete. As with every release here, the Cram Studio installer ships as an asset and is a
+separate proprietary product under its own EULA.
+
+### Added
+
+- **A duplicate scan reports what it has found while it is still running.** A scan over a whole
+  drive spends minutes walking before it can group anything, and until now it said nothing for all
+  of it, which is indistinguishable from being hung. `Progress::on_scan_progress(files, dirs)` is
+  called at most every 250 ms, and Studio shows the running counts.
+
+- **Photos and video open in their own tab in Cram Studio, as a gallery.** A duplicate set of
+  images cannot be judged from a list of paths, so image and video sets now go to a separate tab
+  with thumbnails, per-file or whole-row selection, and identical and look-alike kept on separate
+  panes. Everything that is not an image or a video stays where it was: a thumbnail of a `.dll`
+  tells you nothing.
+
+- **A full-size preview behind every thumbnail**, from the magnifier on hover or a double-click.
+  The arrows step through the set with both neighbours prefetched, and the image is contained in a
+  fixed stage so two near-identical shots land in the same place and only the difference moves.
+  Where the file is small enough and the format is one the view can draw directly, the original
+  bytes are shown rather than a re-encode, so nothing you are judging is an artefact of the
+  preview; when it does have to downscale, it says so.
+
+- **Duplicates can be deleted from Cram Studio, to the Recycle Bin.** Deliberately not a button you
+  can hit in passing: it has to be held, it says how many and how much, and everything goes to the
+  Recycle Bin so a mistake is recoverable from Explorer. Selecting every copy in a set raises a
+  warning rather than being forbidden.
+
+- **The hard-link option explains itself**, behind a `?` beside it, and a duplicate can be shown in
+  its folder rather than only named.
+
+### Fixed
+
+- **A look-alike group could swallow hundreds of unrelated images.** One scan put 936 different
+  terminal screenshots in a single group. Grouping was by perceptual hash alone, unioned, which is
+  single-linkage clustering: A joins B and B joins C, so one bridging pair merges two sets that
+  resemble each other not at all. Tightening the hash threshold could not have fixed it, because
+  single-linkage always finds a bridge. A candidate pair is now verified against the pixels — same
+  aspect ratio within 10%, and a mean absolute difference no greater than 0.007 over a 64-pixel
+  render. Measured on the case that produced the complaint: a genuine resized copy scores 0.0037,
+  two different captures of the same terminal score 0.0132.
+
+- **A cancelled extraction took back more than it wrote.** It now removes only files and directories
+  that did not exist when it created them, so cancelling an extraction into a folder that already
+  held a file of the same name leaves that file alone.
+
+- **A directory cycle walked forever.** Past 1,000 levels the walk checks file identity and stops
+  when it reaches somewhere it has already been. Legitimately deep trees are unaffected, which has
+  a test.
+
+- **Thumbnails were drawn at roughly a quarter of the resolution they were displayed at.** The
+  request was sized in CSS pixels rather than device pixels, the result was then cropped to fill and
+  upscaled again, the fast integer resampler aliased text, and JPEG's default quality rang around
+  every glyph edge. Now: sized from the display's pixel ratio, Lanczos3, quality 90, and the whole
+  image shown rather than a crop. Against a perfect render at the display size, 12.4x closer for
+  4.1x the bytes.
+
+- **Installing a new version over an old one failed with Cram Studio closed.** `cram shell install`
+  registers `cram_shell.dll` as an in-process context-menu handler, so the first right-click after
+  an install maps it into `explorer.exe`, which does not let go; the installer then could not open
+  it for writing. Explorer is not something an installer can close, and the check for a running app
+  looks for Studio rather than Explorer. A mapped file can still be renamed, so the installer now
+  moves the old one aside and writes the new one over the name it vacated. Explorer keeps serving
+  right-clicks from the previous version until it next restarts, which is a better outcome than an
+  install that will not proceed.
+
+- **The browser hand-off left Firefox's own copy of every download on disk.** The add-on called
+  `downloads.erase()`, which removes the entry from Firefox's history and never touches the file.
+  Deleting the bytes is `downloads.removeFile()`, which was not called at all. The leftover file
+  also explains the `file(1).type` names: Cram found its own destination taken and uniquified around
+  it. The add-on needs updating separately from Cram itself.
+
 ## [1.0.2] - 2026-08-11
 
 Skips 1.0.1, which the CLI already used for a crates.io-only release. `cram --version` and Studio's
@@ -268,4 +344,6 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
      "fixes" the published notes by moving them. -->
 
 [1.0.0]: https://github.com/lukr54/cram/releases/tag/v1.0.0
-[Unreleased]: https://github.com/lukr54/cram/compare/v1.0.0...HEAD
+[1.0.2]: https://github.com/lukr54/cram/releases/tag/v1.0.2
+[1.1.0]: https://github.com/lukr54/cram/releases/tag/v1.1.0
+[Unreleased]: https://github.com/lukr54/cram/compare/v1.1.0...HEAD
