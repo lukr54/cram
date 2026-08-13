@@ -424,6 +424,10 @@ struct BlockSegments {
     /// segment boundary for a straddling entry knows where the stream really ends.
     pack_end: u64,
     segs: Vec<lzma2seg::Segment>,
+    /// The dictionary size the archive declares for this block, when it declares a usable one.
+    /// Exact, and far smaller than a segment: 7-Zip's default writes 32 MiB dictionaries into
+    /// 128 MiB thread blocks, so having it is worth roughly a quarter of the peak memory.
+    dict: Option<u32>,
     /// `(archive file index, uncompressed offset within the block, size)`, in archive order.
     layout: Vec<(usize, u64, u64)>,
 }
@@ -695,6 +699,7 @@ impl SevenZRandomAccess {
                 block: b,
                 pack_end: start + len,
                 segs,
+                dict: lzma2seg::declared_dict(block.coders[0].properties()),
                 layout: std::mem::take(&mut layouts[b]),
             });
         }
@@ -861,7 +866,8 @@ impl SevenZRandomAccess {
         file.seek(std::io::SeekFrom::Start(seg.comp_off))
             .map_err(|e| ArchiveError::Backend(format!("{}: {e}", self.path.display())))?;
         let src = file.take(g.pack_end.saturating_sub(seg.comp_off));
-        let mut r = lzma_rust2::Lzma2Reader::new(src, lzma2seg::dict_window(seg, spill), None);
+        let mut r =
+            lzma_rust2::Lzma2Reader::new(src, lzma2seg::dict_window(seg, spill, g.dict), None);
 
         // Reads after a decode error can hang; see [`FuseOnError`]. Wrapping the reader once here
         // covers both the visitor and the drains below it.

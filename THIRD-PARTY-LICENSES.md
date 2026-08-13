@@ -238,7 +238,7 @@ Applies to:
 
 Applies to:
 - `lzma-rust2` 0.16.5
-- `sevenz-rust2` 0.21.3
+- `sevenz-rust2-cram` 0.21.3
 
 ```text
                                  Apache License

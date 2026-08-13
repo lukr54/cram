@@ -429,7 +429,7 @@ dependencies = [
  "rdm-core",
  "reqwest",
  "ruzstd",
- "sevenz-rust2",
+ "sevenz-rust2-cram",
  "sha2 0.10.9",
  "tar",
  "thiserror",
@@ -2218,10 +2218,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sevenz-rust2"
+name = "sevenz-rust2-cram"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b5d71c87d24cb22976f3f6e6c2c9296ef1f6958394e2b868d56ca01b082798a"
+checksum = "d3d2014aae73a7f3123476f428a12050a61b842006d89d536c49573cbf0f9ad2"
 dependencies = [
  "aes 0.9.1",
  "bzip2",
