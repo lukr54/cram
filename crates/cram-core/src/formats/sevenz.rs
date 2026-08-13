@@ -652,6 +652,77 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
         true
     }
 
+    fn streams_units(&self) -> bool {
+        true
+    }
+
+    /// One pass per block, entries handed over as they decode. Nothing is buffered, so extracting or
+    /// verifying a 7z costs the copy buffer rather than a block per worker.
+    ///
+    /// Grouped by block rather than assuming one, because the engine's collision groups are formed
+    /// from destination names and a fused cluster can in principle span blocks. Blocks are visited in
+    /// increasing order and entries within a block in archive order, which together is archive order,
+    /// so two entries resolving to one destination still land last-writer-wins.
+    fn copy_unit(
+        &self,
+        indices: &[usize],
+        visit: &mut dyn FnMut(usize, &mut dyn Read) -> bool,
+    ) -> Result<()> {
+        let mut by_block: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
+        let mut streamless = Vec::new();
+        for &i in indices {
+            match self.loc.get(i).copied().flatten() {
+                Some((block, file_idx)) => by_block.entry(block).or_default().push((file_idx, i)),
+                // A directory or an empty file: no block holds it, and it costs nothing to serve.
+                None => streamless.push(i),
+            }
+        }
+        for i in streamless {
+            if !visit(i, &mut io::empty()) {
+                return Ok(());
+            }
+        }
+
+        for (block, mut want) in by_block {
+            want.sort_unstable();
+            let mut file = std::fs::File::open(&self.path)
+                .map_err(|e| ArchiveError::Backend(format!("{}: {e}", self.path.display())))?;
+            // One thread: parallelism comes from decoding different blocks at once, and asking for
+            // more here would oversubscribe every worker against every other.
+            let decoder =
+                sevenz_rust2::BlockDecoder::new(1, block, &self.archive, &self.password, &mut file);
+            let first = self.archive.stream_map.block_first_file_index[block];
+            let mut n = 0usize;
+            let mut pos = 0usize;
+            let mut stopped = false;
+            decoder
+                .for_each_entries(&mut |_entry, reader| {
+                    let file_idx = first + n;
+                    n += 1;
+                    if pos < want.len() && want[pos].0 == file_idx {
+                        let index = want[pos].1;
+                        pos += 1;
+                        if !visit(index, &mut *reader) {
+                            stopped = true;
+                        }
+                    }
+                    // Whatever the visitor did not take still has to go through the decoder: the
+                    // block is one stream and the next entry begins where this one ends.
+                    io::copy(reader, &mut io::sink())?;
+                    // Nothing later in this block is wanted, so stop rather than decode it for
+                    // nobody. This is what makes extracting a handful of entries from a large solid
+                    // block cost the prefix rather than the whole thing.
+                    Ok(!stopped && pos < want.len())
+                })
+                .map_err(map_sevenz)?;
+            if stopped {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     fn decode_units(&self) -> Option<usize> {
         Some(self.blocks)
     }
@@ -904,6 +975,86 @@ mod gate_tests {
             SevenZRandomAccess::build_within(&path, &secret, &entries, 1).is_none(),
             "a shared block that cannot be cached must fall back to the sequential path"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unit pass must hand over every entry, in archive order, with the right bytes. This is the
+    /// path extraction and `cram t` both take, so a fault here is silent wrong output.
+    #[test]
+    fn copy_unit_serves_every_entry_in_archive_order() {
+        let dir = scratch("unit-all");
+        let (path, entries) = two_block_archive(&dir, 512 * 1024);
+        let secret = Secret::new(String::new());
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+
+        let all: Vec<usize> = (0..entries.len())
+            .filter(|&i| entries[i].kind == EntryKind::File)
+            .collect();
+        let mut seen = Vec::new();
+        crate::reader::RandomAccessReader::copy_unit(&ra, &all, &mut |i, body| {
+            let mut got = Vec::new();
+            body.read_to_end(&mut got).unwrap();
+            seen.push((i, got));
+            true
+        })
+        .unwrap();
+
+        assert_eq!(seen.len(), all.len(), "every entry must be served once");
+        let order: Vec<usize> = seen.iter().map(|(i, _)| *i).collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(order, sorted, "entries must arrive in archive order");
+        for (i, got) in &seen {
+            let name = entries[*i].path.safe().file_name().unwrap();
+            assert_eq!(*got, std::fs::read(dir.join("src").join(name)).unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asking for part of a block must serve exactly that part. The entries around it still have to
+    /// be decoded to reach it, but they must not be handed over.
+    #[test]
+    fn copy_unit_serves_only_the_entries_asked_for() {
+        let dir = scratch("unit-some");
+        let (path, entries) = two_block_archive(&dir, 512 * 1024);
+        let secret = Secret::new(String::new());
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+
+        let files: Vec<usize> = (0..entries.len())
+            .filter(|&i| entries[i].kind == EntryKind::File)
+            .collect();
+        let want = vec![files[1], files[3]];
+        let mut seen = Vec::new();
+        crate::reader::RandomAccessReader::copy_unit(&ra, &want, &mut |i, body| {
+            let mut got = Vec::new();
+            body.read_to_end(&mut got).unwrap();
+            seen.push(i);
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A visitor that returns `false` is cancelling, and the pass must stop rather than decode the
+    /// rest of the block for nobody.
+    #[test]
+    fn copy_unit_stops_when_the_visitor_says_so() {
+        let dir = scratch("unit-stop");
+        let (path, entries) = two_block_archive(&dir, 512 * 1024);
+        let secret = Secret::new(String::new());
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+
+        let files: Vec<usize> = (0..entries.len())
+            .filter(|&i| entries[i].kind == EntryKind::File)
+            .collect();
+        let mut n = 0;
+        crate::reader::RandomAccessReader::copy_unit(&ra, &files, &mut |_i, _body| {
+            n += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(n, 1, "the pass must stop at the first refusal");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

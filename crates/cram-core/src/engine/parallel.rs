@@ -2,6 +2,10 @@
 //! rayon pool sized to `plan.workers` fans out; every task calls [`RandomAccessReader::copy_entry`],
 //! which opens its own handle. Per-entry writers keep the NVMe saturated where a single write stream
 //! underutilizes it, so that is the shape.
+//!
+//! A backend whose decode unit is shared — a 7z solid block — takes
+//! [`copy_unit`](RandomAccessReader::copy_unit) instead: one pass over the unit, each entry written
+//! as its bytes go past. Same scheduling, same policy, no decoded block held anywhere.
 
 use std::cmp::Reverse;
 use std::fs::{self, File};
@@ -221,8 +225,45 @@ pub fn run(
         .build()
         .map_err(|e| ArchiveError::Backend(e.to_string()))?;
 
+    let record = |i: usize, outcome: std::thread::Result<Result<EntryOutcome>>| match outcome {
+        Ok(Ok(EntryOutcome::Wrote(bytes))) => {
+            // Returns immediately unless the user opted into detailed diagnostics; the check is a
+            // relaxed atomic load, which is why it can sit in the per-entry path at all.
+            crate::diag::diag().entry(entries[i].name(), Some(bytes), "ok");
+            let mut r = report.lock().unwrap();
+            r.extracted += 1;
+            r.bytes += bytes;
+        }
+        Ok(Ok(EntryOutcome::Skipped)) => {
+            crate::diag::diag().entry(entries[i].name(), None, "skip");
+            report.lock().unwrap().skipped += 1
+        }
+        Ok(Err(ArchiveError::Cancelled)) => {}
+        Ok(Err(e)) => report.lock().unwrap().push_failure(entries[i].name(), e),
+        Err(panic) => report.lock().unwrap().push_failure(
+            entries[i].name(),
+            ArchiveError::Backend(panic_message(panic.as_ref())),
+        ),
+    };
+
     pool.install(|| {
         groups.par_iter().for_each(|group| {
+            // A backend whose decode unit is expensive serves the whole group in one pass, so its
+            // entries stream out as they decode instead of being held. See
+            // `RandomAccessReader::copy_unit`.
+            if ra.streams_units() {
+                extract_unit(
+                    ra,
+                    dest,
+                    group,
+                    entries,
+                    skip_existing,
+                    sink,
+                    created,
+                    &record,
+                );
+                return;
+            }
             // One task per destination group; its members run in archive order on this thread, so
             // two entries that resolve to the same file can never be in flight at once.
             for &i in group {
@@ -237,27 +278,7 @@ pub fn run(
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     extract_one(ra, dest, i, &entries[i], skip_existing, sink, created)
                 }));
-                match outcome {
-                    Ok(Ok(EntryOutcome::Wrote(bytes))) => {
-                        // Returns immediately unless the user opted into detailed diagnostics; the
-                        // check is a relaxed atomic load, which is why it can sit in the per-entry
-                        // path of the parallel extractor at all.
-                        crate::diag::diag().entry(entries[i].name(), Some(bytes), "ok");
-                        let mut r = report.lock().unwrap();
-                        r.extracted += 1;
-                        r.bytes += bytes;
-                    }
-                    Ok(Ok(EntryOutcome::Skipped)) => {
-                        crate::diag::diag().entry(entries[i].name(), None, "skip");
-                        report.lock().unwrap().skipped += 1
-                    }
-                    Ok(Err(ArchiveError::Cancelled)) => {}
-                    Ok(Err(e)) => report.lock().unwrap().push_failure(entries[i].name(), e),
-                    Err(panic) => report.lock().unwrap().push_failure(
-                        entries[i].name(),
-                        ArchiveError::Backend(panic_message(panic.as_ref())),
-                    ),
-                }
+                record(i, outcome);
             }
         });
     });
@@ -270,6 +291,62 @@ pub fn run(
     let mut r = report.into_inner().unwrap();
     r.cancelled = sink.is_cancelled();
     Ok(r)
+}
+
+/// Extract a whole decode unit in one pass, writing each entry as its bytes arrive.
+///
+/// The panic isolation is coarser than the per-entry path's, and it has to be: a solid block is one
+/// stream, so a decoder that dies part-way through it has not just failed the entry in hand, it has
+/// lost the position of every entry behind it. Those are recorded as failures against the same cause
+/// rather than silently dropped — an extraction that reports success for entries it never wrote is
+/// the failure mode worth engineering against.
+#[allow(clippy::too_many_arguments)]
+fn extract_unit(
+    ra: &dyn RandomAccessReader,
+    dest: &Path,
+    group: &[usize],
+    entries: &[Entry],
+    skip_existing: bool,
+    sink: &dyn ProgressSink,
+    created: &super::unwind::CreatedLog,
+    record: &dyn Fn(usize, std::thread::Result<Result<EntryOutcome>>),
+) {
+    let served = Mutex::new(Vec::with_capacity(group.len()));
+    let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ra.copy_unit(group, &mut |i, body| {
+            sink.wait_if_paused();
+            if sink.is_cancelled() {
+                return false;
+            }
+            served.lock().unwrap().push(i);
+            // Still per entry, so one unwritable destination in a block does not cost the rest.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                extract_streamed(dest, &entries[i], body, skip_existing, sink, created)
+            }));
+            record(i, outcome);
+            true
+        })
+    }));
+
+    // Whatever the pass did not reach. Cancellation is not damage, so it reports nothing.
+    let err = match pass {
+        Ok(Ok(())) => return,
+        _ if sink.is_cancelled() => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(panic) => panic_message(panic.as_ref()),
+    };
+    let served = served.into_inner().unwrap();
+    for &i in group {
+        if !served.contains(&i) {
+            record(
+                i,
+                Ok(Err(ArchiveError::Backend(format!(
+                    "{}: its decode unit failed before this entry was reached: {err}",
+                    entries[i].name()
+                )))),
+            );
+        }
+    }
 }
 
 /// Best-effort human-readable text from a caught panic payload. Shared with
@@ -295,6 +372,40 @@ fn extract_one(
     sink: &dyn ProgressSink,
     created: &super::unwind::CreatedLog,
 ) -> Result<EntryOutcome> {
+    write_entry(dest, entry, skip_existing, sink, created, |w| {
+        ra.copy_entry(pos, w)
+    })
+}
+
+/// The same entry, from a body the caller already has open rather than one fetched by index. Used by
+/// the unit-streaming path, where the bytes arrive mid-decode and there is nothing to fetch.
+fn extract_streamed(
+    dest: &Path,
+    entry: &Entry,
+    body: &mut dyn std::io::Read,
+    skip_existing: bool,
+    sink: &dyn ProgressSink,
+    created: &super::unwind::CreatedLog,
+) -> Result<EntryOutcome> {
+    write_entry(dest, entry, skip_existing, sink, created, |w| {
+        Ok(std::io::copy(body, w)?)
+    })
+}
+
+/// Everything that happens around the bytes: skip policy, directory and file creation, the progress
+/// writer, the short-read check, mtime, and removing a partial file on failure. `fill` supplies the
+/// bytes and returns how many it wrote.
+///
+/// Factored out so the per-entry and unit-streaming paths cannot drift. They differ only in where the
+/// bytes come from, and every rule below is one that a decoder got wrong at least once.
+fn write_entry(
+    dest: &Path,
+    entry: &Entry,
+    skip_existing: bool,
+    sink: &dyn ProgressSink,
+    created: &super::unwind::CreatedLog,
+    fill: impl FnOnce(&mut dyn Write) -> Result<u64>,
+) -> Result<EntryOutcome> {
     if sink.is_cancelled() {
         return Err(ArchiveError::Cancelled);
     }
@@ -316,7 +427,7 @@ fn extract_one(
     let file = File::create(&outpath)?;
     let mut writer = ProgressWriter::new(BufWriter::with_capacity(WRITE_BUF, file), sink);
 
-    match ra.copy_entry(pos, &mut writer).and_then(|n| {
+    match fill(&mut writer).and_then(|n| {
         writer.flush()?;
         Ok(n)
     }) {
