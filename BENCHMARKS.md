@@ -363,8 +363,20 @@ columns do not separate: repeated runs of the same command ranged 9.85–26.68 C
 - **Maximum ratio on large corpora.** 7-Zip `-mx=9` is 1.84% smaller on the kernel tree and
   5.09% smaller on enwik9. On the kernel tree cram `--small` is dominated outright: bigger and
   slower. Use `--auto` there and take the speed.
-- **Single-file archives, on extraction.** enwik9 extracts in 10.28 s against 7-Zip's 2.77 s.
-  The parallel extract path is per-entry, so one entry means one thread.
+- **Single-file archives, on extraction** — mostly closed on 2026-08-14, and still a loss. The
+  parallel path's unit of work was the entry, so one entry meant one thread whatever the machine.
+  A `.cram` entry can now be cut at its pack boundaries and its pieces decoded concurrently.
+  Measured on the 24-thread Linux box, enwik9 to tmpfs, three rounds, output byte-identical to the
+  original 1,000,000,000-byte file:
+
+  | | wall | effective cores | peak |
+  |---|---|---|---|
+  | before | 9.05 s | 1.0 | 568 MB |
+  | after | **2.06 s** | 5.4 | 900 MB |
+  | 7-Zip | 1.64 s | 4.4 | 1176 MB |
+
+  4.4× faster and 26% behind 7-Zip rather than 5.5×, in 23% less memory. The memory rise is the
+  decode window, which is bounded by the worker count.
 - **Small archives, on creation.** cram does not parallelise *within* a pack, so a corpus
   smaller than a few packs compresses single-threaded while 7-Zip splits it across every core.
   On a 20 MB input, cram at maximum took 15.89 s against 7-Zip `-mx=9`'s 4.55 s.
