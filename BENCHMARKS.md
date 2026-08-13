@@ -42,10 +42,11 @@ decoder fed it.
 **One corpus exposes a real weakness.** enwik9 is a single 1 GB file, and cram extracts it in
 10.28 s against 7-Zip's 2.77 s. Parallel extraction of a `.cram` is per-entry, and there is one entry.
 
-**Opening somebody else's `.7z` is now level with 7-Zip**, at 3.66 s against 3.68 s on the Cram
-corpus, in 2795 MB against 7-Zip's 4876 MB. That is a later build than the rest of this document and
-is measured separately below; the number depends on the archive having been written by a
-multi-threaded encoder, which is a property of the file rather than of the format.
+**Opening somebody else's `.7z` is now level with 7-Zip on time and well under it on memory**, at
+3.26 s against 3.68 s on the Cram corpus, in **867 MB against 7-Zip's 4876 MB**. That is a later
+build than the rest of this document and is measured separately below; the number depends on the
+archive having been written by a multi-threaded encoder, which is a property of the file rather than
+of the format.
 
 **Memory is where cram is unambiguously cheaper.** Default against default on the Cram corpus,
 2.4 GB against 7-Zip's 7.1 GB. At maximum, 7-Zip needs **17.4 GB** and does not fit on a 16 GB
@@ -295,12 +296,20 @@ cram a corpus.7z .                     2,339,551,070 bytes, 49 solid blocks
 
 | extracting | cram 1.1.0 | cram, this build | 7-Zip 26.01 |
 |---|---|---|---|
-| the 7-Zip-written archive | 25.01 s, 609 MB | **3.66 s** [3.59–3.71], 2795 MB | 3.68 s [3.67–3.71], **4876 MB** |
+| the 7-Zip-written archive | 25.01 s, 609 MB | **3.26 s** [3.13–3.26], **867 MB** | 3.68 s [3.67–3.71], 4876 MB |
 | the cram-written archive | 8.62 s, 138 MB | **1.35 s** [1.32–1.38], 303 MB | 3.25 s [3.24–3.27], 173 MB |
 
-**On 7-Zip's own archive the two are level** — 3.66 against 3.68 is a tie, and anyone reading a
-winner into it is reading noise. What is not noise is the memory: 7-Zip needs 4876 MB to reach that
-time and cram needs 2795 MB. On a cram-written `.7z` cram is 2.4× faster, at 303 MB against 173 MB.
+**On 7-Zip's own archive the two are level on time** — 3.26 against 3.68 is close enough that
+reading a winner into it is reading noise. What is not noise is the memory: 7-Zip needs 4876 MB to
+reach that time and cram needs 867 MB. On a cram-written `.7z` cram is 2.4× faster, at 303 MB
+against 173 MB.
+
+**Most of that memory gap was closed in one line.** Until the declared LZMA2 dictionary size became
+readable, the window had to be bounded by the segment's own length — always safe, since a segment
+opens on a dictionary reset, and about four times too large, since 7-Zip writes 32 MiB dictionaries
+into 128 MiB thread blocks. Asking the archive instead took peak RSS from 2809 MB to 867 MB on this
+run, and 15% off the CPU with it, from the allocation that stopped happening. The declared value
+comes from the archive, so it is used only to shrink the window and never to grow it.
 
 **Why a single-folder archive is divisible at all.** 7-Zip's `-mx=5` default puts the whole 2.8 GB
 in one solid block, which cram used to decode on one thread. But its multi-threaded encoder resets

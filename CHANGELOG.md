@@ -15,6 +15,26 @@ and 2.4× faster on an archive cram wrote, in less memory than 7-Zip needs in ei
 
 ### Changed
 
+- **7z extraction uses a third of the memory it did this morning, by asking the archive how big its
+  dictionary is.** A segment's own length was the only bound available while the 7z crate kept coder
+  properties private. It is always safe — a segment opens on a dictionary reset, so nothing in it
+  reaches further back than its start — and it is about four times too large, since 7-Zip writes
+  32 MiB dictionaries into 128 MiB thread blocks and every concurrent segment holds a window.
+  Reading the declared size took peak RSS on the corpus from **2809 MB to 867 MB**, and 15% off the
+  CPU as well, from the allocation that no longer happens. The declared value is attacker-controlled
+  and is used only to *shrink* the window, never to grow it.
+
+- **7z packs are compressed concurrently instead of chunked inside one.** Packs were compressed
+  straight into the output stream, so two could never be built at once and every thread had to come
+  from LZMA2's chunking within a single pack — capped at pack size over dictionary, and costing
+  ratio because a match cannot cross a chunk boundary. Creating the corpus went from 57.9 s to
+  43.4 s, and the archive came out *smaller*: 284.0 MB against 289.1 MB.
+
+  Both of the above needed API that `sevenz-rust2` keeps private, so cram now depends on
+  `sevenz-rust2-cram`, upstream 0.21.3 plus those two additions and nothing else (163 inserted
+  lines, no deletions). Both are offered upstream as pull requests and the fork retires if they
+  land.
+
 - **7z extracts in parallel.** Entries in a 7z share a solid block, so the block is the unit of work
   rather than the entry. On the Cram corpus that took a cram-written `.7z` from 8.62 s to 1.35 s
   against 7-Zip's 3.25 s, every extraction checked file-by-file against the corpus manifest.
