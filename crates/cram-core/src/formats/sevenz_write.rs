@@ -42,6 +42,42 @@ use crate::probe;
 use crate::secret::{HeaderMode, Secret};
 use crate::writer::{ArchiveWriter, CreateOptions, CreateReport, Level, WriteHint};
 
+/// Raise this process's file-descriptor soft limit toward its hard limit, once.
+///
+/// A solid block holds one handle per entry, so the descriptor limit sets the block size, the block
+/// size sets how many LZMA2 chunks a pack holds, and the chunk count sets how many threads can work
+/// on it. On Linux that chain turns a default soft limit of 1024 into ~30 MB blocks, three or four
+/// 8 MiB chunks, and three busy cores on a 24-core machine — measured at 105.4s and 2.54 cores.
+///
+/// The hard limit is typically 1,048,576, and the soft limit is a courtesy default rather than a
+/// real constraint. Raising it is what `ripgrep`, `fd` and most file-heavy tools do.
+///
+/// Deliberately conservative, because this is a library and the rlimit is process-wide: it never
+/// lowers anything, it does nothing when the soft limit is already generous, and it asks for at most
+/// 65,536 rather than the hard limit — macOS in particular will refuse a request above
+/// `kern.maxfilesperproc`. Failure is ignored; the adaptive flush in `open_for_block` still keeps
+/// the writer correct at whatever limit is actually in force.
+#[cfg(unix)]
+fn raise_descriptor_limit() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    const WANT: libc::rlim_t = 65_536;
+    ONCE.call_once(|| unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 || lim.rlim_cur >= WANT {
+            return;
+        }
+        lim.rlim_cur = WANT.min(lim.rlim_max);
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+    });
+}
+
+#[cfg(not(unix))]
+fn raise_descriptor_limit() {}
+
 /// Whether an open failed because the process (or the system) is out of file descriptors.
 ///
 /// Matched on the raw code because `std::io::ErrorKind` has no stable variant for either: `EMFILE`
@@ -273,6 +309,7 @@ pub struct SevenZArchiveWriter {
 
 impl SevenZArchiveWriter {
     pub fn create(path: &Path, opts: &CreateOptions) -> Result<Self> {
+        raise_descriptor_limit();
         let mut sz = SzWriter::create(path).map_err(map_sz)?;
 
         let mut aes_salt = [0u8; 16];
