@@ -134,6 +134,41 @@ fn solid_7z_round_trips_and_keeps_empty_directories() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A solid block holds one open file handle per entry until it is written, so a tree with more
+/// files than the process may have descriptors must still archive.
+///
+/// This is a real defect that shipped: the per-block entry cap was tuned on Windows, where a process
+/// may hold millions of handles, and on Linux — soft limit 1024 by default, 256 on macOS — a
+/// 41,305-file tree died after 0.15s with `Too many open files`. Every other 7z test here uses 3 or
+/// 60 files, so all three CI platforms passed it.
+///
+/// 1,200 files: above the 512-entry cap and above Linux's default 1024, so on a Unix runner this
+/// exercises the descriptor-exhaustion path for real rather than merely covering multiple blocks.
+#[test]
+fn more_files_than_the_descriptor_limit_still_archives() {
+    let dir = scratch("fdlimit");
+    let data = dir.join("many");
+    fs::create_dir_all(&data).unwrap();
+    // Deliberately tiny bodies: the file COUNT is what this test is about, and LZMA2 in a debug
+    // build is slow enough that a 200-byte payload each turned this into a 60-second test.
+    for i in 0..1200u32 {
+        fs::write(data.join(format!("f{i:05}.txt")), format!("e{i}\n")).unwrap();
+    }
+
+    let archive = dir.join("many.7z");
+    let entries = create_7z(&data, &archive);
+    assert_eq!(entries, 1201, "expected 1200 files plus the root directory");
+
+    let out = dir.join("out");
+    assert_eq!(extract_and_count(&archive, &out), 1200);
+    assert_eq!(
+        fs::read(out.join("many/f00999.txt")).unwrap(),
+        b"e999\n",
+        "content mismatch after a multi-block, descriptor-bounded create"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The point of the change: a shared dictionary across many similar small files must produce a
 /// materially smaller archive than one dictionary per entry.
 #[test]

@@ -42,6 +42,20 @@ use crate::probe;
 use crate::secret::{HeaderMode, Secret};
 use crate::writer::{ArchiveWriter, CreateOptions, CreateReport, Level, WriteHint};
 
+/// Whether an open failed because the process (or the system) is out of file descriptors.
+///
+/// Matched on the raw code because `std::io::ErrorKind` has no stable variant for either: `EMFILE`
+/// and `ENFILE` are 24 and 23 on Unix, and Windows reports `ERROR_TOO_MANY_OPEN_FILES` as 4.
+fn out_of_descriptors(e: &io::Error) -> bool {
+    match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(24) | Some(23) => true,
+        #[cfg(windows)]
+        Some(4) => true,
+        _ => false,
+    }
+}
+
 fn map_sz(e: SzError) -> ArchiveError {
     match e {
         SzError::Io(io, _) | SzError::FileOpen(io, _) => ArchiveError::Io(io),
@@ -129,7 +143,14 @@ impl Read for BlockSource {
 /// Cap on entries per block, independent of [`SOLID_BLOCK_BYTES`]. A block holds one open handle per
 /// entry, so a tree of 1 KB files would otherwise reach ~65,000 handles before the byte ceiling
 /// noticed.
-const SOLID_BLOCK_ENTRIES: usize = 4096;
+///
+/// This is a backstop, not the real defence. It was 4096, chosen on Windows where a process may hold
+/// millions of handles, and it made `.7z` creation fail outright on Linux, whose default soft limit
+/// is **1024** — a 41,305-file tree died with `Too many open files` after 0.15s. The 7z tests use 3-
+/// and 60-file fixtures, so CI saw nothing on any platform. The adaptive flush in `add_path` is what
+/// actually keeps this correct; the constant only stops a pathological tree from finding the limit
+/// on every single block.
+const SOLID_BLOCK_ENTRIES: usize = 512;
 
 /// LZMA2 dictionary size for a preset, in MiB (the xz preset table). Needed because encoder memory
 /// is a multiple of the dictionary, and the dictionary grows 8× between the default level and
@@ -292,14 +313,40 @@ impl SevenZArchiveWriter {
         })
     }
 
+    /// Open a source file for the open block, flushing the block first if the process has run out
+    /// of descriptors.
+    ///
+    /// A solid block holds one handle per entry until it is written, so its size is bounded by the
+    /// descriptor limit as well as by bytes and count — and that limit is not knowable from a
+    /// constant. Windows lets a process hold millions; Linux defaults to a soft limit of **1024**,
+    /// macOS to 256. A cap tuned on Windows made `.7z` creation fail outright on Linux for any tree
+    /// over ~1000 files, in 0.15s, with `Too many open files`.
+    ///
+    /// Rather than guess the limit, react to it: on `EMFILE`/`ENFILE`, flush the block — which drops
+    /// every handle it was holding — and retry once. That self-tunes to whatever the real limit is,
+    /// needs no `getrlimit` binding, and behaves the same whether the limit is 256 or a million. A
+    /// second failure is a real error and is reported as one.
+    fn open_for_block(&mut self, path: &Path) -> Result<File> {
+        match File::open(path) {
+            Ok(f) => Ok(f),
+            Err(e) if out_of_descriptors(&e) && !self.block.is_empty() => {
+                self.flush_block()?;
+                File::open(path)
+                    .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))
+            }
+            Err(e) => Err(ArchiveError::Backend(format!("{}: {e}", path.display()))),
+        }
+    }
+
     /// Compress and write the open block as one pack, then start a new one.
     fn flush_block(&mut self) -> Result<()> {
         if self.block.is_empty() {
             return Ok(());
         }
         let batch = std::mem::take(&mut self.block);
+        let block_bytes = self.block_bytes;
         self.block_bytes = 0;
-        let methods = self.content_methods(self.block_store);
+        let methods = self.content_methods(self.block_store, block_bytes);
 
         let mut entries = Vec::with_capacity(batch.len());
         let mut readers = Vec::with_capacity(batch.len());
@@ -353,7 +400,7 @@ impl SevenZArchiveWriter {
         store: bool,
         adaptive_store: bool,
     ) -> Result<()> {
-        let methods = self.content_methods(store);
+        let methods = self.content_methods(store, entry.size);
         let sz_entry = ArchiveEntry::new_file(&arc_name(entry));
         let w = self.writer()?;
         w.set_content_methods(methods);
@@ -374,10 +421,16 @@ impl SevenZArchiveWriter {
 
     /// The content-method chain for one entry: COPY when storing, else LZMA2; wrapped in AES
     /// (applied last, so compress-then-encrypt) when the archive is encrypted.
-    fn content_methods(&self, store: bool) -> Vec<EncoderConfiguration> {
+    /// `bytes` is how much uncompressed data this pack will hold. It gates multi-threading: an
+    /// LZMA2 MT encoder allocates a match-finder state per thread — about 88 MB each at the default
+    /// dictionary — so asking for eight threads to compress a pack smaller than one chunk spends
+    /// several hundred megabytes and all the setup to do work one thread would finish immediately.
+    /// A 1,200-file / 245 KB fixture took **62.9s** in a debug build before this check, essentially
+    /// all of it encoder setup across three tiny blocks.
+    fn content_methods(&self, store: bool, bytes: u64) -> Vec<EncoderConfiguration> {
         let compress: EncoderConfiguration = if store {
             EncoderConfiguration::new(EncoderMethod::COPY)
-        } else if self.solid && self.threads > 1 {
+        } else if self.solid && self.threads > 1 && bytes >= self.chunk.saturating_mul(2) {
             // LZMA2's own multi-threading splits the input into independent chunks, each clamped to
             // at least the dictionary. That does nothing for a 27 KB entry in its own pack, which is
             // why non-solid create could never use more than one core; inside a 64 MiB block it is
@@ -418,8 +471,7 @@ impl ArchiveWriter for SevenZArchiveWriter {
     }
 
     fn add_path(&mut self, entry: &Entry, path: &Path, hint: WriteHint) -> Result<()> {
-        let file = File::open(path)
-            .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))?;
+        let file = self.open_for_block(path)?;
 
         // Turning `takes_paths` on stops the engine probing inline, and a block must know every
         // entry's verdict before it picks its single method chain. Same order of checks as
@@ -517,7 +569,7 @@ impl ArchiveWriter for SevenZArchiveWriter {
             // this: (a) the header reuses the LAST entry's IV, and (b) an archive that never had
             // an `add_file` (empty, or directories only) has no AES configuration at all and a
             // NamesToo header is silently written in PLAINTEXT.
-            sz.set_content_methods(self.content_methods(false));
+            sz.set_content_methods(self.content_methods(false, 0));
         }
         let file = sz.finish().map_err(ArchiveError::Io)?;
         let out_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
