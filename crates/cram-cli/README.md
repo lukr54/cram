@@ -17,6 +17,9 @@ On a public 42,151-file corpus (2.80 GB, 15% duplicate), creating an archive tak
 65.46 s for `7z -mx=5` and 84.09 s for `rar -m3`, at a better ratio than 7-Zip and the same ratio as
 RAR. The corpus and the method are published so you can check that rather than take it on trust.
 
+Reading other tools' archives is measured too: extracting a 7-Zip-written `.7z` of that corpus takes
+3.66 s against 7-Zip's own 3.68 s, in 2795 MB against 4876 MB.
+
 Optional features, all off by default: `download` (the `cram dl` verb), `zstd-c` (C libzstd instead
 of the pure-Rust encoder), `phash` (perceptual hashing for `cram dedup --similar`).
 

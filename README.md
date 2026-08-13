@@ -154,9 +154,11 @@ Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS   # a restart m
 
 The ProjFS DLL is bound lazily, so every other command works without the feature. *on-demand*:
 content is read out of the archive as a file is opened, with no up-front extraction. *≤ 2 GiB RAM*:
-7z, tar, RAR and bare compressed streams have no random-access hand-off point, so mounting one **decodes the
-whole archive into memory up front** and refuses anything whose total uncompressed size exceeds
-2 GiB, extract those instead.
+7z, tar, RAR and bare compressed streams are **decoded whole into memory up front** and refuse
+anything whose total uncompressed size exceeds 2 GiB, extract those instead. tar, RAR and bare
+streams have no random-access hand-off point at all; 7z has one that extraction uses, but a small
+ranged read through it still costs decoding from the start of a solid block, so it is not the
+on-demand behaviour the column promises.
 
 **The archive is never modified.** By default a mount is for reading: unmounting removes the mount
 directory, so a file you edit inside it is discarded. If the folder ends up holding files that are
@@ -571,8 +573,12 @@ These describe how Cram works, not a measured comparison against anything else. 
 section is a performance claim; for those see [`BENCHMARKS.md`](BENCHMARKS.md).
 
 - **Parallel extraction** on the formats with a random-access boundary, ZIP, ISO and `.cram`, where
-  entries can be decoded independently. Sequential formats (7z, tar, RAR, bare streams) stream
-  front-to-back through the same write machinery.
+  entries can be decoded independently. **7z is parallel over decode units instead**: its entries
+  share a solid block, so the block is the unit, and a block written by a multi-threaded LZMA2
+  encoder is cut finer at the dictionary resets inside it, each of which is a point a decoder can
+  start from cold. A 7z written single-threaded, or smaller than one of those thread-blocks, has
+  nothing to cut and decodes whole. tar, RAR and bare streams stream front-to-back through the same
+  write machinery.
 - **`.cram`** applies content-defined chunking, then global BLAKE3-keyed dedup across every input in
   one archive, then compressed packs and a footer index. Dedup is global: identical data anywhere in
   the inputs is stored once, with no dictionary-window limit. Optional encryption is Argon2id +

@@ -1,8 +1,11 @@
-# Performance findings, 2–3 August 2026
+# Performance findings, 2–13 August 2026
 
 Open issues found while benchmarking against 7-Zip 26.01 and WinRAR 7.12/7.13. Measurements
 are in `BENCHMARKS.md`. Each item states what was observed, where the code is, and what is
 hypothesis rather than fact.
+
+Items 1–15 are from 2–3 August and concern `.cram`. Items 16–19 are from 13 August and concern
+reading `.7z`, including the scheduler and calibration changes that came out of it.
 
 Machines: Ryzen 7 3700X / 16T / 15.9 GiB / Windows 11, and Ryzen 9 5900X / 24 vCPU /
 23 GiB / Ubuntu 24.04 (KVM guest).
@@ -529,6 +532,137 @@ a fixture. `crates/cram-core/tests/chunk_lanes.rs` pins it at 1, 2, 4 and 16.
 Shipped lane counts: `--store` gets 12 (`packs_are_cheap` is `matches!(policy, PackPolicy::Store)`),
 `--fast` and `--auto` get 3. **`--fast` at 12 lanes measures about 7% faster for 380 MB more RSS**,
 which is a trade rather than a free win and has not been taken.
+
+---
+
+## 16. 7z extraction ran on one thread, and four separate things kept it there
+
+**Confirmed and fixed, 13 August 2026.** Measured on the 24-thread Linux box, Cram corpus 1.0,
+destination `/dev/shm`, three rounds with the tool order rotated, every extraction checked against
+the corpus `MANIFEST.sha256`.
+
+Each of these was individually sufficient to keep extraction at ~1.1 effective cores, so fixing any
+one of them alone would have shown nothing. That is the reason to record them separately.
+
+1. **`sevenz.rs` never implemented `as_random_access`**, so no 7z ever reached the parallel path.
+2. **Clustering was not enough.** With the unit merely *adjacent* in the schedule, rayon steals
+   across the list, a worker hops units, and a backend caching "the unit I am on" evicts on every
+   hop: 110 CPU-seconds against 11 sequential, ten re-decodes of every block, for almost no wall
+   gain. `coalesce_locality` fuses a unit into one work item — 34 items instead of 41,305.
+3. **The memory gate was all-or-nothing on the largest block.** A block holding a single entry needs
+   no cache at all, and the corpus has one: a 263.3 MiB stored video, 5.5% over a 249.6 MiB
+   per-worker budget, which vetoed the other 48 blocks. Extraction stayed at 1.30 cores on the very
+   corpus the project publishes against, and only a benchmark noticed — the gate is invisible when
+   wrong, because extraction still succeeds.
+4. **`copy_entry` is the wrong shape for a solid format.** Serving a block through a per-entry
+   interface means decoding the block and *holding* every entry's bytes: 1.8 GB peak RSS against
+   7-Zip's 176 MB, to be 10% faster than it. `copy_unit` hands each entry over as it decodes, and is
+   both smaller and faster — 175 MB and 38% less CPU than the sequential path it replaced, because
+   the buffering was most of the cost.
+
+| `cram.7z`, 49 blocks | wall | cpu | cores | peak |
+|---|---|---|---|---|
+| sequential | 8.62 s | 11.03 s | 1.28 | 138 MB |
+| cached blocks | 2.96 s | 12.06 s | 4.07 | 1.0–1.8 GB |
+| streaming | **1.35 s** | 11.68 s | 8.65 | 303 MB |
+| 7-Zip 26.01 | 3.25 s | 4.74 s | 1.46 | 173 MB |
+
+---
+
+## 17. One solid folder is divisible after all, and the upstream support for it does nothing
+
+**Confirmed and fixed, 13 August 2026.**
+
+7-Zip's default writes an entire archive as ONE solid block (`Method = LZMA2:25`, `Blocks = 1`), so
+§16 bought nothing there: 24.99 s against 7-Zip's 3.68 s, 6.8× behind on the archive shape a user is
+most likely to be handed.
+
+Its multi-threaded encoder resets the LZMA2 dictionary at each thread-block boundary, and a chunk
+with a dictionary reset decodes cold. Walking the corpus archive's framing: **47,011 chunks, 21
+dictionary resets**, segments of 110.9–128.0 MiB. The walk is self-validating — it consumed the pack
+stream exactly and totalled 2,800,604,582 unpacked bytes, the corpus size to the byte.
+
+**`lzma-rust2` already finds these seams and cannot use them.** `Lzma2ReaderMt` splits on exactly the
+same condition (`control >= 0xE0 || control == 0x01`), `sevenz-rust2` selects it whenever
+`threads >= 2`, and `ArchiveReader::open` already defaults `thread_count` to
+`available_parallelism()`. None of it is feature-gated. Measured:
+
+| threads | wall | cores | peak |
+|---|---|---|---|
+| 1 | 15.43 s | 1.01 | 49 MB |
+| 4 | 19.68 s | 1.01 | 577 MB |
+| 24 | 19.71 s | 1.01 | 577 MB |
+
+28% slower and 528 MB heavier for no parallelism, because it refills its work queue only when the
+queue is *empty* and spawns a worker only when the queue is non-empty — a depth-1 prefetch pipeline.
+Its work units are also whole `Vec`s of input and output, so even fixed it would buffer ~128 MiB per
+unit in flight. Hence `formats/lzma2seg.rs` cutting the seams in cram and feeding them to the
+scheduler that already exists.
+
+Two things the format forces. A segment ends where the next one's control byte begins, so read alone
+it has no end marker and the decoder runs off the end looking for one more chunk header
+(`UnexpectedEof`, all 21, first attempt). Giving it the rest of the pack stream and dropping it early
+is simpler than synthesising a terminator, and it makes an entry straddling a boundary fall out for
+free. And the dictionary window is sized from the segment rather than from the archive's declared
+dictionary, because `sevenz-rust2` keeps `Coder::properties` private — a segment opens on a reset, so
+nothing inside it reaches back past its start. **That over-allocates about 4× on 7-Zip's output**
+(128 MiB windows where 32 MiB would do) and is the bulk of the 2795 MB below. Recoverable if a
+`properties()` accessor lands upstream.
+
+| `sevenz.7z`, 1 block / 21 segments | wall | cpu | cores | peak |
+|---|---|---|---|---|
+| before | 25.01 s | 27.12 s | 1.08 | 609 MB |
+| after | **3.66 s** | 29.42 s | 8.04 | 2795 MB |
+| 7-Zip 26.01 | 3.68 s | 16.77 s | 4.56 | 4876 MB |
+
+**This is a property of the archive, not of the format.** An archive written `-mmt=1`, or smaller
+than one thread-block, has one segment and gains nothing. No survey has been done of how common each
+case is, so no claim is made about `.7z` files in general.
+
+---
+
+## 18. A write-bound plan asked for a wall it then declined to reach
+
+**Confirmed and fixed, 13 August 2026. One part unresolved.**
+
+`classify` computed `min(units, physical) × decode_rate = 21 × 143.7 = 3018 MiB/s` against a measured
+2689 MiB/s wall, called the extraction write-bound, and the write-bound branch then ran
+`((physical * 3) / 4).clamp(4, 8)` = **8** workers. Actual throughput was 620 MiB/s, 23% of the wall
+it had just declared itself bound by. Being write-bound is a claim about the ratio of two rates, so
+the worker count now comes from those rates: `wall / decode_rate`, nineteen here. 4.16 s → 3.66 s.
+The old value is kept as a floor, so this can only add workers.
+
+**It is not free, and the cost lands where the win does not.** On an archive whose wall time is
+already write-bound the extra workers buy nothing and still cost their CPU: `cram.7z` stays at 1.35 s
+and goes from 6.4 to 11.7 CPU-seconds. `decode_rate` is a static per-codec estimate and cannot know
+that half that corpus is stored data decoding at memcpy speed. A per-archive decode estimate, or a
+governor that sheds workers that are not moving bytes, would fix it.
+
+**Unresolved: the inline write probe reads high, and the worker count now depends on it.** The probe
+an extraction runs writes 512 MiB and reported 331.9 MiB/s for the dev box's `/scratch`;
+`calibrate --write-probe` writes 4 GiB and reported 84 MiB/s for the same box on 7 August. Both are
+measurements — the short one never leaves cache. A wall 4× high asks for 4× the workers.
+
+---
+
+## 19. The write wall was cached per machine, and it is a property of the volume
+
+**Confirmed and fixed, 13 August 2026.** Profile schema 3.
+
+`write_wall_mibs` was one number for the computer. Whichever destination happened to be extracted to
+first set it for every destination afterwards. Live on the dev box: a profile carrying
+`write_wall_mibs = 2689.6`, measured against `/dev/shm`, planning extractions onto an ext4 disk.
+
+Codec rates stay per machine — they belong to the CPU. Walls are now keyed by volume (`st_dev` on
+unix, volume root on Windows) and a destination never measured gets no wall rather than another
+volume's. Verified on one machine, two volumes: `/dev/shm` → 2717.1 MiB/s → 19 workers; `/scratch`
+→ 331.9 MiB/s → 8 workers.
+
+**Benchmark trap this exposed.** Two cram builds on one machine share
+`~/.config/cram/profile.toml` and disagree about its schema, so each invalidated the other's *every
+run*; every timing then silently included a full recalibration plus a 512 MiB write probe. It showed
+as cram swinging 1.33–8.07 s while 7-Zip sat still at 3.28 s, and read exactly like a regression. An
+A/B of two builds must give each its own `XDG_CONFIG_HOME` and a warm-up pass.
 
 ---
 

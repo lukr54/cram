@@ -1,12 +1,20 @@
 //! 7z backend, **read-only** for now (create lands with the writer phase), via the pure-Rust
 //! `sevenz-rust2` decoder (LZMA/LZMA2 always; BZip2/PPMd/Deflate/LZ4/AES-256 behind features).
 //!
-//! 7z is solid/blocked: entries in a block share one decode stream, so there's no cheap per-entry
-//! random access → this is a sequential [`ArchiveReader`], routed to the sequential engine. The
-//! crate's extraction API is a **push** callback (`for_each_entries(|entry, &mut Read|)`), the same
-//! shape as tar, so the same fix applies: a **worker thread** owns the reader and pushes
-//! `(metadata, bytes)` over a bounded channel; `next_entry` pulls. Listing (`entries`) is a cheap
-//! header pass off `archive().files` (no block decode).
+//! 7z is solid/blocked: entries in a block share one decode stream, so there is no cheap *per-entry*
+//! random access. There is per-*unit* random access, which is what this backend offers, and the two
+//! must not be confused — [`SevenZRandomAccess`] addresses a solid block, or an LZMA2 segment inside
+//! one where the archive was written by a multi-threaded encoder (see
+//! [`lzma2seg`](super::lzma2seg)). That is enough to extract and verify in parallel, and too coarse
+//! to back a mount, which is why `formats::open_random_access` still routes 7z to `seqcache`.
+//!
+//! The sequential [`ArchiveReader`] below remains the fallback, for archives that offer no usable
+//! unit at all: encrypted ones (content passwords resolve lazily, and the random-access view holds
+//! only the header password), and blocks too large to serve. The crate's extraction API is a **push**
+//! callback (`for_each_entries(|entry, &mut Read|)`), the same shape as tar, so the same fix applies:
+//! a **worker thread** owns the reader and pushes `(metadata, bytes)` over a bounded channel;
+//! `next_entry` pulls. Listing (`entries`) is a cheap header pass off `archive().files` (no block
+//! decode).
 //!
 //! Passwords: 7z uses ONE archive-wide password. If the *header* is encrypted we resolve it at
 //! `open()` (needed even to list). If only *content* is encrypted (header plain, listing browsable),

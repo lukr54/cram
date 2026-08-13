@@ -46,9 +46,14 @@ pub fn open(
 /// - **Natively seekable**, ZIP (central directory + per-entry local headers), `.cram` (a footer
 ///   index over content-addressed packs), and ISO 9660 (each file is a contiguous extent). These serve
 ///   ranges straight from disk with no whole-archive buffering.
-/// - **Sequential, staged to RAM**; tar / 7z / rar / raw are front-to-back streams with no seek boundary,
-///   so [`seqcache::SeqCacheReader`] decodes them once into a bounded in-memory cache and serves ranges
-///   from there. Capped, so a too-large archive is refused (extract it instead of mounting).
+/// - **Sequential, staged to RAM**; tar / 7z / rar / raw, so [`seqcache::SeqCacheReader`] decodes
+///   them once into a bounded in-memory cache and serves ranges from there. Capped, so a too-large
+///   archive is refused (extract it instead of mounting). tar, rar and raw have no seek boundary at
+///   all. 7z does — [`sevenz::SevenZRandomAccess`], which extraction and `verify` fan out over — but
+///   its smallest addressable unit is a solid block or an LZMA2 segment, so serving a mount's small
+///   reads through it would decode one of those per read. **This dispatch is on `Container`, not on
+///   `ArchiveReader::as_random_access`**: giving a backend the latter does not put it in the tier
+///   above, and the two decisions are deliberately separate.
 ///
 /// `pw` supplies passwords lazily, exactly as [`open`] does.
 pub fn open_random_access(

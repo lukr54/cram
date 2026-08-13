@@ -7,6 +7,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+7z extraction. It ran on one thread whatever the archive or the machine, which on a 7-Zip-written
+archive of the benchmark corpus meant 25 s against 7-Zip's 3.7 s. It is now level with 7-Zip there
+and 2.4× faster on an archive cram wrote, in less memory than 7-Zip needs in either case.
+
+### Changed
+
+- **7z extracts in parallel.** Entries in a 7z share a solid block, so the block is the unit of work
+  rather than the entry. On the Cram corpus that took a cram-written `.7z` from 8.62 s to 1.35 s
+  against 7-Zip's 3.25 s, every extraction checked file-by-file against the corpus manifest.
+
+- **A 7z written by a multi-threaded encoder is split finer than its blocks.** 7-Zip's default puts
+  an entire archive in ONE solid block, which no amount of block-level parallelism can divide. But
+  its multi-threaded encoder resets the LZMA2 dictionary at each thread-block boundary, and a chunk
+  with a dictionary reset can be decoded without anything before it. Cram walks that framing and
+  treats each reset as a starting point: the corpus archive has 47,011 chunks and 21 resets, and
+  extracting it went from 25.01 s to 3.66 s against 7-Zip's 3.68 s, using 2795 MB where 7-Zip uses
+  4876 MB.
+
+  This depends on how the archive was written, not on the format. A `.7z` written single-threaded,
+  or smaller than one thread-block, has one segment and extracts at the old speed. Chains with a BCJ
+  or delta filter keep the old path too, since filter state crosses the boundary.
+
+- **Extraction no longer holds a decoded block in memory.** Serving a solid block's entries one at a
+  time meant decoding the block and keeping every entry's bytes until asked for them — 1.8 GB of
+  peak RSS on the corpus. Entries are now handed over as they decode, which is both smaller and
+  faster: 175 MB, and 38% less CPU than the path it replaced. `cram test` shares it, 8.04 s to
+  1.16 s.
+
+- **A write-bound extraction sizes its thread pool from the measured rates rather than from a
+  fraction of the core count.** Saturating a write wall at a given per-worker decode rate takes
+  `wall / decode_rate` workers; the previous fixed cap was chosen for a codec fast enough that eight
+  of them outrun any drive, and on a slow one it contradicted itself — projecting twenty-one units
+  of LZMA decode to classify the extraction as write-bound, then running eight. The old value is
+  kept as a floor, so no archive gets fewer workers than before.
+
+- **The calibration profile records a write wall per volume instead of one per machine** (schema 3).
+  The wall is a property of the destination, not of the computer, and keeping one meant whichever
+  destination was extracted to first set the figure for every later one — a RAM-disk measurement
+  planning writes to a hard disk. Codec rates stay per machine, since those belong to the CPU. A
+  profile written by an older version is re-measured rather than migrated.
+
+### Fixed
+
+- **A single large file no longer disabled parallel 7z extraction for the whole archive.** The
+  memory bound was applied to the largest block, and a block holding one big entry needs no cache at
+  all — it can be streamed. One 263 MiB video, alone in its block, was 5.5% over the budget and took
+  the other 48 blocks of the benchmark corpus down with it, leaving extraction on 1.3 effective
+  cores. The bound now applies only to blocks that more than one entry shares.
+
+### Added
+
+- `CRAM_PROFILE=1` prints the extraction plan and every input to it — bottleneck, workers, decode
+  units, measured decode rate and write wall — so "why did this run on two threads" is one line
+  rather than an afternoon of bisecting.
+
+---
+
 ## [1.1.0] - 2026-08-12
 
 Mostly work on finding duplicates, and on what you can see and do with the result. The engine gains

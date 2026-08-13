@@ -100,7 +100,27 @@ sequence), and every worker opening its own handle via `copy_entry`. Those three
 containers can address an entry without reading what precedes it, which is what makes independent
 per-entry workers possible.
 
-**Everything else, tar, 7z, RAR, a bare compressed stream; takes the sequential path**
+**7z takes the parallel path too, over decode units rather than entries.** Its entries are not
+independent, so the unit is the *solid block*, and where a block is a lone LZMA2 coder written by a
+multi-threaded encoder it is cut finer still, at the dictionary resets inside it
+([`formats/lzma2seg.rs`](../crates/cram-core/src/formats/lzma2seg.rs)). A chunk that resets the
+dictionary can be decoded cold, so each is somewhere a worker can start. That is what makes 7-Zip's
+own default output — one solid folder for the entire archive — divisible at all. Where a stream
+cannot be cut (single-threaded encoder output, anything under one thread-block, a coder chain with a
+BCJ or delta filter whose state crosses the boundary) the walk says so and the block is decoded
+whole. Nothing is assumed about the encoder.
+
+Two trait methods carry this, both on `RandomAccessReader`:
+
+- `coalesce_locality` fuses a unit's entries into ONE work item. Adjacency is not enough — rayon
+  steals across the ordered list, and a worker hopping units re-decodes them. Measured on a 34-block
+  archive: entries stayed adjacent, workers scattered anyway, and the archive cost 110 CPU-seconds
+  instead of 11.
+- `copy_unit` serves a whole unit in one pass, handing each entry over as its bytes decode. The
+  per-entry `copy_entry` cannot express that for a solid format: serving a block through it means
+  decoding the block and *keeping* it, which cost 1.8 GB of peak RSS where streaming costs 175 MB.
+
+**Everything else, tar, RAR, a bare compressed stream; takes the sequential path**
 ([`engine/sequential.rs`](../crates/cram-core/src/engine/sequential.rs)), one entry at a time. These
 are front-to-back streams with no seek interface: entry *n* can only be decoded by decoding what precedes
 it, so there is nothing to fan out over.
@@ -136,6 +156,23 @@ skipped when the destination is short on free space, a calibration must never be
 disk; absence in the profile means "not measured", never `0`. `hw::derive_plan` turns those inputs
 into a `Plan`, and `engine::parallel` sizes its pool from `plan.workers`. The `calibrate` binary runs
 the same measurements standalone.
+
+**The profile holds two kinds of number and they do not have the same scope.** Codec rates belong to
+the CPU and are the same wherever the bytes land, so one set is kept per machine. A write wall
+belongs to the *volume*, so it is recorded per volume (`wall.<key>`, from `st_dev` on unix and the
+volume root on Windows). Keeping one machine-wide wall meant whichever destination was extracted to
+first set the figure for every later one — a `/dev/shm` measurement of 2689.6 MiB/s was live here,
+planning writes to an ext4 disk. A destination never measured gets no wall rather than another
+volume's, and probes.
+
+**A write-bound plan sizes its pool from those two rates, not from a fraction of the cores.** Being
+write-bound is a claim about their ratio, so saturating a wall of `wall` MiB/s at `decode_rate`
+MiB/s per worker takes `wall / decode_rate` workers. The fixed `(physical * 3 / 4).clamp(4, 8)` this
+replaced was right only for a codec fast enough that eight workers outrun any drive; on a slow one
+it contradicted the decision it came from, projecting twenty-one units of LZMA decode against the
+wall to *call* the extraction write-bound and then running eight. The old value survives as a floor,
+so this can only add workers. It follows that a wrong wall now sets a wrong thread count, which is
+why the per-volume scoping above is not a tidiness matter.
 
 ### `cram test`
 
@@ -362,7 +399,9 @@ from `read_range` on demand. ProjFS invokes callbacks on its own threads, so the
   only the packs the range touches, and ZIP re-opens the entry and decodes forward from its start,
   discarding the leading bytes through a 64 KiB scratch buffer, bounded memory, but work proportional
   to the offset.
-- **Sequential, staged to RAM**; tar, 7z, RAR and bare compressed streams have no seek hand-off point, so
+- **Sequential, staged to RAM**; tar, RAR and bare compressed streams have no seek hand-off point,
+  and 7z has one whose smallest addressable unit is a solid block or an LZMA2 segment rather than an
+  entry, which is too coarse to serve a mount's small reads. So
   [`formats/seqcache.rs`](../crates/cram-core/src/formats/seqcache.rs) decodes the whole archive into
   memory when the mount opens and serves ranges from those buffers. The cache is capped at **2 GiB
   uncompressed** (entry metadata counts against the same cap, so millions of tiny entries cannot slip

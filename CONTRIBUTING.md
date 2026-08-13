@@ -113,7 +113,7 @@ cargo test -p cram-core         # one crate
 cargo test -- --ignored         # runs ONLY the ignored (heavy) tests
 ```
 
-On default features that is **240 passing tests, 0 failures**, and **253** with the features the
+On default features that is **258 passing tests, 0 failures**, and **271** with the features the
 release is built with (`download,zstd-c,phash`), which compile code the default build leaves out.
 Counted on `main` after 1.1.0. Those counts drift with every commit and are given only as a sanity check; green
 is the gate.
@@ -124,8 +124,10 @@ XZ compressor and is skipped for time, not because it fails. A `download` build 
 `a_running_binary_can_still_be_replaced` starts so it has a genuinely running executable to replace.
 
 [`crates/cram-core/tests/fuzz_parsers.rs`](crates/cram-core/tests/fuzz_parsers.rs) runs as part of
-that suite: a bounded smoke-fuzz of every pure-Rust parser (150 iterations each by default). Raise it
-when you touch a parser:
+that suite: a bounded smoke-fuzz of every pure-Rust parser (150 iterations each by default). It
+drives the random-access side as well as `next_entry`, because they read different structure — the
+7z one walks LZMA2 chunk framing that the sequential path never looks at. Raise it when you touch a
+parser:
 
 ```powershell
 $env:CRAM_FUZZ_ITERS = 20000; cargo test -p cram-core --test fuzz_parsers

@@ -101,8 +101,15 @@ that silently duplicated 8,011 files behind twelve directory symlinks, and it tu
 into an unbounded walk.
 
 **Lazy mounts for 7z, tar and RAR.** Mounting one of these decodes the whole archive into memory and
-refuses anything over 2 GiB, because none of them offers a random-access boundary the way ZIP, ISO
-and `.cram` do. Those three are already projected on demand.
+refuses anything over 2 GiB. tar and RAR have no random-access boundary at all, the way ZIP, ISO and
+`.cram` do; those three are already projected on demand.
+
+7z is no longer in that category and the entry is kept here because the work is now worth doing
+rather than impossible. Extraction addresses a 7z by solid block, and by LZMA2 segment within a
+block where the archive carries dictionary resets, so a ranged read costs decoding from the nearest
+segment start — on the benchmark corpus 128 MiB rather than the whole 2.8 GB archive. What is
+missing is teaching `read_range` to start there instead of at the block, and deciding what a mount
+should do with an archive whose segments are large enough that even that is slow.
 
 **Streaming `cram conv`.** Conversion holds one whole entry in memory, so a `.cram` containing a
 single file over 512 MiB fails to convert even though `cram x` extracts it fine. Extraction streams

@@ -40,7 +40,12 @@ land between 15 and 19 s, because extraction is write-bound and the disk does no
 decoder fed it.
 
 **One corpus exposes a real weakness.** enwik9 is a single 1 GB file, and cram extracts it in
-10.28 s against 7-Zip's 2.77 s. Parallel extraction is per-entry, and there is one entry.
+10.28 s against 7-Zip's 2.77 s. Parallel extraction of a `.cram` is per-entry, and there is one entry.
+
+**Opening somebody else's `.7z` is now level with 7-Zip**, at 3.66 s against 3.68 s on the Cram
+corpus, in 2795 MB against 7-Zip's 4876 MB. That is a later build than the rest of this document and
+is measured separately below; the number depends on the archive having been written by a
+multi-threaded encoder, which is a property of the file rather than of the format.
 
 **Memory is where cram is unambiguously cheaper.** Default against default on the Cram corpus,
 2.4 GB against 7-Zip's 7.1 GB. At maximum, 7-Zip needs **17.4 GB** and does not fit on a 16 GB
@@ -266,6 +271,52 @@ The disk column does not repeat well — cram 8.69–18.54, 7-Zip 15.47–19.88,
 those spreads overlap completely. **On disk these three are indistinguishable**, and anyone
 quoting a winner from that column is quoting noise. Extraction is write-bound: the same work takes
 2.58 s when the disk is not in the way and 15 s when it is.
+
+## Reading archives other tools wrote
+
+Everything above measures each tool on its *own* format. This measures the other thing people
+actually do: open a `.7z` somebody else made.
+
+**Measured 2026-08-13, and not part of the run above.** Same machine, but two later builds than the
+1.0.0 used everywhere else in this document: released 1.1.0 as the baseline, and an unreleased build
+for the segment work described below. The corpus is on a different volume of the same box. Do not compare these timings against
+the tables above; compare them against the 7-Zip column beside them, which was re-run at the same
+time. Three rounds with the tool order rotated, `/dev/shm` as the destination, every extraction
+counted by file and byte and checked against the corpus `MANIFEST.sha256`: 42,151 files each, all
+matching.
+
+Two archives of the Cram corpus, because how an archive was *written* decides what can be done with
+it:
+
+```
+cram a corpus.7z .                     2,339,551,070 bytes, 49 solid blocks
+7zz a corpus.7z . -mmt=24 -mx=5        2,297,090,458 bytes, ONE solid block
+```
+
+| extracting | cram 1.1.0 | cram, this build | 7-Zip 26.01 |
+|---|---|---|---|
+| the 7-Zip-written archive | 25.01 s, 609 MB | **3.66 s** [3.59–3.71], 2795 MB | 3.68 s [3.67–3.71], **4876 MB** |
+| the cram-written archive | 8.62 s, 138 MB | **1.35 s** [1.32–1.38], 303 MB | 3.25 s [3.24–3.27], 173 MB |
+
+**On 7-Zip's own archive the two are level** — 3.66 against 3.68 is a tie, and anyone reading a
+winner into it is reading noise. What is not noise is the memory: 7-Zip needs 4876 MB to reach that
+time and cram needs 2795 MB. On a cram-written `.7z` cram is 2.4× faster, at 303 MB against 173 MB.
+
+**Why a single-folder archive is divisible at all.** 7-Zip's `-mx=5` default puts the whole 2.8 GB
+in one solid block, which cram used to decode on one thread. But its multi-threaded encoder resets
+the LZMA2 dictionary at each thread-block boundary, and a chunk with a dictionary reset can be
+decoded cold. Walking the framing of that archive: 47,011 chunks, **21 dictionary resets**, segments
+of 110.9–128.0 MiB. Twenty-one places a decoder can start.
+
+**This is a property of the archive, not of the format, and it is worth stating plainly rather than
+generalising.** The resets exist because a multi-threaded encoder put them there. A `.7z` written
+with `-mmt=1`, or one smaller than a single thread-block, has exactly one segment and gains nothing
+— it decodes at the 1.0.0 speed. No survey has been done of how common each case is in the wild, so
+no claim is made about "most `.7z` files".
+
+Extraction to a real disk is not reported here. On this machine it is write-bound and the four
+columns do not separate: repeated runs of the same command ranged 9.85–26.68 CPU-seconds and
+16.33–30.32 s wall, which supports no claim in either direction.
 
 ## Where cram loses
 

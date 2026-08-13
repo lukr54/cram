@@ -99,8 +99,10 @@ pub trait RandomAccessReader: Send + Sync {
     /// structurally impossible, since no arrangement of chunks can force a re-decode of a unit that
     /// is visited once.
     ///
-    /// 7z solid blocks have the same shape and should adopt this; they are believed to suffer the
-    /// same way and it has not been measured.
+    /// 7z solid blocks have the same shape and now use it, both the block and, where the archive
+    /// carries LZMA2 dictionary resets, each independently decodable segment inside one. Measured:
+    /// clustering alone was not enough there either, and cost 110 CPU-seconds against 11 — see
+    /// [`coalesce_locality`](Self::coalesce_locality).
     fn locality_key(&self, _index: usize) -> Option<u64> {
         None
     }
