@@ -219,7 +219,10 @@ fn verify_workers(fmt: Format, entries: &[Entry], units: Option<usize>, path: &P
         &hw,
         Topology::SameDrive,
         &Rates::default(),
-        f64::INFINITY,
+        // Sustained, because it is not a measurement at all: an infinite wall exists to make the
+        // write side irrelevant to a pass that never writes. Calling it a burst would send the
+        // write-bound branch to its floor for the opposite reason and by accident.
+        hw::Wall::sustained(f64::INFINITY),
     )
     .workers
 }

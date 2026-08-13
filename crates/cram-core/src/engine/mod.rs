@@ -91,12 +91,14 @@ pub(crate) fn staging_path(dest: &Path) -> std::path::PathBuf {
 
 /// Rates + write-wall for planning: the cached profile if present, else a quick in-memory calibrate
 /// with a bus/media-derived wall estimate. (Mirrors the `calibrate` bin's resolution.)
-fn rates_and_wall(hw: &HwProfile, dest: &Path) -> (Rates, f64) {
-    let default_wall = hw
-        .work_drive
-        .as_ref()
-        .map(|d| d.default_wall_mibs())
-        .unwrap_or(250.0);
+fn rates_and_wall(hw: &HwProfile, dest: &Path) -> (Rates, hw::Wall) {
+    // A table value, not a measurement: never a ceiling, so it can classify but not scale.
+    let default_wall = hw::Wall::burst(
+        hw.work_drive
+            .as_ref()
+            .map(|d| d.default_wall_mibs())
+            .unwrap_or(250.0),
+    );
     // Two separate questions, and they expire separately. The codec rates belong to the CPU and are
     // reusable everywhere; the wall belongs to THIS destination and a figure measured on another
     // volume says nothing about it.
@@ -150,7 +152,7 @@ fn probe_dir(dest: &Path) -> Option<&Path> {
     }
 }
 
-fn probe_wall_if_safe(dest: &Path) -> Option<f64> {
+fn probe_wall_if_safe(dest: &Path) -> Option<hw::Wall> {
     const PROBE_MIB: usize = 512; // 4 x 128 MiB windows -> a median has something to work with
     const REQUIRED_FREE_MIB: u64 = 4096;
     let dir = probe_dir(dest).unwrap_or(Path::new("."));
@@ -165,7 +167,16 @@ fn probe_wall_if_safe(dest: &Path) -> Option<f64> {
     } else {
         w.burst_mibs
     };
-    (mibs > 0.0).then_some(mibs)
+    // **512 MiB is not enough to claim a ceiling**, and saying so is the whole point of the
+    // distinction. A drive with a gigabyte of SLC cache absorbs this entire probe and reports the
+    // cache: 331.9 MiB/s on a volume whose 4 GiB probe measures 84. Only a run that watched
+    // throughput step down and then sampled past the step has seen the device's floor, and that is
+    // exactly what `cliff_mib` records. Everything else is a burst figure, honestly labelled, good
+    // enough to tell write-bound from cpu-bound and not good enough to size a thread pool from.
+    (mibs > 0.0).then(|| match w.cliff_mib {
+        Some(_) => hw::Wall::sustained(mibs),
+        None => hw::Wall::burst(mibs),
+    })
 }
 
 /// Extract `path` into `dest`. `pw` supplies passwords for encrypted entries; `sink` receives
@@ -232,7 +243,7 @@ pub fn extract(
                 hw.logical,
                 hw.physical,
                 rates.decode_rate(plan_codec(fmt, entries)),
-                wall,
+                wall.mibs,
                 reader.as_random_access().is_some(),
                 plan.note,
             );

@@ -86,11 +86,14 @@ fn main() {
     );
     println!("  Working drive: {}", drive_str(&hw.work_drive));
 
-    let default_wall = hw
-        .work_drive
-        .as_ref()
-        .map(|d| d.default_wall_mibs())
-        .unwrap_or(250.0);
+    // A bus/media table value. Never a ceiling, so the planner may classify with it but not size a
+    // thread pool from it.
+    let default_wall = hw::Wall::burst(
+        hw.work_drive
+            .as_ref()
+            .map(|d| d.default_wall_mibs())
+            .unwrap_or(250.0),
+    );
 
     // ---- Layer 4: calibration (cached unless --recalibrate) ----
     // The wall is looked up for the volume this is being run on, since that is the one a probe here
@@ -124,7 +127,7 @@ fn main() {
     println!("  LZMA/xz decode {:>6.0} MiB/s", rates.lzma_dec);
 
     // ---- optional heavy write-wall probe ----
-    let mut measured_wall = wall > 0.0 && source == "cached profile";
+    let mut measured_wall = wall.mibs > 0.0 && source == "cached profile";
     if write_probe {
         let dir = here.clone();
         println!(
@@ -144,10 +147,13 @@ fn main() {
                             "not reached within {probe_gib} GiB (SLC cache is larger)"
                         ))
                 );
-                wall = if w.sustained_mibs > 0.0 {
-                    w.sustained_mibs
-                } else {
-                    wall
+                // This probe writes gigabytes, which is the point: only a run that reached the cliff
+                // and sampled past it has seen the drive's floor, and only that may be scaled by. A
+                // probe that never found the cliff says so in the line above and stays a burst.
+                wall = match (w.sustained_mibs > 0.0, w.cliff_mib) {
+                    (true, Some(_)) => hw::Wall::sustained(w.sustained_mibs),
+                    (true, None) => hw::Wall::burst(w.sustained_mibs),
+                    _ => wall,
                 };
                 measured_wall = true;
             }
@@ -156,8 +162,13 @@ fn main() {
     }
 
     println!(
-        "\nWrite wall: {:.0} MiB/s  ({})",
-        wall,
+        "\nWrite wall: {:.0} MiB/s{}  ({})",
+        wall.mibs,
+        if wall.sustained {
+            ""
+        } else {
+            " [burst, not a ceiling]"
+        },
         if measured_wall {
             "measured on your drive"
         } else {
@@ -201,8 +212,13 @@ fn main() {
                 println!("\nSaved profile → {}", p.display());
                 if measured_wall {
                     println!(
-                        "  write wall {:.0} MiB/s recorded for the volume holding {}",
-                        wall,
+                        "  write wall {:.0} MiB/s recorded as {} for the volume holding {}",
+                        wall.mibs,
+                        if wall.sustained {
+                            "a sustained ceiling"
+                        } else {
+                            "a burst figure (the planner will not size threads from it)"
+                        },
                         here.display()
                     );
                 }

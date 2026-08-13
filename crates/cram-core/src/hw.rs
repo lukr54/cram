@@ -1158,7 +1158,7 @@ pub fn derive_plan(
     hw: &HwProfile,
     topo: Topology,
     rates: &Rates,
-    wall: f64,
+    wall: Wall,
 ) -> Plan {
     let is_hdd = matches!(hw.work_drive.as_ref().and_then(|d| d.ssd), Some(false));
     if is_hdd && op == Op::Extract {
@@ -1204,7 +1204,7 @@ pub fn derive_plan(
             }
         }
         Op::Extract => {
-            let bottleneck = classify(op, codec, blocks, hw, rates, wall);
+            let bottleneck = classify(op, codec, blocks, hw, rates, wall.mibs);
             match (bottleneck, topo) {
                 (Bottleneck::WriteBound, Topology::TwoDrive) => Plan {
                     bottleneck,
@@ -1246,7 +1246,20 @@ pub fn derive_plan(
                     //
                     // Still bounded by the units that actually exist and the cores to run them on.
                     let floor = ((hw.physical * 3) / 4).clamp(4, 8);
-                    let needed = (wall / rates.decode_rate(codec)).ceil().max(1.0) as usize;
+                    // Scale by the wall only when the wall is a *ceiling*. `needed` is linear in it,
+                    // so a burst figure -- a probe that never left the drive's cache -- multiplies
+                    // straight through into decoders that have nothing to feed. Measured on the
+                    // corpus with a tmpfs destination reporting 2928 MiB/s: 20 workers where 8 was
+                    // the knee, for 7% of the wall time and 78% more CPU. See `Wall`.
+                    //
+                    // Without a ceiling, take the floor. That is not a retreat to the old constant:
+                    // the sweep put the knee at exactly 8 on this machine, and every worker past it
+                    // bought under a tenth of its own cost.
+                    let needed = if wall.sustained {
+                        (wall.mibs / rates.decode_rate(codec)).ceil().max(1.0) as usize
+                    } else {
+                        floor
+                    };
                     let workers = needed.clamp(floor, blocks.max(1).min(hw.physical).max(floor));
                     Plan {
                         bottleneck,
@@ -1360,6 +1373,46 @@ pub struct WriteWall {
     pub burst_mibs: f64,
     pub sustained_mibs: f64,
     pub cliff_mib: Option<f64>, // bytes written when throughput first stepped down (SLC size)
+}
+
+/// A write-throughput figure **and whether it is a ceiling**.
+///
+/// The two are not interchangeable and conflating them cost real CPU. A probe that writes 512 MiB
+/// into a drive with a gigabyte of SLC cache measures the cache, reports a number four times the
+/// drive's sustained rate, and looks exactly like a measurement. On the dev box the inline probe
+/// reported 331.9 MiB/s for a volume whose 4 GiB probe measures 84.
+///
+/// It matters because the write-bound worker count is `wall / decode_rate`, which scales linearly
+/// with this number: a wall four times too high fields four times the decoders. Measured on the
+/// corpus, that was 20 workers where 8 was the knee — 7% of wall time for 78% more CPU.
+///
+/// So a figure carries how it was obtained, and only a sustained one may be scaled by. Classifying
+/// the bottleneck uses either, since for that question an order of magnitude is enough.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Wall {
+    pub mibs: f64,
+    /// True only when the probe wrote far enough to watch throughput step down, and then measured
+    /// past the step. A probe that never saw a cliff cannot distinguish a genuinely flat device
+    /// from one whose cache it never left, so it says `false` and the planner declines to scale.
+    pub sustained: bool,
+}
+
+impl Wall {
+    /// A measured ceiling: the probe saw the cliff and sampled past it.
+    pub fn sustained(mibs: f64) -> Self {
+        Wall {
+            mibs,
+            sustained: true,
+        }
+    }
+
+    /// A figure that may be nothing but cache. Usable for classification, not for scaling.
+    pub fn burst(mibs: f64) -> Self {
+        Wall {
+            mibs,
+            sustained: false,
+        }
+    }
 }
 
 /// Sequentially write `total_mib` MiB of 8 MiB blocks to a temp file under `dir`, sampling
@@ -1504,7 +1557,11 @@ pub fn profile_path() -> Option<std::path::PathBuf> {
 /// 3: the write wall moved from one machine-wide `write_wall_mibs` to a `wall.<volume>` entry per
 /// destination. A v2 file carries a single wall that may have been measured on any volume, which is
 /// exactly the reading that has to stop, so it is retired rather than migrated.
-pub const PROFILE_SCHEMA: u32 = 3;
+/// 4: a wall now records whether it is a sustained ceiling (`wall.<volume>`) or a burst that may be
+/// nothing but cache (`burst.<volume>`). Every v3 entry was written without that distinction and
+/// most were burst figures from the short inline probe, so reading them as ceilings would keep
+/// over-provisioning workers off numbers up to four times too high. Retired rather than migrated.
+pub const PROFILE_SCHEMA: u32 = 4;
 
 /// Identity of the machine a profile was measured on: core counts plus the work drive's media and
 /// bus. Without this stamp a profile copied between machines, or a *roaming* profile following the
@@ -1577,7 +1634,7 @@ pub fn volume_key(dir: &Path) -> Option<String> {
 ///
 /// Walls already recorded for *other* volumes are carried over, so measuring the scratch disk does
 /// not forget what was measured about the system one.
-pub fn save_profile(rates: &Rates, wall: Option<(String, f64)>) -> io::Result<()> {
+pub fn save_profile(rates: &Rates, wall: Option<(String, Wall)>) -> io::Result<()> {
     if let Some(p) = profile_path() {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1588,7 +1645,7 @@ pub fn save_profile(rates: &Rates, wall: Option<(String, f64)>) -> io::Result<()
             .map(|t| parse_profile(&t).1)
             .unwrap_or_default();
         // Only a real measurement is recorded at all; absence means "not measured", never 0.
-        if let Some((key, w)) = wall.filter(|(_, w)| *w > 0.0) {
+        if let Some((key, w)) = wall.filter(|(_, w)| w.mibs > 0.0) {
             walls.retain(|(k, _)| *k != key);
             walls.push((key, w));
         }
@@ -1603,8 +1660,11 @@ pub fn save_profile(rates: &Rates, wall: Option<(String, f64)>) -> io::Result<()
             rates.deflate_dec,
             rates.lzma_dec
         );
+        // A ceiling and a burst go under different keys, so a reload can still tell them apart.
+        // Storing only the number lost the one fact that decides whether it may be scaled by.
         for (k, w) in &walls {
-            body.push_str(&format!("wall.{k} = {w:.1}\n"));
+            let prefix = if w.sustained { "wall" } else { "burst" };
+            body.push_str(&format!("{prefix}.{k} = {:.1}\n", w.mibs));
         }
         std::fs::write(p, body)?;
     }
@@ -1613,7 +1673,7 @@ pub fn save_profile(rates: &Rates, wall: Option<(String, f64)>) -> io::Result<()
 
 /// Parse a profile file body into (rates, per-volume walls). Blank and `#` comment lines are
 /// skipped, crucially WITHOUT early-returning, so one comment line can't discard the whole profile.
-fn parse_profile(text: &str) -> (Rates, Vec<(String, f64)>) {
+fn parse_profile(text: &str) -> (Rates, Vec<(String, Wall)>) {
     let mut r = Rates::default();
     let mut walls = Vec::new();
     for line in text.lines() {
@@ -1631,7 +1691,9 @@ fn parse_profile(text: &str) -> (Rates, Vec<(String, f64)>) {
                 "lzma_dec_mibs" => r.lzma_dec = val,
                 _ => {
                     if let Some(vol) = k.strip_prefix("wall.") {
-                        walls.push((vol.to_string(), val));
+                        walls.push((vol.to_string(), Wall::sustained(val)));
+                    } else if let Some(vol) = k.strip_prefix("burst.") {
+                        walls.push((vol.to_string(), Wall::burst(val)));
                     }
                 }
             }
@@ -1649,7 +1711,7 @@ fn parse_profile(text: &str) -> (Rates, Vec<(String, f64)>) {
 ///
 /// Returns `None` entirely when the profile was written by an older schema or on other hardware,
 /// forcing a fresh calibration.
-pub fn load_profile(dest: Option<&Path>) -> Option<(Rates, Option<f64>)> {
+pub fn load_profile(dest: Option<&Path>) -> Option<(Rates, Option<Wall>)> {
     let p = profile_path()?;
     let text = std::fs::read_to_string(p).ok()?;
     if !profile_applies(&text) {
@@ -1659,7 +1721,7 @@ pub fn load_profile(dest: Option<&Path>) -> Option<(Rates, Option<f64>)> {
     let key = dest.and_then(volume_key);
     let wall = key
         .and_then(|k| walls.iter().find(|(v, _)| *v == k).map(|(_, w)| *w))
-        .filter(|w| *w > 0.0);
+        .filter(|w| w.mibs > 0.0);
     Some((rates, wall))
 }
 
@@ -1738,7 +1800,10 @@ mod tests {
     fn profile_parse_survives_comment_and_blank_lines() {
         let text = "# Cram calibrated hardware profile\n\ndeflate_enc_mibs = 17.0\ndeflate_dec_mibs = 574.0\nlzma_dec_mibs = 103.0\nwall.dev66306 = 191.0\n";
         let (r, walls) = parse_profile(text);
-        assert_eq!(walls, vec![("dev66306".to_string(), 191.0)]);
+        assert_eq!(
+            walls,
+            vec![("dev66306".to_string(), Wall::sustained(191.0))]
+        );
         assert_eq!(r.deflate_dec, 574.0);
         assert_eq!(r.lzma_dec, 103.0);
     }
@@ -1752,8 +1817,8 @@ mod tests {
         let text = "schema = 3\nmachine = \"x\"\ndeflate_dec_mibs = 574.0\nwall.devFAST = 2689.6\nwall.devSLOW = 84.0\n";
         let (_, walls) = parse_profile(text);
         let of = |k: &str| walls.iter().find(|(v, _)| v == k).map(|(_, w)| *w);
-        assert_eq!(of("devFAST"), Some(2689.6));
-        assert_eq!(of("devSLOW"), Some(84.0));
+        assert_eq!(of("devFAST"), Some(Wall::sustained(2689.6)));
+        assert_eq!(of("devSLOW"), Some(Wall::sustained(84.0)));
         // The one that matters: an unmeasured volume gets nothing, NOT another volume's number.
         assert_eq!(of("devUNSEEN"), None);
     }
@@ -1816,7 +1881,7 @@ mod tests {
             &hw,
             Topology::SameDrive,
             &rates,
-            194.0,
+            Wall::sustained(194.0),
         );
         assert_eq!(p.bottleneck, Bottleneck::WriteBound);
         // Verdict: parallel per-entry, NOT a single-writer pipeline.
@@ -1850,11 +1915,34 @@ mod tests {
             &hw,
             Topology::SameDrive,
             &rates,
-            2689.0,
+            Wall::sustained(2689.0),
         );
         assert_eq!(p.bottleneck, Bottleneck::WriteBound);
         // 2689 / 143.7 = 18.7, so nineteen -- not the eight a fraction of the cores would give.
         assert_eq!(p.workers, 19);
+
+        // **The same number, obtained differently, must not buy those workers.** 2689 MiB/s from a
+        // 512 MiB probe is a cache measurement wearing a ceiling's clothes, and scaling by it is
+        // what put twenty workers on a corpus whose knee was eight: 7% of the wall time for 78%
+        // more CPU. Same inputs, burst provenance, floor.
+        let unmeasured = derive_plan(
+            Op::Extract,
+            Codec::Lzma,
+            21,
+            &hw,
+            Topology::SameDrive,
+            &rates,
+            Wall::burst(2689.0),
+        );
+        assert_eq!(
+            unmeasured.bottleneck,
+            Bottleneck::WriteBound,
+            "a burst figure still classifies; it just cannot size the pool"
+        );
+        assert_eq!(
+            unmeasured.workers, 8,
+            "a wall that is not a ceiling must not be scaled by"
+        );
 
         // Never more workers than there are units to run on them.
         let few = derive_plan(
@@ -1864,7 +1952,7 @@ mod tests {
             &hw,
             Topology::SameDrive,
             &rates,
-            2689.0,
+            Wall::sustained(2689.0),
         );
         assert!(few.workers <= 8, "3 units must not ask for 19 workers");
 
@@ -1876,7 +1964,7 @@ mod tests {
             &hw,
             Topology::SameDrive,
             &rates,
-            194.0,
+            Wall::sustained(194.0),
         );
         assert_eq!(fast.workers, 8);
     }
@@ -1904,7 +1992,7 @@ mod tests {
             &hw,
             Topology::SameDrive,
             &rates,
-            194.0,
+            Wall::sustained(194.0),
         );
         assert_eq!(p.bottleneck, Bottleneck::CpuBound);
     }
