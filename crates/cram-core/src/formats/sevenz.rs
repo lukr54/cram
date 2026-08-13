@@ -569,24 +569,24 @@ impl SevenZRandomAccess {
         // Cut what can be cut. A block written by a multi-threaded LZMA2 encoder carries dictionary
         // resets, and each is somewhere a decoder can start cold.
         let segmented = Self::segment_blocks(path, &archive, &mut layouts, per_thread);
-        let is_segmented: Vec<bool> = {
-            let mut v = vec![false; archive.blocks.len()];
-            for g in &segmented {
-                v[g.block] = true;
-            }
-            v
-        };
 
-        // Refuse only for a block that needs the cache and cannot have it. Single-entry blocks are
-        // streamed, and a segmented block is decoded a segment at a time, so neither one's size is
-        // this decision's business. An archive with no block holding any bytes has nothing for this
-        // path to do and is left to the sequential one.
+        // An archive with no block holding any bytes has nothing for this path to do and is left to
+        // the sequential one. Nothing else is refused.
+        //
+        // A multi-entry block that cannot be cached used to disqualify the whole archive, on the
+        // reasoning that such a block "needs the cache and cannot have it". That stopped being true
+        // when `copy_unit` landed: a block is served in ONE streaming pass, entries handed over as
+        // they decode, holding nothing but the copy buffer. Its size is no longer this decision's
+        // business, and leaving the gate in place cost more than it ever saved — a 1 GiB `.7z`
+        // written by a single-threaded encoder fell all the way back to the sequential reader and
+        // took 10.62 s and 2477 MB, against 7-Zip's 5.53 s and 127 MB, for want of a path that was
+        // sitting right there.
+        //
+        // `fits` still decides per block whether `copy_entry` and `read_range` use the cache, so
+        // the trade it describes is intact where it applies. See their doc comments for the one
+        // shape that remains expensive, and why nothing in the engine takes it.
         let has_content = archive.blocks.iter().any(|b| b.get_unpack_size() > 0);
-        let stuck = plan
-            .iter()
-            .enumerate()
-            .any(|(b, p)| p.entries > 1 && !p.fits && !is_segmented[b]);
-        if plan.is_empty() || !has_content || stuck {
+        if plan.is_empty() || !has_content {
             return None;
         }
 
@@ -683,6 +683,8 @@ impl SevenZRandomAccess {
             let Ok(Some(segs)) = lzma2seg::walk(&mut file, start, len) else {
                 continue;
             };
+            let dict = lzma2seg::declared_dict(block.coders[0].properties());
+
             // Each concurrent segment holds a dictionary window, so the same per-worker budget that
             // bounds the block cache has to bound these. Workers never exceed the core count and the
             // budget is a quarter of RAM divided by it, so passing here caps the whole fan-out at a
@@ -691,7 +693,17 @@ impl SevenZRandomAccess {
             // Without this the segment path had no memory bound at all: 19 workers each holding a
             // 128 MiB window reached 2.8 GB on the corpus, which is fine on this machine and would
             // not have been on a small one.
-            let widest = segs.iter().map(|s| s.unpacked).max().unwrap_or(0);
+            //
+            // **Judge the window, not the segment.** Those were the same number only while the
+            // declared dictionary was unreadable and the segment's own length was the bound. It is
+            // readable now and is typically a quarter of it — 7-Zip writes 32 MiB dictionaries into
+            // 128 MiB blocks — so measuring the segment here refuses fan-outs that would cost a
+            // quarter of what the refusal assumes.
+            let widest = segs
+                .iter()
+                .map(|s| lzma2seg::dict_window(s, 0, dict) as u64)
+                .max()
+                .unwrap_or(0);
             if widest > per_thread {
                 continue;
             }
@@ -699,7 +711,7 @@ impl SevenZRandomAccess {
                 block: b,
                 pack_end: start + len,
                 segs,
-                dict: lzma2seg::declared_dict(block.coders[0].properties()),
+                dict,
                 layout: std::mem::take(&mut layouts[b]),
             });
         }
@@ -921,6 +933,14 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
     /// One shot over the whole entry, so the cache earns its memory only when the block has other
     /// entries to serve from it. A block of one is streamed however small it is: buffering a file
     /// in RAM to write it straight back out saves no decode.
+    ///
+    /// **Calling this for every entry of a large shared block is quadratic** — each call streams
+    /// from the start of the block, so N entries cost N block decodes. That is the one shape the
+    /// cache exists to avoid, and when the block is too big to cache there is no way to avoid it
+    /// here. Nothing in the engine does it: extraction and `verify` both go through
+    /// [`copy_unit`](Self::copy_unit), which serves a whole block in one pass, and `streams_units`
+    /// returns `true` so they take that route. A new caller that loops `copy_entry` over a solid
+    /// archive would be the first, and should use `copy_unit` instead.
     fn copy_entry(&self, index: usize, out: &mut dyn io::Write) -> Result<u64> {
         match self.placement(index) {
             Some((block, file_idx, plan)) if plan.entries == 1 || !plan.fits => {
@@ -1424,15 +1444,37 @@ mod gate_tests {
     /// The case the budget exists for: a block over budget that many entries share. Streaming it
     /// would re-decode it once per entry, so the whole archive falls back to sequential.
     #[test]
-    fn a_multi_entry_block_over_budget_still_refuses_the_archive() {
+    fn a_multi_entry_block_over_budget_is_served_by_streaming_it() {
         let dir = scratch("multi");
         let (path, entries) = two_block_archive(&dir, 512 * 1024);
         let secret = Secret::new(String::new());
-        // One byte of budget: even the small shared block cannot be held.
-        assert!(
-            SevenZRandomAccess::build_within(&path, &secret, &entries, 1).is_none(),
-            "a shared block that cannot be cached must fall back to the sequential path"
-        );
+
+        // One byte of budget: nothing can be cached, and it must not matter. `copy_unit` serves a
+        // block in one streaming pass, so the archive is still worth taking. This assertion is the
+        // reverse of the one it replaces -- refusing here sent a 1 GiB `.7z` to the sequential
+        // reader, where it took twice 7-Zip's time and nineteen times its memory.
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, 1)
+            .expect("a block too large to cache is streamed, not a reason to refuse the archive");
+
+        // And the bytes have to be right, which is the part that would make this a bad trade.
+        let all: Vec<usize> = (0..entries.len())
+            .filter(|&i| entries[i].kind == EntryKind::File)
+            .collect();
+        let mut seen = 0usize;
+        crate::reader::RandomAccessReader::copy_unit(&ra, &all, &mut |i, body| {
+            let mut got = Vec::new();
+            body.read_to_end(&mut got).unwrap();
+            assert_eq!(
+                got.len() as u64,
+                entries[i].size,
+                "entry {i} came back the wrong length with no cache"
+            );
+            seen += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, all.len(), "every entry must still be served");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
