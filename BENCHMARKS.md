@@ -44,9 +44,10 @@ decoder fed it.
 
 **Opening somebody else's `.7z` is now level with 7-Zip on time and well under it on memory**, at
 3.26 s against 3.68 s on the Cram corpus, in **867 MB against 7-Zip's 4876 MB**. That is a later
-build than the rest of this document and is measured separately below; the number depends on the
-archive having been written by a multi-threaded encoder, which is a property of the file rather than
-of the format.
+build than the rest of this document and is measured separately below. It applies to a `.7z` holding
+more than 128 MiB written at stock settings, which is where the encoder leaves seams a decoder can
+start from; below that threshold, or with `-mmt=1`, there are no seams and cram is currently the
+slower of the two. Both cases are measured in that section.
 
 **Memory is where cram is unambiguously cheaper.** Default against default on the Cram corpus,
 2.4 GB against 7-Zip's 7.1 GB. At maximum, 7-Zip needs **17.4 GB** and does not fit on a 16 GB
@@ -317,11 +318,29 @@ the LZMA2 dictionary at each thread-block boundary, and a chunk with a dictionar
 decoded cold. Walking the framing of that archive: 47,011 chunks, **21 dictionary resets**, segments
 of 110.9–128.0 MiB. Twenty-one places a decoder can start.
 
-**This is a property of the archive, not of the format, and it is worth stating plainly rather than
-generalising.** The resets exist because a multi-threaded encoder put them there. A `.7z` written
-with `-mmt=1`, or one smaller than a single thread-block, has exactly one segment and gains nothing
-— it decodes at the 1.0.0 speed. No survey has been done of how common each case is in the wild, so
-no claim is made about "most `.7z` files".
+**Which archives split, exactly.** 7-Zip's multi-threaded LZMA2 encoder cuts its input into blocks
+of **four times the dictionary size**, and each block opens with a dictionary reset. Measured by
+varying the dictionary alone on identical input: 256 KiB gives 1.0 MiB segments, 4 MiB gives 16.0,
+16 MiB gives 64.0, 32 MiB gives 128.0, 64 MiB gives 256.0. So:
+
+> A `.7z` splits into `content ÷ (4 × dictionary)` segments, and only when it holds more than
+> 4 × dictionary. At the `-mx=5` default that means **archives over 128 MiB, in 128 MiB pieces**.
+
+7-Zip also shrinks the dictionary to fit a small input — 16 MiB of input reports a 24 MiB dictionary
+— so below that threshold one block covers everything and there is nothing to split whatever `-mmt`
+says. Above a 64 MiB dictionary the 4× relation stops holding (a 256 MiB dictionary gave 256 MiB
+segments, not 1 GiB); the default is well inside the range that was confirmed.
+
+**On an archive that does not split, cram is currently worse than 7-Zip, not merely no better.**
+1 GiB written with `-mmt=1` is one segment, and extracting it takes cram **10.62 s and 2477 MB
+against 7-Zip's 5.53 s and 127 MB** — twice the time and nineteen times the memory. The memory is
+the block cache holding a decoded block so its entries need not be decoded twice, which is the right
+trade when the block is shared and the wrong one here. Fixing it is on the roadmap; until then, a
+single-threaded-encoder `.7z` is a case where 7-Zip is the better tool.
+
+Two settings at the extremes behave differently again. `-mx=1` produces 1 MiB segments, dozens of
+them, and extracts fastest of all. `-mx=9` produces 256 MiB segments which exceed cram's per-worker
+memory budget on a 23 GB machine, so they are refused and the archive decodes as one block: 11.33 s.
 
 Extraction to a real disk is not reported here. On this machine it is write-bound and the four
 columns do not separate: repeated runs of the same command ranged 9.85–26.68 CPU-seconds and
