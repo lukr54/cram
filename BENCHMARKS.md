@@ -46,8 +46,9 @@ decoder fed it.
 3.26 s against 3.68 s on the Cram corpus, in **867 MB against 7-Zip's 4876 MB**. That is a later
 build than the rest of this document and is measured separately below. It applies to a `.7z` holding
 more than 128 MiB written at stock settings, which is where the encoder leaves seams a decoder can
-start from; below that threshold, or with `-mmt=1`, there are no seams and cram is currently the
-slower of the two. Both cases are measured in that section.
+start from. With fewer seams there is less to fan out over and cram gives time back — at `-mmt=1`,
+which leaves none at all, it is 47% slower in a third of the memory. Every case is measured in that
+section.
 
 **Memory is where cram is unambiguously cheaper.** Default against default on the Cram corpus,
 2.4 GB against 7-Zip's 7.1 GB. At maximum, 7-Zip needs **17.4 GB** and does not fit on a 16 GB
@@ -331,16 +332,27 @@ varying the dictionary alone on identical input: 256 KiB gives 1.0 MiB segments,
 says. Above a 64 MiB dictionary the 4× relation stops holding (a 256 MiB dictionary gave 256 MiB
 segments, not 1 GiB); the default is well inside the range that was confirmed.
 
-**On an archive that does not split, cram is currently worse than 7-Zip, not merely no better.**
-1 GiB written with `-mmt=1` is one segment, and extracting it takes cram **10.62 s and 2477 MB
-against 7-Zip's 5.53 s and 127 MB** — twice the time and nineteen times the memory. The memory is
-the block cache holding a decoded block so its entries need not be decoded twice, which is the right
-trade when the block is shared and the wrong one here. Fixing it is on the roadmap; until then, a
-single-threaded-encoder `.7z` is a case where 7-Zip is the better tool.
+**What happens when an archive splits less, or not at all.** 1 GiB of the same data written three
+ways, extracted to tmpfs on 24 threads, three rounds each:
 
-Two settings at the extremes behave differently again. `-mx=1` produces 1 MiB segments, dozens of
-them, and extracts fastest of all. `-mx=9` produces 256 MiB segments which exceed cram's per-worker
-memory budget on a 23 GB machine, so they are refused and the archive decodes as one block: 11.33 s.
+| written with | segments | cram | 7-Zip |
+|---|---|---|---|
+| `-mx=5`, stock | 9 | **1.71 s, 366 MB** | 1.77 s, 1917 MB |
+| `-mx=9`, max | 5 | 3.09 s, 1096 MB | 2.45 s, 1916 MB |
+| `-mmt=1` | 1 | 7.90 s, **64 MB** | 5.38 s, 127 MB |
+
+Fewer seams means less to fan out over, and by `-mmt=1` there is nothing: one segment, one thread,
+and 7-Zip's single-stream decoder is simply faster than ours. That is the honest floor of this
+design — **cram is 47% slower there**, in a third of the memory.
+
+Nowhere is cram the heavier of the two. That was not true earlier on 2026-08-13: both non-stock
+cases used to fall out of the parallel path entirely and back onto the sequential reader, which cost
+`-mmt=1` 10.62 s and 2477 MB, nineteen times 7-Zip's. Two gates were judging the wrong quantity —
+one refused any block too large to cache, months after `copy_unit` made caching unnecessary, and the
+other charged an archive's segments for every core rather than for the workers it could use.
+
+`-mx=1` is the opposite extreme: a 256 KiB dictionary gives 1 MiB segments and over a thousand
+units, and it extracts fastest of all at 0.71 s in 235 MB.
 
 Extraction to a real disk is not reported here. On this machine it is write-bound and the four
 columns do not separate: repeated runs of the same command ranged 9.85–26.68 CPU-seconds and
