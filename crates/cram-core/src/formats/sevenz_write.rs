@@ -24,15 +24,18 @@
 //! The content-method chain is written AES-first, compressor-second (`vec![aes, lzma2]`): the last
 //! method is applied to the data first, so bytes are compressed *then* encrypted.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
 use std::path::Path;
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::Arc;
 use std::time::Instant;
 
 use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_rust2::{
-    ArchiveEntry, ArchiveWriter as SzWriter, EncoderConfiguration, EncoderMethod, Error as SzError,
-    Password, SourceReader,
+    prepare_pack, ArchiveEntry, ArchiveWriter as SzWriter, EncoderConfiguration, EncoderMethod,
+    Error as SzError, Password, PreparedPack, SourceReader,
 };
 
 use crate::error::{ArchiveError, Result};
@@ -290,6 +293,15 @@ pub struct SevenZArchiveWriter {
     block_bytes: u64,
     /// Packs written, for the CRAM_PROFILE block report.
     packs_written: usize,
+    /// Packs compressing on the pool, in submission order. Drained from the front, which is what
+    /// keeps the archive's packs in the order the walk produced them.
+    pending_packs: VecDeque<Receiver<Result<PreparedPack>>>,
+    /// How many packs may compress at once — the whole parallelism budget, since each pack now
+    /// encodes single-threaded and concurrency comes from having several in flight.
+    ///
+    /// Also the multiplier on descriptor pressure: a pack holds one handle per entry until its
+    /// worker finishes, so in-flight packs × entries-per-pack is what the limit actually sees.
+    inflight_max: usize,
     /// Whether the open block is a COPY block. A pack has ONE method chain, so a change of
     /// store-ness closes the block. On real trees that is rare (157 of 41,305 entries on the test
     /// corpus); a corpus that alternated every entry would degenerate to one pack per entry, which
@@ -356,6 +368,12 @@ impl SevenZArchiveWriter {
             block: Vec::new(),
             block_bytes: 0,
             packs_written: 0,
+            pending_packs: VecDeque::new(),
+            inflight_max: std::env::var("CRAM_7Z_INFLIGHT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(|| lzma_threads(lzma_level(opts.level)) as usize)
+                .max(1),
             block_store: false,
             dirs: Vec::new(),
         })
@@ -389,7 +407,15 @@ impl SevenZArchiveWriter {
                 // Meeting the limit once per block costs one failed open. That is cheaper than any
                 // amount of remembering, and it means the block size tracks conditions now rather
                 // than the worst moment the process has ever seen.
-                self.flush_block()?;
+                //
+                // Draining a FINISHED pack comes first, and matters now that packs compress
+                // asynchronously: flushing the open block hands its handles to a worker that keeps
+                // them until it is done, so flushing alone can release nothing at all. In-flight
+                // packs are what hold most of the descriptors -- in-flight × entries-per-pack -- so
+                // waiting for the oldest to land is what actually frees them.
+                if !self.drain_one_pack()? {
+                    self.flush_block()?;
+                }
                 File::open(path)
                     .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))
             }
@@ -397,7 +423,13 @@ impl SevenZArchiveWriter {
         }
     }
 
-    /// Compress and write the open block as one pack, then start a new one.
+    /// Hand the open block to the pool as one pack, and start a new one.
+    ///
+    /// The compression happens on a worker; only the append is ordered. `push_archive_entries`
+    /// compresses straight into the output stream, so packs could never overlap and every thread had
+    /// to come from LZMA2 chunking *within* one pack — capped at pack size ÷ dictionary, and costing
+    /// ratio because a match cannot cross a chunk boundary. Whole packs in parallel lifts both
+    /// limits at once, and needs `prepare_pack`, which this build patches into `sevenz-rust2`.
     fn flush_block(&mut self) -> Result<()> {
         if self.block.is_empty() {
             return Ok(());
@@ -405,7 +437,7 @@ impl SevenZArchiveWriter {
         let batch = std::mem::take(&mut self.block);
         let block_bytes = self.block_bytes;
         self.block_bytes = 0;
-        let methods = self.content_methods(self.block_store, block_bytes);
+        let methods = Arc::new(self.content_methods(self.block_store, block_bytes));
 
         let mut entries = Vec::with_capacity(batch.len());
         let mut readers = Vec::with_capacity(batch.len());
@@ -414,12 +446,41 @@ impl SevenZArchiveWriter {
             readers.push(SourceReader::from(source));
         }
 
-        let w = self.writer()?;
-        w.set_content_methods(methods);
-        // One pack for the whole batch. This is the solid part: every entry in it shares one LZMA2
-        // dictionary, which is where both the size win and the multi-threading come from.
-        w.push_archive_entries(entries, readers).map_err(map_sz)?;
+        self.drain_packs_to_limit()?;
+        let (tx, rx) = sync_channel(1);
+        rayon::spawn_fifo(move || {
+            // FIFO for the same reason as the ZIP writer: the appending thread blocks on the OLDEST
+            // pack, and a LIFO queue runs that one last.
+            let _ = tx.send(prepare_pack(methods, entries, readers).map_err(map_sz));
+        });
+        self.pending_packs.push_back(rx);
+        Ok(())
+    }
+
+    /// Append the oldest finished pack. `Ok(false)` when nothing is in flight.
+    fn drain_one_pack(&mut self) -> Result<bool> {
+        let Some(rx) = self.pending_packs.pop_front() else {
+            return Ok(false);
+        };
+        let pack = rx
+            .recv()
+            .map_err(|_| ArchiveError::Backend("7z: pack compression worker died".into()))??;
+        self.writer()?.push_prepared_pack(pack).map_err(map_sz)?;
         self.packs_written += 1;
+        Ok(true)
+    }
+
+    fn drain_packs_to_limit(&mut self) -> Result<()> {
+        while self.pending_packs.len() >= self.inflight_max {
+            if !self.drain_one_pack()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_all_packs(&mut self) -> Result<()> {
+        while self.drain_one_pack()? {}
         Ok(())
     }
 
@@ -490,7 +551,12 @@ impl SevenZArchiveWriter {
     fn content_methods(&self, store: bool, bytes: u64) -> Vec<EncoderConfiguration> {
         let compress: EncoderConfiguration = if store {
             EncoderConfiguration::new(EncoderMethod::COPY)
-        } else if self.solid && self.threads > 1 && bytes >= self.chunk.saturating_mul(2) {
+        } else if self.solid {
+            // Single-threaded on purpose: parallelism comes from compressing whole packs at once
+            // now, and LZMA2's own chunked MT costs ratio because a match cannot cross a chunk
+            // boundary. One uninterrupted stream per pack is both faster in aggregate and smaller.
+            Lzma2Options::from_level(self.level).into()
+        } else if self.threads > 1 && bytes >= self.chunk.saturating_mul(2) {
             // LZMA2's own multi-threading splits the input into independent chunks, each clamped to
             // at least the dictionary. That does nothing for a 27 KB entry in its own pack, which is
             // why non-solid create could never use more than one core; inside a 64 MiB block it is
@@ -613,6 +679,7 @@ impl ArchiveWriter for SevenZArchiveWriter {
 
     fn finish(mut self: Box<Self>) -> Result<CreateReport> {
         self.flush_block()?;
+        self.drain_all_packs()?;
         if std::env::var_os("CRAM_PROFILE").is_some() {
             eprintln!(
                 "-- 7z blocks --------------------------------------------------\n\
