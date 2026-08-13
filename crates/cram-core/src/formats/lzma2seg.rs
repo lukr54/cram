@@ -106,20 +106,43 @@ pub(crate) fn walk(file: &mut File, off: u64, len: u64) -> io::Result<Option<Vec
     Ok(None)
 }
 
+/// Decode an LZMA2 coder's declared dictionary size from its one property byte.
+///
+/// The encoding is `(2 | (b & 1)) << (b / 2 + 11)`, with 40 meaning the whole address space and
+/// anything above that undefined. **The byte comes from the archive**, so an absurd value must be a
+/// refusal rather than an allocation; the caller additionally never enlarges its own bound with
+/// this, only shrinks it.
+pub(crate) fn declared_dict(props: &[u8]) -> Option<u32> {
+    let &[b] = props else { return None };
+    match b {
+        0..=39 => Some((2 | (b as u32 & 1)) << (b / 2 + 11)),
+        40 => Some(u32::MAX),
+        _ => None,
+    }
+}
+
 /// The dictionary window a decoder needs to serve `seg`, having also to read `spill` bytes past its
 /// end for an entry that straddles the boundary.
 ///
-/// The archive's declared dictionary size would be the exact answer, but `sevenz-rust2` keeps coder
-/// properties private, so it is not reachable from here. The segment's own length is an upper bound
-/// that is always safe: the segment begins at a dictionary reset, so no match inside it can reach
-/// further back than its start. On 7-Zip's output the real dictionary is a quarter of the thread
-/// block, so this over-allocates about 4x — worth recovering if a `Coder::properties()` accessor
-/// ever lands upstream, and correct in the meantime.
+/// Two bounds, and the smaller wins.
 ///
-/// `spill` is covered because reading past the boundary crosses another reset, after which match
-/// distances are bounded by the bytes produced since it.
-pub(crate) fn dict_window(seg: &Segment, spill: u64) -> u32 {
-    seg.unpacked.max(spill).min(u32::MAX as u64) as u32
+/// The segment's own length is always safe on its own: a segment begins at a dictionary reset, so no
+/// match inside it can reach further back than its start. `spill` is covered for the same reason —
+/// reading past the boundary crosses another reset, after which distances are bounded by the bytes
+/// produced since it. That was the only bound available while `sevenz-rust2` kept coder properties
+/// private, and on 7-Zip's output it over-allocates about fourfold, the real dictionary being a
+/// quarter of the thread block.
+///
+/// `declared` is the archive's own answer and is exact. It is **only ever used to shrink** the
+/// window, never to grow it: the value is attacker-controlled, and a crafted 1.5 GiB dictionary
+/// multiplied by the worker count is an out-of-memory from a small file. Taking the minimum makes
+/// this provably no worse than the segment bound it replaces.
+pub(crate) fn dict_window(seg: &Segment, spill: u64, declared: Option<u32>) -> u32 {
+    let bound = seg.unpacked.max(spill).min(u32::MAX as u64) as u32;
+    match declared {
+        Some(d) => d.min(bound),
+        None => bound,
+    }
 }
 
 #[cfg(test)]
@@ -232,7 +255,45 @@ mod tests {
             unpacked_start: 0,
             unpacked: 1000,
         };
-        assert_eq!(dict_window(&s, 0), 1000);
-        assert_eq!(dict_window(&s, 4000), 4000);
+        assert_eq!(dict_window(&s, 0, None), 1000);
+        assert_eq!(dict_window(&s, 4000, None), 4000);
+    }
+
+    /// The declared dictionary is the exact answer and is what makes the window small. The whole
+    /// point of reading it is this case: a 128 MiB segment written with a 32 MiB dictionary.
+    #[test]
+    fn a_declared_dictionary_shrinks_the_window() {
+        let s = Segment {
+            comp_off: 0,
+            unpacked_start: 0,
+            unpacked: 128 << 20,
+        };
+        assert_eq!(dict_window(&s, 0, Some(32 << 20)), 32 << 20);
+    }
+
+    /// A crafted dictionary must never enlarge the allocation. This is the bound that keeps a small
+    /// hostile file from asking for gigabytes per worker.
+    #[test]
+    fn a_declared_dictionary_can_never_grow_the_window() {
+        let s = Segment {
+            comp_off: 0,
+            unpacked_start: 0,
+            unpacked: 1000,
+        };
+        assert_eq!(dict_window(&s, 0, Some(u32::MAX)), 1000);
+        assert_eq!(dict_window(&s, 0, Some(1500 << 20)), 1000);
+        assert_eq!(dict_window(&s, 4000, Some(3000)), 3000);
+    }
+
+    #[test]
+    fn the_dictionary_byte_decodes_and_absurd_values_are_refused() {
+        assert_eq!(declared_dict(&[0]), Some(4 << 10)); // 4 KiB, the minimum
+        assert_eq!(declared_dict(&[24]), Some(16 << 20)); // 16 MiB
+        assert_eq!(declared_dict(&[26]), Some(32 << 20)); // 32 MiB, 7-Zip's -mx=5 default
+        assert_eq!(declared_dict(&[40]), Some(u32::MAX));
+        assert_eq!(declared_dict(&[41]), None); // out of range
+        assert_eq!(declared_dict(&[255]), None);
+        assert_eq!(declared_dict(&[]), None); // no properties at all
+        assert_eq!(declared_dict(&[26, 0]), None); // not an LZMA2 property block
     }
 }

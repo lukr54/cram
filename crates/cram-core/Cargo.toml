@@ -44,7 +44,17 @@ tar = "0.4"                                                            # tar con
 # `deflate` is deliberately OFF: sevenz-rust2 hard-pins flate2's `zlib-rs` backend, which would drag the
 # whole build's DEFLATE (incl. the ZIP spine above) onto buggy zlib-rs 0.6.6. DEFLATE inside a .7z is
 # rare (7z uses LZMA/LZMA2), so dropping it is worth keeping every DEFLATE path on miniz_oxide.
-sevenz-rust2 = { version = "0.21.3", default-features = false, features = [
+#
+# The dependency is renamed rather than forked in place: `sevenz-rust2-cram` is upstream 0.21.3 plus
+# two additions (off-thread pack preparation, and a `Coder::properties` accessor), both offered
+# upstream as pull requests. Its lib is still `sevenz_rust2`, so `use sevenz_rust2::…` is unchanged
+# throughout and switching back is one line here. A crate published to crates.io cannot depend on a
+# git dependency or a `[patch.crates-io]` entry, which is the only reason the fork is published at
+# all -- see its NOTICE.
+# FIXME(unmergeable): `path` builds against the local fork so this can be measured before anything is
+# published. It MUST come off before this branch merges -- CI checks out only this repo and the path
+# does not exist there. `version` alone is the shipping form, once the crate is on crates.io.
+sevenz-rust2 = { package = "sevenz-rust2-cram", version = "0.21.3", path = "../../../sevenz-rust2-cram", default-features = false, features = [
     "aes256",
     "bzip2",
     "compress",
