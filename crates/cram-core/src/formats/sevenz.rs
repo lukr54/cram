@@ -355,14 +355,39 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// What a block costs to serve: how many entries share it, and whether its decoded form fits the
+/// per-worker budget. Computed once at open; see [`SevenZRandomAccess::build`].
+struct BlockPlan {
+    /// Entries with a stream in this block. `1` means caching it buys nothing.
+    entries: usize,
+    /// Whether the decoded block fits the per-worker cache budget.
+    fits: bool,
+}
+
 /// Random access over a 7z archive, by decoding whole blocks and serving entries from the last one.
 ///
-/// 7z is solid: an entry cannot be decoded without decoding its block from the start, so per-entry
-/// random access is only viable if the decoded block can be kept. That is fine for archives cram
-/// writes (bounded solid blocks) and impossible for the general case — **7-Zip's own default puts
-/// the entire archive in one block**, and caching that means holding the whole uncompressed archive
-/// per worker. [`SevenZReader::as_random_access`] therefore offers this only when the largest block
-/// fits the budget, and otherwise returns `None`, leaving the sequential path exactly as it was.
+/// 7z is solid: an entry cannot be decoded without decoding its block from the start, so serving
+/// many entries from one block is only viable if the decoded block can be kept. That is fine for
+/// archives cram writes (bounded solid blocks) and impossible for the general case — **7-Zip's own
+/// default puts the entire archive in one block**, and caching that means holding the whole
+/// uncompressed archive per worker.
+///
+/// The cache is what amortises a decode across a block's *other* entries, so a block holding one
+/// entry gains nothing from it: there is no second reader to serve, and buffering the whole entry
+/// only to write it out again costs memory for no decode saved. Those blocks are streamed instead,
+/// and the budget does not apply to them.
+///
+/// **That distinction is the difference between this path running and not running.** Budgeting on
+/// the largest block outright, as this first did, refused the published benchmark corpus over a
+/// single 263.3 MiB block against a 249.6 MiB budget — one stored video, alone in its block, needing
+/// no cache — and with it the 48 ordinary blocks behind it. Extraction stayed at 1.30 effective
+/// cores. Excluding single-entry blocks from the budget takes the same corpus to 4.63 cores and
+/// 2.67 s against 8.34 s.
+///
+/// A block that is over budget *and* holds many entries is still refused for the whole archive:
+/// streaming it would re-decode it once per entry, which for 7-Zip's one-folder default would mean
+/// decoding 2.6 GB tens of thousands of times. [`SevenZReader::as_random_access`] then returns
+/// `None` and the sequential path runs exactly as before.
 pub struct SevenZRandomAccess {
     id: u64,
     path: PathBuf,
@@ -371,12 +396,30 @@ pub struct SevenZRandomAccess {
     entries: Vec<Entry>,
     /// cram entry index → `(block index, archive file index)`; `None` for entries with no stream.
     loc: Vec<Option<(usize, usize)>>,
+    /// Per block, indexed by block number.
+    plan: Vec<BlockPlan>,
     blocks: usize,
 }
 
 impl SevenZRandomAccess {
     /// Build the view, or `None` when block-caching would not be safe.
     fn build(path: &Path, secret: &Secret, entries: &[Entry]) -> Option<Self> {
+        // The budget is per worker, since each caches its own block.
+        let hw = crate::hw::HwProfile::detect();
+        let per_thread = (hw.ram_total / BLOCK_CACHE_RAM_FRACTION) / hw.physical.max(1) as u64;
+        Self::build_within(path, secret, entries, per_thread)
+    }
+
+    /// [`build`](Self::build) with the cache budget supplied rather than derived, so the decision
+    /// this makes can be tested against a real archive without needing one sized in gigabytes. The
+    /// gate is the part that silently turned the whole parallel path off, and it went unnoticed
+    /// until a benchmark measured it, so it is worth being able to assert on directly.
+    fn build_within(
+        path: &Path,
+        secret: &Secret,
+        entries: &[Entry],
+        per_thread: u64,
+    ) -> Option<Self> {
         let password = Password::new(secret.expose());
         let mut file = std::fs::File::open(path).ok()?;
         let archive = sevenz_rust2::Archive::read(&mut file, &password).ok()?;
@@ -391,16 +434,30 @@ impl SevenZRandomAccess {
             return None;
         }
 
-        // The budget is per worker, since each caches its own block.
-        let hw = crate::hw::HwProfile::detect();
-        let per_thread = (hw.ram_total / BLOCK_CACHE_RAM_FRACTION) / hw.physical.max(1) as u64;
-        let largest = archive
+        // How many entries share each block. A block is usually over budget *because* it holds one
+        // large file, and that block is exactly the one the cache cannot help, so count first and
+        // judge after.
+        let mut per_block = vec![0usize; archive.blocks.len()];
+        for b in archive.stream_map.file_block_index.iter().flatten() {
+            // A block index the block list does not have: refuse rather than guess.
+            *per_block.get_mut(*b)? += 1;
+        }
+
+        let plan: Vec<BlockPlan> = archive
             .blocks
             .iter()
-            .map(|b| b.get_unpack_size())
-            .max()
-            .unwrap_or(0);
-        if largest == 0 || largest > per_thread {
+            .zip(&per_block)
+            .map(|(b, &entries)| BlockPlan {
+                entries,
+                fits: b.get_unpack_size() <= per_thread,
+            })
+            .collect();
+
+        // Refuse only for a block that needs the cache and cannot have it. Single-entry blocks are
+        // streamed, so their size is not this decision's business. An archive with no block holding
+        // any bytes has nothing for this path to do and is left to the sequential one.
+        let has_content = archive.blocks.iter().any(|b| b.get_unpack_size() > 0);
+        if plan.is_empty() || !has_content || plan.iter().any(|p| p.entries > 1 && !p.fits) {
             return None;
         }
 
@@ -426,6 +483,7 @@ impl SevenZRandomAccess {
             archive,
             entries: entries.to_vec(),
             loc,
+            plan,
             blocks,
         })
     }
@@ -478,6 +536,66 @@ impl SevenZRandomAccess {
             .map_err(map_sevenz)?;
         Ok(out)
     }
+
+    /// Decode one entry straight into `sink`, holding no more than the copy buffer.
+    ///
+    /// The counterpart to [`decode_block`](Self::decode_block), for the blocks where caching is the
+    /// wrong trade: a block holding one entry (the cache would save no decode) or one too large to
+    /// hold (the gate has already established that such a block holds one entry). Callers get the
+    /// same bytes either way; the difference is peak memory.
+    ///
+    /// `skip` bytes are discarded first and at most `limit` are copied, so this serves a range as
+    /// well as a whole entry. Decoding still starts at the block, because 7z has no way in.
+    fn stream_entry(
+        &self,
+        block: usize,
+        file_idx: usize,
+        skip: u64,
+        limit: u64,
+        sink: &mut dyn io::Write,
+    ) -> Result<u64> {
+        let mut file = std::fs::File::open(&self.path)
+            .map_err(|e| ArchiveError::Backend(format!("{}: {e}", self.path.display())))?;
+        let decoder =
+            sevenz_rust2::BlockDecoder::new(1, block, &self.archive, &self.password, &mut file);
+        let first = self.archive.stream_map.block_first_file_index[block];
+        let mut n = 0usize;
+        let mut written = 0u64;
+        let mut found = false;
+        decoder
+            .for_each_entries(&mut |_entry, reader| {
+                let this = first + n;
+                n += 1;
+                if this != file_idx {
+                    // Not ours, but the stream is solid and the decoder is positioned mid-block, so
+                    // it has to be advanced past rather than skipped over.
+                    io::copy(reader, &mut io::sink())?;
+                    return Ok(true);
+                }
+                if skip > 0 {
+                    io::copy(&mut Read::take(&mut *reader, skip), &mut io::sink())?;
+                }
+                written = io::copy(&mut Read::take(&mut *reader, limit), sink)?;
+                found = true;
+                // Nothing after this entry is wanted, and finishing the block would decode the rest
+                // of it for nobody.
+                Ok(false)
+            })
+            .map_err(map_sevenz)?;
+        if !found {
+            return Err(ArchiveError::Corrupt(format!(
+                "7z: entry {file_idx} missing from its own block {block}"
+            )));
+        }
+        Ok(written)
+    }
+
+    /// Where entry `index` lives and what its block costs, or `None` when it has no bytes.
+    fn placement(&self, index: usize) -> Option<(usize, usize, &BlockPlan)> {
+        let (block, file_idx) = self.loc.get(index).copied().flatten()?;
+        let plan = self.plan.get(block)?;
+        Some((block, file_idx, plan))
+    }
 }
 
 impl crate::reader::RandomAccessReader for SevenZRandomAccess {
@@ -485,19 +603,37 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
         &self.entries
     }
 
+    /// One shot over the whole entry, so the cache earns its memory only when the block has other
+    /// entries to serve from it. A block of one is streamed however small it is: buffering a file
+    /// in RAM to write it straight back out saves no decode.
     fn copy_entry(&self, index: usize, out: &mut dyn io::Write) -> Result<u64> {
-        self.with_entry_bytes(index, |bytes| {
-            out.write_all(bytes)?;
-            Ok(bytes.len() as u64)
-        })?
+        match self.placement(index) {
+            Some((block, file_idx, plan)) if plan.entries == 1 || !plan.fits => {
+                self.stream_entry(block, file_idx, 0, u64::MAX, out)
+            }
+            _ => self.with_entry_bytes(index, |bytes| {
+                out.write_all(bytes)?;
+                Ok(bytes.len() as u64)
+            })?,
+        }
     }
 
+    /// The mount primitive, called repeatedly with small ranges of one entry, so here the cache is
+    /// worth having even for a block of one — streaming would decode the block again per range.
+    /// Only a block too large to hold is streamed, and the gate guarantees it holds one entry.
     fn read_range(&self, index: usize, off: u64, len: u64) -> Result<Vec<u8>> {
-        self.with_entry_bytes(index, |bytes| {
-            let start = (off as usize).min(bytes.len());
-            let end = start.saturating_add(len as usize).min(bytes.len());
-            bytes[start..end].to_vec()
-        })
+        match self.placement(index) {
+            Some((block, file_idx, plan)) if !plan.fits => {
+                let mut buf = Vec::new();
+                self.stream_entry(block, file_idx, off, len, &mut buf)?;
+                Ok(buf)
+            }
+            _ => self.with_entry_bytes(index, |bytes| {
+                let start = (off as usize).min(bytes.len());
+                let end = start.saturating_add(len as usize).min(bytes.len());
+                bytes[start..end].to_vec()
+            }),
+        }
     }
 
     /// The block, so the engine keeps a block's entries on one worker and decodes it about once.
@@ -668,5 +804,141 @@ mod mtime_guard_tests {
         // The presence flag is honored.
         e.has_last_modified_date = false;
         assert!(seven_z_mtime(&e).is_none());
+    }
+}
+
+/// The cache budget decides whether 7z extraction runs in parallel at all, and getting it wrong is
+/// invisible: extraction still succeeds, just on one thread. That is exactly what happened —
+/// budgeting on the largest block outright refused the published benchmark corpus over one 263.3
+/// MiB stored video sitting alone in its block, taking the other 48 blocks down with it, and only a
+/// benchmark noticed. These assert on the decision rather than on a timing.
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// A two-block archive: one block holding several small entries, one holding a single large
+    /// entry. Returns the archive path and the entry list read back from it.
+    fn two_block_archive(dir: &Path, big: usize) -> (PathBuf, Vec<Entry>) {
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..8 {
+            std::fs::write(
+                src.join(format!("small{i}.txt")),
+                vec![b'a' + i as u8; 4096],
+            )
+            .unwrap();
+        }
+        // Incompressible, so the writer stores it and the block is its full size.
+        let mut noise = Vec::with_capacity(big);
+        let mut x = 0x9E3779B97F4A7C15u64;
+        while noise.len() < big {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            noise.extend_from_slice(&x.to_le_bytes());
+        }
+        noise.truncate(big);
+        std::fs::write(src.join("big.bin"), &noise).unwrap();
+
+        let out = dir.join("a.7z");
+        crate::engine::create::create(
+            &out,
+            Format::sevenz(),
+            std::slice::from_ref(&src),
+            crate::writer::CreateOptions::default(),
+            &crate::progress::NullSink,
+        )
+        .unwrap();
+        let entries = read_metadata(&out, &Secret::new(String::new())).unwrap();
+        (out, entries)
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("cram-7z-gate-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The corpus case: one block over budget, holding one entry. It must NOT veto the archive —
+    /// that block is streamed and every other block still gets the cache.
+    #[test]
+    fn a_single_entry_block_over_budget_does_not_refuse_the_archive() {
+        let dir = scratch("single");
+        let big = 512 * 1024;
+        let (path, entries) = two_block_archive(&dir, big);
+        let secret = Secret::new(String::new());
+
+        // A budget under the big block but over the small one: the exact 5.5%-miss shape.
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, (big / 2) as u64)
+            .expect("a single-entry block over budget must not refuse the archive");
+        assert!(
+            ra.plan.iter().any(|p| !p.fits && p.entries == 1),
+            "test archive did not produce the over-budget single-entry block it is about"
+        );
+
+        // Every entry still reads back correctly, streamed or cached.
+        for (i, e) in entries.iter().enumerate() {
+            if e.kind != EntryKind::File {
+                continue;
+            }
+            let mut got = Vec::new();
+            let n = crate::reader::RandomAccessReader::copy_entry(&ra, i, &mut got).unwrap();
+            let name = e.path.safe().file_name().unwrap();
+            let want = std::fs::read(dir.join("src").join(name)).unwrap();
+            assert_eq!(n, want.len() as u64, "{}", e.path.raw());
+            assert_eq!(got, want, "{}", e.path.raw());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case the budget exists for: a block over budget that many entries share. Streaming it
+    /// would re-decode it once per entry, so the whole archive falls back to sequential.
+    #[test]
+    fn a_multi_entry_block_over_budget_still_refuses_the_archive() {
+        let dir = scratch("multi");
+        let (path, entries) = two_block_archive(&dir, 512 * 1024);
+        let secret = Secret::new(String::new());
+        // One byte of budget: even the small shared block cannot be held.
+        assert!(
+            SevenZRandomAccess::build_within(&path, &secret, &entries, 1).is_none(),
+            "a shared block that cannot be cached must fall back to the sequential path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A range served by streaming must match one served from the cache, since the same entry can
+    /// take either path depending only on how big its block is.
+    #[test]
+    fn a_streamed_range_matches_a_cached_one() {
+        let dir = scratch("range");
+        let big = 512 * 1024;
+        let (path, entries) = two_block_archive(&dir, big);
+        let secret = Secret::new(String::new());
+        let idx = entries
+            .iter()
+            .position(|e| e.path.raw().ends_with("big.bin"))
+            .unwrap();
+
+        let cached = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+        let streamed =
+            SevenZRandomAccess::build_within(&path, &secret, &entries, (big / 2) as u64).unwrap();
+        assert!(cached.plan.iter().all(|p| p.fits));
+        assert!(streamed.plan.iter().any(|p| !p.fits));
+
+        use crate::reader::RandomAccessReader;
+        for (off, len) in [
+            (0u64, 100u64),
+            (1000, 4096),
+            (big as u64 - 10, 64),
+            (0, u64::MAX),
+        ] {
+            assert_eq!(
+                RandomAccessReader::read_range(&cached, idx, off, len).unwrap(),
+                RandomAccessReader::read_range(&streamed, idx, off, len).unwrap(),
+                "range {off}+{len}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
