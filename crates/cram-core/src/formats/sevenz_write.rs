@@ -394,33 +394,48 @@ impl SevenZArchiveWriter {
     /// second failure is a real error and is reported as one.
     fn open_for_block(&mut self, path: &Path) -> Result<File> {
         match File::open(path) {
-            Ok(f) => Ok(f),
-            Err(e) if out_of_descriptors(&e) && !self.block.is_empty() => {
-                // Flush and retry, and deliberately DO NOT remember this. An earlier version
-                // ratcheted `entry_cap` down to the block length here, to avoid meeting the limit
-                // once per block. That made a momentary shortage permanent: a Defender scan briefly
-                // consumed handles mid-run, the cap stuck at a few hundred entries, every later
-                // block fell under the size where LZMA2 MT is worth starting, and the archive took
-                // 160s instead of 86s with 105 packs instead of 34. Three consecutive runs
-                // reproduced it, which is what made it look like a code regression.
-                //
-                // Meeting the limit once per block costs one failed open. That is cheaper than any
-                // amount of remembering, and it means the block size tracks conditions now rather
-                // than the worst moment the process has ever seen.
-                //
-                // Draining a FINISHED pack comes first, and matters now that packs compress
-                // asynchronously: flushing the open block hands its handles to a worker that keeps
-                // them until it is done, so flushing alone can release nothing at all. In-flight
-                // packs are what hold most of the descriptors -- in-flight × entries-per-pack -- so
-                // waiting for the oldest to land is what actually frees them.
-                if !self.drain_one_pack()? {
-                    self.flush_block()?;
-                }
-                File::open(path)
-                    .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))
+            Ok(f) => return Ok(f),
+            // Anything that is not a descriptor shortage is a real error about this file.
+            Err(e) if !out_of_descriptors(&e) => {
+                return Err(ArchiveError::Backend(format!("{}: {e}", path.display())));
             }
-            Err(e) => Err(ArchiveError::Backend(format!("{}: {e}", path.display()))),
+            Err(_) => {}
         }
+
+        // **Release until the open succeeds, rather than once.** A single drain was not enough and
+        // could not have been: a block holds up to SOLID_BLOCK_ENTRIES handles and there are up to
+        // `inflight_max` packs holding as many again, so the writer can want 8192 × (24 + 1) handles
+        // on a 24-thread machine — around 205,000, against a raised soft limit of 65,536. Creating a
+        // `.7z` of the 86,618-file kernel tree failed outright with `Too many open files`, on a tree
+        // 7-Zip archives without complaint.
+        //
+        // Cheapest first: a finished pack costs only the wait for a worker that is probably already
+        // done, while flushing the open block gives up solid compression across the entries in it.
+        // Retry after every step, so a run that meets the limit early does the least work that gets
+        // it past.
+        //
+        // Deliberately still remembers nothing. An earlier version ratcheted the entry cap down here
+        // and made a momentary shortage permanent: a Defender scan briefly consumed handles mid-run,
+        // the cap stuck at a few hundred entries, every later block fell under the size where LZMA2
+        // MT is worth starting, and the archive took 160s instead of 86s with 105 packs instead of
+        // 34. Meeting the limit again next block costs one failed open, which is cheaper than any
+        // amount of remembering.
+        while self.drain_one_pack()? {
+            if let Ok(f) = File::open(path) {
+                return Ok(f);
+            }
+        }
+        if !self.block.is_empty() {
+            // Flushing hands this block's handles to a worker, which keeps them until it is done,
+            // so the flush alone can release nothing at all. Drain what it queued.
+            self.flush_block()?;
+            while self.drain_one_pack()? {
+                if let Ok(f) = File::open(path) {
+                    return Ok(f);
+                }
+            }
+        }
+        File::open(path).map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))
     }
 
     /// Hand the open block to the pool as one pack, and start a new one.
