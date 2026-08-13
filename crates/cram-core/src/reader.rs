@@ -129,6 +129,26 @@ pub trait RandomAccessReader: Send + Sync {
         false
     }
 
+    /// Where a *single* entry can be cut so its pieces decode independently, as byte ranges covering
+    /// it in order. `None`, the default, means it has to be produced in one pass.
+    ///
+    /// This is the other half of [`decode_units`](Self::decode_units). That one says how wide the
+    /// archive can fan out; this one says how wide **one entry** can, which is the number that
+    /// matters when an archive holds very few of them. A 1 GB `.cram` of a single file spans sixty
+    /// independent packs and still extracted on one thread, because the engine's unit of work is the
+    /// entry and there was only ever one — 9.03 s against 7-Zip's 1.61 s, at 1.0 effective cores
+    /// against 4.4.
+    ///
+    /// Ranges must be **aligned to the backend's own decode boundaries**. Cutting mid-unit would
+    /// make neighbouring workers decode the same unit twice, turning a fan-out into extra work; the
+    /// engine cannot know where those boundaries are, so the backend picks them.
+    ///
+    /// Only consulted for an entry large enough to be worth splitting, and only when the extraction
+    /// has workers to spare. Returning `Some` with fewer than two ranges is the same as `None`.
+    fn entry_splits(&self, _index: usize) -> Option<Vec<(u64, u64)>> {
+        None
+    }
+
     /// Serve `indices` in one pass over their decode unit, handing each entry's index and a reader
     /// over its uncompressed bytes to `visit`, in archive order. `visit` returns `false` to stop the
     /// pass (cancellation). Only called when [`streams_units`](Self::streams_units) is `true`.

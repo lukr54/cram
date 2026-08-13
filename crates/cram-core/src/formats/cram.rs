@@ -2849,6 +2849,58 @@ impl RandomAccessReader for CramReader {
         Some(self.packs.len())
     }
 
+    /// Cut at pack boundaries, so two workers never decode the same pack.
+    ///
+    /// A `.cram` entry is a list of chunks and every chunk names the pack holding it. Consecutive
+    /// chunks usually share a pack, so walking the list and starting a new range whenever the pack
+    /// id changes gives exactly the seams that make the pieces independent. Any other cut point
+    /// would put one pack in two ranges and decode it twice.
+    ///
+    /// Ranges are merged up to `SPLIT_TARGET` so a fan-out over an entry with hundreds of small
+    /// packs does not become hundreds of tasks; and refused entirely below `SPLIT_MIN`, where the
+    /// scheduling costs more than the decode saves.
+    ///
+    /// A Lepton-recompressed entry is refused: the whole image is one arithmetic-coded unit and
+    /// cannot be entered part-way, which is the same reason `read_range` reconstructs it whole.
+    fn entry_splits(&self, index: usize) -> Option<Vec<(u64, u64)>> {
+        /// Below this an entry is not worth splitting: the decode is short enough that scheduling
+        /// dominates.
+        const SPLIT_MIN: u64 = 32 << 20;
+        /// Aim for pieces about this big, merging adjacent packs to reach it.
+        const SPLIT_TARGET: u64 = 16 << 20;
+
+        if self.transform_of(index) == XFORM_LEPTON {
+            return None;
+        }
+        let ids = self.entry_chunks.get(index)?;
+        let total: u64 = ids
+            .iter()
+            .map(|&c| self.chunks.get(c as usize).map_or(0, |c| c.length as u64))
+            .sum();
+        if total < SPLIT_MIN {
+            return None;
+        }
+
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        let mut cur = 0u64; // offset within the entry
+        let mut start = 0u64; // where the range being built began
+        let mut pack: Option<u32> = None;
+        for &cid in ids {
+            let c = self.chunks.get(cid as usize)?;
+            // A new pack is a legal cut; take it only once the range in hand is big enough.
+            if pack.is_some() && pack != Some(c.pack_id) && cur - start >= SPLIT_TARGET {
+                out.push((start, cur - start));
+                start = cur;
+            }
+            pack = Some(c.pack_id);
+            cur += c.length as u64;
+        }
+        if cur > start {
+            out.push((start, cur - start));
+        }
+        (out.len() > 1).then_some(out)
+    }
+
     fn read_range(&self, index: usize, off: u64, len: u64) -> Result<Vec<u8>> {
         let ids = self
             .entry_chunks

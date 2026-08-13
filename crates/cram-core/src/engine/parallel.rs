@@ -246,6 +246,12 @@ pub fn run(
         ),
     };
 
+    // Splitting a single entry across workers is only ever worth it when there are workers with
+    // nothing else to do. With more groups than threads the pool is already saturated and a nested
+    // fan-out would just oversubscribe it, so the question is asked once, here, rather than per
+    // entry: are there fewer pieces of work than there are threads to run them?
+    let split_entries = groups.len() < pool.current_num_threads();
+
     pool.install(|| {
         groups.par_iter().for_each(|group| {
             // A backend whose decode unit is expensive serves the whole group in one pass, so its
@@ -276,7 +282,16 @@ pub fn run(
                 // the whole extraction, one bad entry in a big archive can't take down the rest or
                 // crash the host process (which matters for the GUI, which extracts in-process).
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    extract_one(ra, dest, i, &entries[i], skip_existing, sink, created)
+                    extract_one(
+                        ra,
+                        dest,
+                        i,
+                        &entries[i],
+                        skip_existing,
+                        sink,
+                        created,
+                        split_entries,
+                    )
                 }));
                 record(i, outcome);
             }
@@ -363,6 +378,9 @@ pub(crate) fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
 
 /// Extract one entry (position `pos` in `ra.entries()`) to disk, streaming through an 8 MiB writer
 /// that reports progress and honors cancellation. Removes the partial file on error/cancel.
+// Same shape as `extract_unit` above: the extraction context is what it is, and bundling it into a
+// struct to satisfy a count would put a layer between these two functions and the policy they share.
+#[allow(clippy::too_many_arguments)]
 fn extract_one(
     ra: &dyn RandomAccessReader,
     dest: &Path,
@@ -371,10 +389,55 @@ fn extract_one(
     skip_existing: bool,
     sink: &dyn ProgressSink,
     created: &super::unwind::CreatedLog,
+    split: bool,
 ) -> Result<EntryOutcome> {
-    write_entry(dest, entry, skip_existing, sink, created, |w| {
-        ra.copy_entry(pos, w)
-    })
+    let splits = split.then(|| ra.entry_splits(pos)).flatten();
+    write_entry(
+        dest,
+        entry,
+        skip_existing,
+        sink,
+        created,
+        |w| match splits {
+            Some(ranges) => fill_split(ra, pos, &ranges, w),
+            None => ra.copy_entry(pos, w),
+        },
+    )
+}
+
+/// Fill one entry by decoding its pieces concurrently and writing them in order.
+///
+/// The alternative was positional writes from each worker, which would need per-platform `write_at`
+/// / `seek_write` and would have to reimplement everything [`write_entry`] does around the bytes.
+/// This keeps all of that untouched and still buys what matters, because the cost here is decode and
+/// not writing: the entry that motivated this spent 9.03 s of a 9.04 s extraction on one core, with
+/// under half a second of writing to do.
+///
+/// Memory is bounded by decoding one window of `RAYON` ranges at a time rather than mapping the
+/// whole entry: the pieces have to be held until their turn to be written, and an entry can be
+/// arbitrarily large.
+fn fill_split(
+    ra: &dyn RandomAccessReader,
+    pos: usize,
+    ranges: &[(u64, u64)],
+    w: &mut dyn Write,
+) -> Result<u64> {
+    let width = rayon::current_num_threads().max(1);
+    let mut written = 0u64;
+    for window in ranges.chunks(width) {
+        // `collect` into a Vec keeps the results in range order however the pool schedules them,
+        // which is what lets the writes below stay sequential.
+        let parts: Vec<Result<Vec<u8>>> = window
+            .par_iter()
+            .map(|&(off, len)| ra.read_range(pos, off, len))
+            .collect();
+        for part in parts {
+            let bytes = part?;
+            w.write_all(&bytes)?;
+            written += bytes.len() as u64;
+        }
+    }
+    Ok(written)
 }
 
 /// The same entry, from a body the caller already has open rather than one fetched by index. Used by
