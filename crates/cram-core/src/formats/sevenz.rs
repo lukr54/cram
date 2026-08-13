@@ -495,7 +495,7 @@ impl SevenZRandomAccess {
 
         // Cut what can be cut. A block written by a multi-threaded LZMA2 encoder carries dictionary
         // resets, and each is somewhere a decoder can start cold.
-        let segmented = Self::segment_blocks(path, &archive, &mut layouts);
+        let segmented = Self::segment_blocks(path, &archive, &mut layouts, per_thread);
         let is_segmented: Vec<bool> = {
             let mut v = vec![false; archive.blocks.len()];
             for g in &segmented {
@@ -580,6 +580,7 @@ impl SevenZRandomAccess {
         path: &Path,
         archive: &sevenz_rust2::Archive,
         layouts: &mut [Vec<(usize, u64, u64)>],
+        per_thread: u64,
     ) -> Vec<BlockSegments> {
         /// 7z method id for LZMA2.
         const LZMA2: [u8; 1] = [0x21];
@@ -609,6 +610,18 @@ impl SevenZRandomAccess {
             let Ok(Some(segs)) = lzma2seg::walk(&mut file, start, len) else {
                 continue;
             };
+            // Each concurrent segment holds a dictionary window, so the same per-worker budget that
+            // bounds the block cache has to bound these. Workers never exceed the core count and the
+            // budget is a quarter of RAM divided by it, so passing here caps the whole fan-out at a
+            // quarter of RAM however many segments the archive turns out to have.
+            //
+            // Without this the segment path had no memory bound at all: 19 workers each holding a
+            // 128 MiB window reached 2.8 GB on the corpus, which is fine on this machine and would
+            // not have been on a small one.
+            let widest = segs.iter().map(|s| s.unpacked).max().unwrap_or(0);
+            if widest > per_thread {
+                continue;
+            }
             out.push(BlockSegments {
                 block: b,
                 pack_end: start + len,

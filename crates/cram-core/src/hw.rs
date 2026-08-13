@@ -1222,10 +1222,32 @@ pub fn derive_plan(
                 },
                 (Bottleneck::WriteBound, _) => {
                     // Single drive: parallel per-entry writers. A lone sequential writer measured
-                    // slower than parallel on the tested NVMe SSD (one write stream underutilizes the
-                    // drive), so the pipeline is NOT built. ~physical*3/4 keeps some headroom for the
-                    // competing reads on the shared drive; governor tunes.
-                    let workers = ((hw.physical * 3) / 4).clamp(4, 8);
+                    // slower than parallel on the tested NVMe SSD (one write stream underutilizes
+                    // the drive), so the pipeline is NOT built.
+                    //
+                    // Enough workers to keep the drive fed, and no more. Being write-bound is a
+                    // statement about the *ratio* of the two rates, so the worker count has to come
+                    // from the same two numbers rather than from a fraction of the core count:
+                    // saturating a wall of `wall` MiB/s at `decode_rate` MiB/s per worker takes
+                    // `wall / decode_rate` of them, whatever the machine happens to have.
+                    //
+                    // The fixed `(physical * 3 / 4).clamp(4, 8)` this replaces was right only for a
+                    // codec fast enough that eight workers outrun any disk. On a slow one it was
+                    // self-contradicting: extracting a 7-Zip-written archive, `classify` projected
+                    // twenty-one units of LZMA decode against the wall to call it write-bound and
+                    // then ran eight, reaching 620 MiB/s against the 2689 MiB/s wall it had just
+                    // declared itself bound by. The same two numbers now give nineteen.
+                    //
+                    // The old value becomes the FLOOR rather than the answer, so no archive that
+                    // extracts well today gets fewer workers than it got before: this can only add
+                    // them, and only where the codec is slow enough to need them. Byte throughput
+                    // is not the only thing workers buy — 42,151 files is 42,151 creates, and that
+                    // parallelism does not show up in either rate.
+                    //
+                    // Still bounded by the units that actually exist and the cores to run them on.
+                    let floor = ((hw.physical * 3) / 4).clamp(4, 8);
+                    let needed = (wall / rates.decode_rate(codec)).ceil().max(1.0) as usize;
+                    let workers = needed.clamp(floor, blocks.max(1).min(hw.physical).max(floor));
                     Plan {
                         bottleneck,
                         shape: Shape::PerEntry,
@@ -1704,6 +1726,63 @@ mod tests {
         // Verdict: parallel per-entry, NOT a single-writer pipeline.
         assert_eq!(p.shape, Shape::PerEntry);
         assert!(p.workers >= 4 && p.workers <= 8);
+    }
+
+    /// A write-bound plan must field enough workers to actually reach the wall it says it is bound
+    /// by. Extracting a 7-Zip-written archive, the old fixed cap projected twenty-one units of LZMA
+    /// decode to classify it as write-bound and then ran eight of them, which reached under a
+    /// quarter of that wall.
+    #[test]
+    fn a_write_bound_plan_fields_enough_workers_to_saturate_the_wall() {
+        let hw = HwProfile {
+            logical: 24,
+            physical: 24,
+            smt: false,
+            ram_total: 24 << 30,
+            ..HwProfile::detect()
+        };
+        let rates = Rates {
+            deflate_enc: 5.0,
+            deflate_dec: 133.0,
+            lzma_dec: 143.7,
+        };
+        // The measured corpus case: 21 LZMA2 segments, tmpfs wall of 2689 MiB/s.
+        let p = derive_plan(
+            Op::Extract,
+            Codec::Lzma,
+            21,
+            &hw,
+            Topology::SameDrive,
+            &rates,
+            2689.0,
+        );
+        assert_eq!(p.bottleneck, Bottleneck::WriteBound);
+        // 2689 / 143.7 = 18.7, so nineteen -- not the eight a fraction of the cores would give.
+        assert_eq!(p.workers, 19);
+
+        // Never more workers than there are units to run on them.
+        let few = derive_plan(
+            Op::Extract,
+            Codec::Lzma,
+            3,
+            &hw,
+            Topology::SameDrive,
+            &rates,
+            2689.0,
+        );
+        assert!(few.workers <= 8, "3 units must not ask for 19 workers");
+
+        // A codec fast enough to outrun the drive keeps the old count: this only ever adds workers.
+        let fast = derive_plan(
+            Op::Extract,
+            Codec::Zstd,
+            2000,
+            &hw,
+            Topology::SameDrive,
+            &rates,
+            194.0,
+        );
+        assert_eq!(fast.workers, 8);
     }
 
     #[test]
