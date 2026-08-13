@@ -14,7 +14,28 @@ Machines: Ryzen 7 3700X / 16T / 15.9 GiB / Windows 11, and Ryzen 9 5900X / 24 vC
 
 ## 1. Extraction of many small files is pathologically slow
 
-**Severity: highest. Unresolved.**
+**Severity: highest. RESOLVED, confirmed by measurement 2026-08-14.**
+
+Re-run on the same corpus and the same machine. `--best` is now spelled `--small`:
+
+| kernel tree, 86,618 files, 1605 MiB, to tmpfs | wall | files/s | MiB/s | peak |
+|---|---|---|---|---|
+| `.cram --small` (XZ packs) | **2.92 s** | 29,664 | 482 | 1713 MB |
+| `.cram` default (zstd packs) | **2.32 s** | 37,335 | 607 | 962 MB |
+| 7-Zip, same tree | 3.59 s | 25,973 | — | 1615 MB |
+
+**760× the finding's 39 files/s**, and faster than 7-Zip on the same content. Every one of the
+86,618 files verified byte-identical to the source tree at both levels.
+
+**The hypothesis in this item was right.** LPT ordering scheduled neighbouring workers onto
+unrelated packs and the pack cache thrashed. The fix is `locality_key` plus `coalesce_locality` in
+`engine/parallel.rs`: entries sharing a pack become one work item, scheduled together, so a pack is
+decoded about once instead of once per entry that touches it. Items 12 and 13 are the same defect
+seen from the verify side.
+
+The original text follows, since the reasoning is what made it findable.
+
+---
 
 Extracting the 94,753-file kernel tree from a `--best` `.cram` archive ran at a sustained
 **39 files/s / ~1.3 MiB/s** while occupying 7.7 cores. After 666 s it had written 24,452
@@ -51,7 +72,26 @@ workers sharing a pack run together.
 
 ## 2. `cram t` is single-threaded
 
-**Severity: high. Cause confirmed.**
+**Severity: high. RESOLVED, confirmed by measurement 2026-08-14.**
+
+Same corpus, same machine, two rounds each:
+
+| `cram t`, kernel tree | was | now | 7-Zip |
+|---|---|---|---|
+| `--small` (XZ packs) | 17.64 s | **1.10 s** | 1.08 s |
+| default (zstd packs) | 3.05 s | **0.90 s** | — |
+
+16× at `--small`, and level with 7-Zip rather than eleven times behind it. **The claim below that
+this is "the one clearly published weakness in `BENCHMARKS.md`" is no longer true** and that document
+no longer says so.
+
+Fixed by items 12 and 13 — `.cram` reported one decode unit, and verify's unit of work was the entry
+rather than the pack, so every pack was decompressed 2.31 times. Verify now takes the same
+`copy_unit` path extraction does.
+
+The original text follows.
+
+---
 
 `engine/verify.rs` contains no `rayon`, no `par_iter`, no `ThreadPool` and no worker count.
 It streams entries one at a time.
