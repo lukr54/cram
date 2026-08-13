@@ -190,7 +190,7 @@ pub fn extract(
         let hw = HwProfile::detect_for(dest);
         let (rates, wall) = rates_and_wall(&hw, dest);
         let units = units.unwrap_or_else(|| block_count(fmt, entries));
-        let plan = hw::derive_plan(
+        let mut plan = hw::derive_plan(
             Op::Extract,
             plan_codec(fmt, entries),
             // The backend's own count where it has one (`.cram` packs); the entry list otherwise.
@@ -200,6 +200,22 @@ pub fn extract(
             &rates,
             wall,
         );
+        // `CRAM_WORKERS=n` forces the pool width, for measuring what the plan is worth.
+        //
+        // There was no way to ask "what would this cost on four cores": `taskset` narrows which CPUs
+        // the process may use without narrowing `hw.physical`, so the plan still asks for twenty-four
+        // workers and simply gets them descheduled. That measures contention rather than the count.
+        // Deliberately not a CLI flag; the planner's whole thesis is that it decides this better than
+        // a person can, and an override belongs beside `CRAM_PROFILE` as a diagnostic. It is echoed
+        // in the profile line below so it can never be quietly in effect during a benchmark.
+        let forced = std::env::var("CRAM_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        if let Some(n) = forced {
+            plan.workers = n;
+            plan.writers = plan.writers.min(n);
+        }
         // Why this extraction ran the way it did, on request. Every input to the decision, because
         // the useless answer is the one that says what was chosen without saying what decided it.
         // Working out why 7z extraction used two cores on twelve and twelve on twenty-four took an
@@ -220,6 +236,11 @@ pub fn extract(
                 reader.as_random_access().is_some(),
                 plan.note,
             );
+            if let Some(n) = forced {
+                eprintln!(
+                    "cram: FORCED workers={n} via CRAM_WORKERS (the plan did not choose this)"
+                );
+            }
         }
         plan
     };
