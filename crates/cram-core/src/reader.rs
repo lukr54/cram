@@ -105,6 +105,22 @@ pub trait RandomAccessReader: Send + Sync {
         None
     }
 
+    /// Whether every entry sharing a [`locality_key`](Self::locality_key) should become ONE work
+    /// item rather than many adjacent ones.
+    ///
+    /// Clustering alone only makes same-unit groups *adjacent* in the schedule. Rayon still steals
+    /// across that list, so a worker hops between units and a backend that caches "the unit I am
+    /// currently decoding" evicts on every hop. Measured on a 34-block 7z: entries stayed adjacent,
+    /// workers scattered anyway, and decoding the archive cost **110 CPU-seconds instead of 11** —
+    /// ten re-decodes of every block — for almost no wall-clock gain.
+    ///
+    /// Coalescing trades load-balancing granularity for that: 34 items instead of 41,305, each
+    /// decoded exactly once. Right when a unit is expensive to decode and holds many entries; wrong
+    /// when entries decode independently, which is why it is off by default.
+    fn coalesce_locality(&self) -> bool {
+        false
+    }
+
     /// How many units of work can be decoded independently, when the backend knows a number the
     /// entry list cannot express. `.cram` returns its pack count; a format whose members decode on
     /// their own returns `None` and the planner counts entries instead.

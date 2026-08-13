@@ -46,10 +46,16 @@ const WRITE_BUF: usize = 8 * 1024 * 1024;
 /// clustering. The scattering this prevents is not a tuning matter: it re-decoded `.cram` packs more
 /// than sixteen times each, tripped the anti-decompression-bomb budget, and failed 60,052 entries of
 /// a sound archive.
+///
+/// `coalesce` fuses each locality cluster into a single work item; see
+/// [`RandomAccessReader::coalesce_locality`](crate::reader::RandomAccessReader::coalesce_locality).
+/// Adjacency alone is not enough for a backend whose decode unit is expensive, because rayon steals
+/// across the ordered list and a worker that hops units re-decodes them.
 pub(crate) fn order_groups(
     groups: Vec<Vec<usize>>,
     entries: &[Entry],
     locality: impl Fn(usize) -> Option<u64>,
+    coalesce: bool,
 ) -> Vec<Vec<usize>> {
     let weight = |g: &Vec<usize>| -> u64 {
         g.iter()
@@ -70,8 +76,21 @@ pub(crate) fn order_groups(
             }
         }
     }
-    for (_, gs) in &mut clusters {
-        gs.sort_by_key(|g| Reverse(weight(g)));
+    if coalesce {
+        // One item per unit. Entries go back into archive order inside it: the destination-collision
+        // groups this fuses rely on last-writer-wins matching the sequential path, and weight-first
+        // ordering would silently reverse which of two colliding entries survives.
+        for (_, gs) in &mut clusters {
+            let mut fused: Vec<usize> = gs.drain(..).flatten().collect();
+            fused.sort_unstable();
+            if !fused.is_empty() {
+                gs.push(fused);
+            }
+        }
+    } else {
+        for (_, gs) in &mut clusters {
+            gs.sort_by_key(|g| Reverse(weight(g)));
+        }
     }
     clusters.sort_by_key(|(_, gs)| Reverse(gs.iter().map(weight).fold(0u64, u64::saturating_add)));
     clusters.into_iter().flat_map(|(_, gs)| gs).collect()
@@ -189,7 +208,12 @@ pub fn run(
     // So: cluster by locality key, order clusters heaviest-first, and keep LPT inside a cluster.
     // Formats whose entries decode independently report `None` for every entry, which collapses to a
     // single cluster and leaves the old pure-LPT behaviour exactly as it was.
-    let groups = order_groups(groups, entries, |i| ra.locality_key(i));
+    let groups = order_groups(
+        groups,
+        entries,
+        |i| ra.locality_key(i),
+        ra.coalesce_locality(),
+    );
 
     let report = Mutex::new(Report::default());
     let pool = ThreadPoolBuilder::new()
@@ -351,6 +375,37 @@ mod dest_race_tests {
             .collect()
     }
 
+    /// With `coalesce`, a decode unit must become ONE work item whose entries are in ARCHIVE order.
+    ///
+    /// Both halves matter. One item is the point: adjacency alone still lets rayon steal groups
+    /// apart, and a 7z worker that hops blocks re-decodes them — 110 CPU-seconds against 11 on a
+    /// 34-block archive. Archive order is the safety half: the fused groups are the
+    /// destination-collision groups, which rely on last-writer-wins agreeing with the sequential
+    /// path, and the weight-first ordering used otherwise would reverse which of two colliding
+    /// entries survives.
+    #[test]
+    fn coalesce_fuses_each_unit_into_one_group_in_archive_order() {
+        let entries = sized_entries(&[30, 25, 20, 15]);
+        // Entries 0 and 2 share unit 0; 1 and 3 share unit 1.
+        let key = |i: usize| Some((i % 2) as u64);
+        let ordered = order_groups(
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            &entries,
+            key,
+            true,
+        );
+
+        assert_eq!(ordered.len(), 2, "expected one group per decode unit");
+        for g in &ordered {
+            let mut sorted = g.clone();
+            sorted.sort_unstable();
+            assert_eq!(g, &sorted, "a fused group must stay in archive order");
+        }
+        let mut units: Vec<Vec<usize>> = ordered.clone();
+        units.sort();
+        assert_eq!(units, vec![vec![0, 2], vec![1, 3]]);
+    }
+
     /// Groups sharing a decode unit must come out adjacent, or concurrent workers scatter across
     /// unrelated packs, thrash the cache and re-decode enough to trip the anti-bomb budget. That is
     /// not hypothetical: it failed 60,052 entries of a sound 94,778-file archive.
@@ -362,7 +417,12 @@ mod dest_race_tests {
         let entries = sized_entries(&[30, 25, 20, 15]);
         // Entries 0 and 2 live in pack 7; entries 1 and 3 live in pack 3.
         let key = |i: usize| Some(if i.is_multiple_of(2) { 7u64 } else { 3u64 });
-        let ordered = order_groups(vec![vec![0], vec![1], vec![2], vec![3]], &entries, key);
+        let ordered = order_groups(
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            &entries,
+            key,
+            false,
+        );
         let keys: Vec<u64> = ordered.iter().map(|g| key(g[0]).unwrap()).collect();
         assert_eq!(
             keys,
@@ -379,7 +439,12 @@ mod dest_race_tests {
     #[test]
     fn no_locality_key_is_plain_lpt() {
         let entries = sized_entries(&[10, 40, 20, 30]);
-        let ordered = order_groups(vec![vec![0], vec![1], vec![2], vec![3]], &entries, |_| None);
+        let ordered = order_groups(
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            &entries,
+            |_| None,
+            false,
+        );
         assert_eq!(ordered, vec![vec![1], vec![3], vec![2], vec![0]]);
     }
 
