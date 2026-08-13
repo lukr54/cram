@@ -437,6 +437,67 @@ struct SegUnit {
     seg: usize,
 }
 
+/// A reader that stops touching its source once a read has failed, and remembers that it did.
+///
+/// **Reading an LZMA2 stream again after it has reported corrupt input does not return.** A crafted
+/// 2 KB archive found by the fuzz harness on 2026-08-13 spun for 7,470 CPU-seconds inside a single
+/// `read` call, on one thread, allocating nothing. The first read reports `corrupted input data
+/// (LZMA2:4)` correctly; the second never comes back.
+///
+/// Not returning is the worst failure shape available: no error, no output, no memory growth, and
+/// from outside it is indistinguishable from slow work. It is reachable from `cram t` and `cram x`
+/// on a file someone sends you, which puts it in scope under `SECURITY.md`.
+///
+/// The guard belongs here rather than at the call sites because two different callers each read
+/// again after handing bytes to a visitor: the visitor is engine code that turns a failed entry into
+/// a reported failure and carries on, and the drain that follows it advances the solid stream to the
+/// next entry. Neither can be relied on to notice. Once fused, subsequent reads report clean EOF
+/// without consulting the source, so an in-flight `io::copy` unwinds promptly; callers check
+/// [`broken`](Self::broken) straight after and fail the unit, which is what stops that EOF from
+/// being mistaken for a complete entry.
+///
+/// `Interrupted` is passed through untouched: it means retry, and `io::copy` handles it.
+struct FuseOnError<'a> {
+    inner: &'a mut dyn Read,
+    /// Set on the first failure and never cleared. Separate from `why` on purpose: reading the
+    /// reason must not re-arm the source, or a caller that reports the failure and carries on would
+    /// walk straight back into the hang.
+    poisoned: bool,
+    why: Option<String>,
+}
+
+impl<'a> FuseOnError<'a> {
+    fn new(inner: &'a mut dyn Read) -> Self {
+        Self {
+            inner,
+            poisoned: false,
+            why: None,
+        }
+    }
+
+    /// Why the source failed, if it did. Takes the reason, so a caller checking once per entry
+    /// attributes the failure to the entry it happened in rather than to every later one.
+    fn broken(&mut self) -> Option<String> {
+        self.why.take()
+    }
+}
+
+impl Read for FuseOnError<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.poisoned {
+            return Ok(0);
+        }
+        match self.inner.read(buf) {
+            Err(e) if e.kind() != io::ErrorKind::Interrupted => {
+                self.poisoned = true;
+                self.why = Some(e.to_string());
+                Err(e)
+            }
+            other => other,
+        }
+    }
+}
+
 impl SevenZRandomAccess {
     /// Build the view, or `None` when block-caching would not be safe.
     fn build(path: &Path, secret: &Secret, entries: &[Entry]) -> Option<Self> {
@@ -802,6 +863,10 @@ impl SevenZRandomAccess {
         let src = file.take(g.pack_end.saturating_sub(seg.comp_off));
         let mut r = lzma_rust2::Lzma2Reader::new(src, lzma2seg::dict_window(seg, spill), None);
 
+        // Reads after a decode error can hang; see [`FuseOnError`]. Wrapping the reader once here
+        // covers both the visitor and the drains below it.
+        let mut r = FuseOnError::new(&mut r);
+
         let mut pos = seg.unpacked_start;
         for (index, off, size) in serve {
             if off > pos {
@@ -809,11 +874,23 @@ impl SevenZRandomAccess {
                 // segment's worker, so decode past it without keeping it.
                 io::copy(&mut (&mut r).take(off - pos), &mut io::sink())?;
             }
-            let mut body = (&mut r).take(size);
-            let go = visit(index, &mut body);
-            // Whatever the visitor left has to go through the decoder anyway: the next entry starts
-            // where this one ends.
-            io::copy(&mut body, &mut io::sink())?;
+            let go = {
+                let mut body = (&mut r).take(size);
+                let go = visit(index, &mut body);
+                // Whatever the visitor left has to go through the decoder anyway: the next entry
+                // starts where this one ends.
+                io::copy(&mut body, &mut io::sink())?;
+                go
+            };
+            // The segment is one stream, so a fault in it makes everything after this entry
+            // garbage. Fail the unit rather than serving what cannot be trusted; the engine
+            // reports every entry the unit did not reach.
+            if let Some(why) = r.broken() {
+                return Err(ArchiveError::Corrupt(format!(
+                    "7z: decode failed inside a segment of block {}: {why}",
+                    g.block
+                )));
+            }
             pos = off + size;
             if !go {
                 return Ok(());
@@ -952,26 +1029,43 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
             let mut n = 0usize;
             let mut pos = 0usize;
             let mut stopped = false;
+            let mut broken: Option<String> = None;
             decoder
                 .for_each_entries(&mut |_entry, reader| {
                     let file_idx = first + n;
                     n += 1;
+                    // Reads after a decode error can hang; see [`FuseOnError`]. The visitor is
+                    // engine code that turns an error into a per-entry failure and carries on, and
+                    // the drain below reads unconditionally, so neither can be relied on to stop.
+                    let mut reader = FuseOnError::new(&mut *reader);
                     if pos < want.len() && want[pos].0 == file_idx {
                         let index = want[pos].1;
                         pos += 1;
-                        if !visit(index, &mut *reader) {
+                        if !visit(index, &mut reader) {
                             stopped = true;
                         }
                     }
                     // Whatever the visitor did not take still has to go through the decoder: the
                     // block is one stream and the next entry begins where this one ends.
-                    io::copy(reader, &mut io::sink())?;
+                    io::copy(&mut reader, &mut io::sink())?;
+                    if let Some(why) = reader.broken() {
+                        broken = Some(why);
+                        return Ok(false);
+                    }
                     // Nothing later in this block is wanted, so stop rather than decode it for
                     // nobody. This is what makes extracting a handful of entries from a large solid
                     // block cost the prefix rather than the whole thing.
                     Ok(!stopped && pos < want.len())
                 })
                 .map_err(map_sevenz)?;
+            // A solid block is one stream, so once it faults nothing after the fault is
+            // recoverable. Failing the unit is what makes the engine report the entries it never
+            // reached, rather than dropping them from an otherwise successful extraction.
+            if let Some(why) = broken {
+                return Err(ArchiveError::Corrupt(format!(
+                    "7z: decode failed inside block {block}: {why}"
+                )));
+            }
             if stopped {
                 return Ok(());
             }
@@ -1142,6 +1236,105 @@ mod mtime_guard_tests {
 /// budgeting on the largest block outright refused the published benchmark corpus over one 263.3
 /// MiB stored video sitting alone in its block, taking the other 48 blocks down with it, and only a
 /// benchmark noticed. These assert on the decision rather than on a timing.
+#[cfg(test)]
+mod fuse_tests {
+    use super::*;
+
+    /// A source that reports an error once and then hangs forever if read again, which is what
+    /// `lzma-rust2` does after `corrupted input data`. The panic stands in for the hang: a test that
+    /// actually hung would be indistinguishable from a slow one, which is the whole problem.
+    struct ErrThenHang {
+        errored: bool,
+    }
+
+    impl Read for ErrThenHang {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.errored, "the source was read again after it failed");
+            self.errored = true;
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "corrupted input",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_failed_source_is_never_read_again() {
+        let mut src = ErrThenHang { errored: false };
+        let mut fused = FuseOnError::new(&mut src);
+        let mut buf = [0u8; 64];
+
+        // The failure surfaces once, intact.
+        let first = fused.read(&mut buf).unwrap_err();
+        assert_eq!(first.kind(), io::ErrorKind::InvalidInput);
+
+        // Everything after it reports EOF without touching the source. `ErrThenHang` asserts on a
+        // second read, so reaching here at all is the point of the test.
+        assert_eq!(fused.read(&mut buf).unwrap(), 0);
+        assert_eq!(
+            io::copy(&mut fused, &mut io::sink()).unwrap(),
+            0,
+            "a drain after the failure must terminate"
+        );
+    }
+
+    /// Clean EOF must not be mistaken for damage, or every intact block would fail.
+    #[test]
+    fn an_undamaged_source_is_passed_through_and_reports_nothing() {
+        let mut src = &b"hello"[..];
+        let mut fused = FuseOnError::new(&mut src);
+        let mut out = Vec::new();
+        assert_eq!(io::copy(&mut fused, &mut out).unwrap(), 5);
+        assert_eq!(out, b"hello");
+        assert!(fused.broken().is_none());
+    }
+
+    /// `Interrupted` means retry, and `io::copy` acts on it. Latching on it would turn an ordinary
+    /// signal into a corrupt archive.
+    #[test]
+    fn an_interrupted_read_is_not_treated_as_damage() {
+        struct Flaky {
+            hits: usize,
+        }
+        impl Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.hits += 1;
+                match self.hits {
+                    1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                    2 => {
+                        buf[..2].copy_from_slice(b"ok");
+                        Ok(2)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+
+        let mut src = Flaky { hits: 0 };
+        let mut fused = FuseOnError::new(&mut src);
+        let mut out = Vec::new();
+        assert_eq!(io::copy(&mut fused, &mut out).unwrap(), 2);
+        assert_eq!(out, b"ok");
+        assert!(fused.broken().is_none(), "Interrupted is not damage");
+    }
+
+    /// The reason is reported once, to the entry it happened in. Reading it must NOT re-arm the
+    /// source: a caller that reports the failure and carries on would otherwise walk back into the
+    /// hang this whole type exists to prevent.
+    #[test]
+    fn taking_the_reason_does_not_unfuse_the_source() {
+        let mut src = ErrThenHang { errored: false };
+        let mut fused = FuseOnError::new(&mut src);
+        let _ = fused.read(&mut [0u8; 8]);
+
+        assert!(fused.broken().unwrap().contains("corrupted input"));
+        assert!(fused.broken().is_none(), "the reason is reported once");
+
+        // `ErrThenHang` asserts if it is read twice, so this is the assertion that matters.
+        assert_eq!(fused.read(&mut [0u8; 8]).unwrap(), 0);
+    }
+}
+
 #[cfg(test)]
 mod gate_tests {
     use super::*;

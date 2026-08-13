@@ -52,6 +52,19 @@ and 2.4× faster on an archive cram wrote, in less memory than 7-Zip needs in ei
 
 ### Fixed
 
+- **A crafted 7z could make `cram t` and `cram x` run forever.** A solid block is one stream shared
+  by several entries, so a reader that has reported corrupt input is asked for bytes again — once by
+  the code that records the failed entry and carries on, and again by the drain that advances to the
+  next entry. An LZMA2 stream does not return from that second read. A 2,208-byte archive found by
+  the fuzz harness pinned one core for over two hours with no error, no output and no memory growth.
+  Reads of a block or segment now stop touching the source after its first failure, and the unit is
+  failed rather than continued, so every entry it never reached is reported instead of being dropped
+  from an otherwise successful-looking run. The archive is kept as a regression fixture.
+
+- **The fuzz harness now fails on a hang instead of waiting for one.** Each input gets its own thread
+  and 60 seconds, because a parser that spins produces no panic and no error and so looked exactly
+  like slow work — which is why the hang above went unnoticed for two hours.
+
 - **A single large file no longer disabled parallel 7z extraction for the whole archive.** The
   memory bound was applied to the largest block, and a block holding one big entry needs no cache at
   all — it can be streamed. One 263 MiB video, alone in its block, was 5.5% over the budget and took

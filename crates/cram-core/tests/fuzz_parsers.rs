@@ -14,12 +14,17 @@
 //! would *not* unwind into `catch_unwind` on the test thread. To catch those too, a process-wide panic
 //! **hook** bumps a counter on *every* panic on *any* thread; `feed` flags a failure if either the
 //! caught result is an error (test-thread panic) or the counter advanced (worker-thread panic).
+//!
+//! **Not returning is a failure too**, and needs its own mechanism: every input runs under
+//! [`PER_INPUT_LIMIT`], because a parser that spins forever produces no panic, no error and no
+//! output, and is indistinguishable from slow work until someone reads the staging file's mtime.
 
 use std::io::Read;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use cram_core::engine;
 use cram_core::format::{Codec, Format};
@@ -98,22 +103,51 @@ fn exercise(fmt: Format, path: &Path) {
     }
 }
 
+/// How long one input gets. Every input here is at most 40 KB, so a correct parser needs
+/// milliseconds; this is a liveness bound, not a speed one.
+///
+/// It exists because **a hang and a slow run are indistinguishable from outside**. On 2026-08-13 a
+/// crafted 2 KB 7z spun for 7,470 CPU-seconds inside a single `read` call and the sweep looked
+/// merely slow for two hours, having in fact stopped on its 21,000th input of 40,000.
+const PER_INPUT_LIMIT: Duration = Duration::from_secs(60);
+
 /// Feed `bytes` to the `fmt` parser (staged at the reused `path`). Returns `Some(message)` if it
-/// panicked, on the test thread (caught) or a decode worker thread (counter advanced). Returning the
-/// message instead of asserting lets the caller restore the real panic hook *before* failing, so the
-/// re-runnable seed is actually printed (rather than swallowed by the quiet hook).
+/// panicked (on any thread) or never came back. Returning the message instead of asserting lets the
+/// caller restore the real panic hook *before* failing, so the re-runnable seed is actually printed
+/// rather than swallowed by the quiet hook.
+///
+/// The parse runs on its own thread so that not returning is a reportable outcome. A hung thread
+/// cannot be reclaimed, so the harness reports and the process exits, taking the thread with it.
 fn feed(fmt: Format, bytes: &[u8], seed: u64, path: &Path) -> Option<String> {
     if std::fs::write(path, bytes).is_err() {
         return None;
     }
+    let len = bytes.len();
     let before = PANIC_COUNT.load(Ordering::SeqCst);
-    let res = panic::catch_unwind(AssertUnwindSafe(|| exercise(fmt, path)));
+
+    let staged = path.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let res = panic::catch_unwind(AssertUnwindSafe(|| exercise(fmt, &staged)));
+        let _ = tx.send(res.is_err());
+    });
+
+    let panicked = match rx.recv_timeout(PER_INPUT_LIMIT) {
+        Ok(v) => v,
+        Err(_) => {
+            return Some(format!(
+                "parser {:?} HUNG on fuzz input: nothing returned within {PER_INPUT_LIMIT:?} \
+                 (seed={seed}, len={len})",
+                fmt.container
+            ))
+        }
+    };
+
     let after = PANIC_COUNT.load(Ordering::SeqCst);
-    if res.is_err() || after != before {
+    if panicked || after != before {
         Some(format!(
-            "parser {:?} PANICKED on fuzz input (seed={seed}, len={})",
-            fmt.container,
-            bytes.len()
+            "parser {:?} PANICKED on fuzz input (seed={seed}, len={len})",
+            fmt.container
         ))
     } else {
         None

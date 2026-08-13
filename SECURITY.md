@@ -134,6 +134,16 @@ against what the header declared, deletes the partial file, and reports the entr
 from an untrusted archive are checked against fixed bounds *before* the work starts, so a small
 crafted file cannot force an unbounded allocation or an unbounded decode.
 
+**A failed decode is never read again.** Solid formats hand one stream to several entries in turn, so
+a reader that has already reported corrupt input gets asked for more bytes: once by the code that
+turns a failed entry into a reported failure and carries on, and again by the drain that advances to
+the next entry. An LZMA2 stream does not return from that second read. Every read of a 7z block or
+segment therefore goes through a guard that stops touching the source after its first failure, and
+the unit is failed rather than continued, since nothing after a fault in a solid stream is
+recoverable anyway. Found by the fuzz harness (below) on a 2,208-byte archive that made `cram t` spin
+forever; `tests/data/hostile-7z-read-after-error.7z` is that archive, and the regression test asserts
+termination rather than any particular error.
+
 **A damaged archive fails honestly.** Extraction is best-effort: intact entries are recovered and
 damaged ones are listed by name, and the process still exits **non-zero**, so a script chaining on
 `&&` cannot mistake a partial extraction for a clean one.
