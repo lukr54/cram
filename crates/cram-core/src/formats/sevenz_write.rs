@@ -144,13 +144,21 @@ impl Read for BlockSource {
 /// entry, so a tree of 1 KB files would otherwise reach ~65,000 handles before the byte ceiling
 /// noticed.
 ///
-/// This is a backstop, not the real defence. It was 4096, chosen on Windows where a process may hold
-/// millions of handles, and it made `.7z` creation fail outright on Linux, whose default soft limit
-/// is **1024** — a 41,305-file tree died with `Too many open files` after 0.15s. The 7z tests use 3-
-/// and 60-file fixtures, so CI saw nothing on any platform. The adaptive flush in `add_path` is what
-/// actually keeps this correct; the constant only stops a pathological tree from finding the limit
-/// on every single block.
-const SOLID_BLOCK_ENTRIES: usize = 512;
+/// This is a backstop, not the real bound. [`SOLID_BLOCK_BYTES`] and the descriptor limit learned in
+/// [`SevenZArchiveWriter::open_for_block`] are what normally decide a block.
+///
+/// It must be set high. A previous attempt at fixing descriptor exhaustion pinned it to 512, which
+/// looked safe and quietly cost all the multi-threading: at ~30 KB mean file size a 512-entry block
+/// is 15.5 MB, and LZMA2 MT needs a pack of at least two 8 MiB chunks — 16.8 MB — to be worth
+/// starting. Blocks landed just under the threshold, MT switched off, and a 24-core machine finished
+/// in the same 113s as an 8-core one. Worse, the margin was thin enough that a corpus with slightly
+/// larger files would flip MT back on, so the same tool scaled on one tree and not on a similar one.
+///
+/// Letting the environment set the block size instead: Windows reaches the byte ceiling first
+/// (~4,400 entries at 128 MiB), Linux learns its ~1,020 (≈30 MB blocks, comfortably over the MT
+/// threshold), macOS learns ~250 — and at that point the blocks genuinely are too small to chunk, so
+/// MT switching off is correct rather than accidental.
+const SOLID_BLOCK_ENTRIES: usize = 8192;
 
 /// LZMA2 dictionary size for a preset, in MiB (the xz preset table). Needed because encoder memory
 /// is a multiple of the dictionary, and the dictionary grows 8× between the default level and
@@ -244,6 +252,9 @@ pub struct SevenZArchiveWriter {
     /// The block being filled: entries, their unread sources, and total source bytes.
     block: Vec<(ArchiveEntry, BlockSource)>,
     block_bytes: u64,
+    /// Entries allowed in one block. Starts at [`SOLID_BLOCK_ENTRIES`] and ratchets down to the
+    /// machine's real descriptor limit the first time a block walks into it.
+    entry_cap: usize,
     /// Whether the open block is a COPY block. A pack has ONE method chain, so a change of
     /// store-ness closes the block. On real trees that is rare (157 of 41,305 entries on the test
     /// corpus); a corpus that alternated every entry would degenerate to one pack per entry, which
@@ -308,6 +319,7 @@ impl SevenZArchiveWriter {
                 .max(1),
             block: Vec::new(),
             block_bytes: 0,
+            entry_cap: SOLID_BLOCK_ENTRIES,
             block_store: false,
             dirs: Vec::new(),
         })
@@ -330,6 +342,11 @@ impl SevenZArchiveWriter {
         match File::open(path) {
             Ok(f) => Ok(f),
             Err(e) if out_of_descriptors(&e) && !self.block.is_empty() => {
+                // Remember where the wall is, so later blocks stop just short of it instead of
+                // walking into it every time. Without this the exhaustion path runs once per block:
+                // harmless, but it makes the limit invisible in profiles and leaves the entry cap
+                // reading as though it were in control when it never is.
+                self.entry_cap = self.entry_cap.min(self.block.len());
                 self.flush_block()?;
                 File::open(path)
                     .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))
@@ -384,7 +401,7 @@ impl SevenZArchiveWriter {
         if adaptive_store {
             self.stored += 1;
         }
-        if self.block_bytes >= self.solid_max || self.block.len() >= SOLID_BLOCK_ENTRIES {
+        if self.block_bytes >= self.solid_max || self.block.len() >= self.entry_cap {
             self.flush_block()?;
         }
         Ok(())
