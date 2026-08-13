@@ -1997,3 +1997,261 @@ mod tests {
         assert_eq!(p.bottleneck, Bottleneck::CpuBound);
     }
 }
+
+/// Table-driven regression cover for the planner.
+///
+/// Adaptive parallelism is the thesis this whole project rests on, and until now nothing asserted
+/// it as a whole. The plan silently flipped between 8 and 24 workers twice in one day and both times
+/// it was caught by a human reading `CRAM_PROFILE` output, once after the change had already been
+/// benchmarked and written up.
+///
+/// So: named scenarios, whole expected plans, one table. The point is not that these numbers are
+/// sacred — several are judgement calls and one is a trade that was argued about. The point is that
+/// changing any of them requires editing this table, which makes a change **state what it meant to
+/// change** instead of discovering it in a benchmark three days later.
+///
+/// Every machine here is a real one this has been measured on, so a scenario that looks wrong can be
+/// checked against a physical box rather than against an opinion.
+#[cfg(test)]
+mod planner_table {
+    use super::*;
+
+    /// The dev box: Ryzen 9 5900X in a KVM guest, which reports 24 physical.
+    fn dev_box() -> HwProfile {
+        HwProfile {
+            logical: 24,
+            physical: 24,
+            smt: false,
+            ram_total: 23 << 30,
+            ram_avail: 20 << 30,
+            work_drive: None,
+        }
+    }
+
+    /// The workstation: Ryzen 7 3700X, 8 physical / 16 logical, 16 GiB.
+    fn workstation() -> HwProfile {
+        HwProfile {
+            logical: 16,
+            physical: 8,
+            smt: true,
+            ram_total: 16 << 30,
+            ram_avail: 10 << 30,
+            work_drive: None,
+        }
+    }
+
+    /// A small machine, to keep the floors honest.
+    fn laptop() -> HwProfile {
+        HwProfile {
+            logical: 4,
+            physical: 4,
+            smt: false,
+            ram_total: 8 << 30,
+            ram_avail: 4 << 30,
+            work_drive: None,
+        }
+    }
+
+    /// Measured on the dev box, 2026-08-14.
+    fn dev_rates() -> Rates {
+        Rates {
+            deflate_enc: 5.0,
+            deflate_dec: 948.0,
+            lzma_dec: 145.0,
+        }
+    }
+
+    struct Case {
+        name: &'static str,
+        hw: HwProfile,
+        rates: Rates,
+        op: Op,
+        codec: Codec,
+        units: usize,
+        wall: Wall,
+        want_bottleneck: Bottleneck,
+        want_workers: usize,
+        /// Why this is the answer. Read this before changing the number.
+        because: &'static str,
+    }
+
+    #[test]
+    fn the_planner_answers_these_the_same_way_it_did_yesterday() {
+        let cases = vec![
+            Case {
+                name: "corpus 7z to tmpfs, wall never measured past its cache",
+                hw: dev_box(),
+                rates: dev_rates(),
+                op: Op::Extract,
+                codec: Codec::Lzma,
+                units: 96,
+                wall: Wall::burst(2841.9),
+                want_bottleneck: Bottleneck::WriteBound,
+                want_workers: 8,
+                because: "2841.9 is tmpfs memory bandwidth, not a write ceiling. Scaling by it \
+                          asked for 20 workers where the measured knee is 8: 7% of the wall clock \
+                          for 78% more CPU. A burst figure classifies and does not scale.",
+            },
+            Case {
+                name: "the same wall, actually measured as a ceiling",
+                hw: dev_box(),
+                rates: dev_rates(),
+                op: Op::Extract,
+                codec: Codec::Lzma,
+                units: 96,
+                wall: Wall::sustained(2841.9),
+                want_bottleneck: Bottleneck::WriteBound,
+                want_workers: 20,
+                because: "2841.9 / 145.0 = 19.6. If a destination really does absorb that, the \
+                          decoders to feed it are worth having. This is the branch the burst case \
+                          above declines to take, and it must still work.",
+            },
+            Case {
+                name: "corpus 7z to a real disk",
+                hw: dev_box(),
+                rates: dev_rates(),
+                op: Op::Extract,
+                codec: Codec::Lzma,
+                units: 96,
+                wall: Wall::sustained(84.0),
+                want_bottleneck: Bottleneck::WriteBound,
+                want_workers: 8,
+                because: "84 / 145 = 0.6, so the wall needs less than one decoder and the floor \
+                          decides. Note what this means: with an honest wall the scaling term is \
+                          inert on any destination slower than the codec, which is most of them.",
+            },
+            Case {
+                name: "a solid 7z with one block",
+                hw: dev_box(),
+                rates: dev_rates(),
+                op: Op::Extract,
+                codec: Codec::Lzma,
+                units: 1,
+                wall: Wall::sustained(2841.9),
+                want_bottleneck: Bottleneck::CpuBound,
+                want_workers: 1,
+                because: "One block is one decoder, so decode is the constraint by definition and \
+                          no wall can change that. The write-bound floor does NOT apply here, \
+                          which is the answer that surprised the author of this table: an archive \
+                          7-Zip wrote as a single solid folder gets one worker unless its LZMA2 \
+                          stream can be cut into segments, which is what `lzma2seg` is for.",
+            },
+            Case {
+                name: "big low-ratio zip, fast codec",
+                hw: dev_box(),
+                rates: dev_rates(),
+                op: Op::Extract,
+                codec: Codec::Deflate,
+                units: 5000,
+                wall: Wall::sustained(84.0),
+                want_bottleneck: Bottleneck::WriteBound,
+                want_workers: 8,
+                because: "DEFLATE at 948 MiB/s against an 84 MiB/s drive is write-bound by a wide \
+                          margin, and one decoder would nearly do. The floor is what keeps the \
+                          per-file work parallel.",
+            },
+            Case {
+                name: "the same zip on the workstation",
+                hw: workstation(),
+                rates: dev_rates(),
+                op: Op::Extract,
+                codec: Codec::Deflate,
+                units: 5000,
+                wall: Wall::sustained(757.0),
+                want_bottleneck: Bottleneck::WriteBound,
+                want_workers: 6,
+                because: "8 physical cores: the floor is (8*3)/4 = 6, and 757/948 asks for one. \
+                          The floor scales with the machine rather than being a constant 8.",
+            },
+            Case {
+                name: "a small machine must not be given eight workers",
+                hw: laptop(),
+                rates: dev_rates(),
+                op: Op::Extract,
+                codec: Codec::Lzma,
+                units: 96,
+                wall: Wall::burst(2841.9),
+                want_bottleneck: Bottleneck::CpuBound,
+                want_workers: 4,
+                because: "Four cores at 145 MiB/s of LZMA is 580 MiB/s against a 2841 MiB/s \
+                          destination, so this machine is decode-limited where the 24-core one is \
+                          not. The same archive and the same destination classify differently on \
+                          different hardware, which is the whole thesis in one row.",
+            },
+        ];
+
+        let mut wrong = Vec::new();
+        for c in &cases {
+            let p = derive_plan(
+                c.op,
+                c.codec,
+                c.units,
+                &c.hw,
+                Topology::SameDrive,
+                &c.rates,
+                c.wall,
+            );
+            if p.bottleneck != c.want_bottleneck || p.workers != c.want_workers {
+                wrong.push(format!(
+                    "\n  {}\n    expected {:?} with {} workers, got {:?} with {}\n    why that was the answer: {}",
+                    c.name, c.want_bottleneck, c.want_workers, p.bottleneck, p.workers, c.because
+                ));
+            }
+            // Whatever else moves, these must hold for every extraction plan.
+            assert_eq!(
+                p.writers, p.workers,
+                "{}: writers and workers are the same number on the per-entry shape",
+                c.name
+            );
+            assert!(
+                p.workers >= 1,
+                "{}: a plan with no workers does nothing",
+                c.name
+            );
+            assert!(
+                p.workers <= c.hw.logical.max(1),
+                "{}: more workers than the machine has threads",
+                c.name
+            );
+        }
+        assert!(
+            wrong.is_empty(),
+            "the planner changed its mind about {} scenario(s). If that was deliberate, update the \
+             table and say why in `because`.{}",
+            wrong.len(),
+            wrong.join("")
+        );
+    }
+
+    /// The floor is derived from the machine, and the derivation is easy to break by tuning the
+    /// clamp for one box. Pinned separately from the table so a failure names the cause.
+    #[test]
+    fn the_worker_floor_follows_the_core_count_within_its_clamp() {
+        for (physical, want) in [(2usize, 4usize), (4, 4), (8, 6), (12, 8), (24, 8), (64, 8)] {
+            let hw = HwProfile {
+                logical: physical,
+                physical,
+                smt: false,
+                ram_total: 16 << 30,
+                ram_avail: 8 << 30,
+                work_drive: None,
+            };
+            let p = derive_plan(
+                Op::Extract,
+                Codec::Lzma,
+                96,
+                &hw,
+                Topology::SameDrive,
+                &dev_rates(),
+                // Burst, so the floor is the whole answer and no scaling can move it. Low enough
+                // that even two cores out-decode it, keeping every row on the write-bound branch:
+                // a faster wall flips the small machines to cpu-bound and tests something else.
+                Wall::burst(200.0),
+            );
+            assert_eq!(
+                p.workers, want,
+                "{physical} physical cores should floor at {want} workers"
+            );
+        }
+    }
+}
