@@ -288,9 +288,8 @@ pub struct SevenZArchiveWriter {
     /// The block being filled: entries, their unread sources, and total source bytes.
     block: Vec<(ArchiveEntry, BlockSource)>,
     block_bytes: u64,
-    /// Entries allowed in one block. Starts at [`SOLID_BLOCK_ENTRIES`] and ratchets down to the
-    /// machine's real descriptor limit the first time a block walks into it.
-    entry_cap: usize,
+    /// Packs written, for the CRAM_PROFILE block report.
+    packs_written: usize,
     /// Whether the open block is a COPY block. A pack has ONE method chain, so a change of
     /// store-ness closes the block. On real trees that is rare (157 of 41,305 entries on the test
     /// corpus); a corpus that alternated every entry would degenerate to one pack per entry, which
@@ -356,7 +355,7 @@ impl SevenZArchiveWriter {
                 .max(1),
             block: Vec::new(),
             block_bytes: 0,
-            entry_cap: SOLID_BLOCK_ENTRIES,
+            packs_written: 0,
             block_store: false,
             dirs: Vec::new(),
         })
@@ -379,11 +378,17 @@ impl SevenZArchiveWriter {
         match File::open(path) {
             Ok(f) => Ok(f),
             Err(e) if out_of_descriptors(&e) && !self.block.is_empty() => {
-                // Remember where the wall is, so later blocks stop just short of it instead of
-                // walking into it every time. Without this the exhaustion path runs once per block:
-                // harmless, but it makes the limit invisible in profiles and leaves the entry cap
-                // reading as though it were in control when it never is.
-                self.entry_cap = self.entry_cap.min(self.block.len());
+                // Flush and retry, and deliberately DO NOT remember this. An earlier version
+                // ratcheted `entry_cap` down to the block length here, to avoid meeting the limit
+                // once per block. That made a momentary shortage permanent: a Defender scan briefly
+                // consumed handles mid-run, the cap stuck at a few hundred entries, every later
+                // block fell under the size where LZMA2 MT is worth starting, and the archive took
+                // 160s instead of 86s with 105 packs instead of 34. Three consecutive runs
+                // reproduced it, which is what made it look like a code regression.
+                //
+                // Meeting the limit once per block costs one failed open. That is cheaper than any
+                // amount of remembering, and it means the block size tracks conditions now rather
+                // than the worst moment the process has ever seen.
                 self.flush_block()?;
                 File::open(path)
                     .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))
@@ -414,6 +419,7 @@ impl SevenZArchiveWriter {
         // One pack for the whole batch. This is the solid part: every entry in it shares one LZMA2
         // dictionary, which is where both the size win and the multi-threading come from.
         w.push_archive_entries(entries, readers).map_err(map_sz)?;
+        self.packs_written += 1;
         Ok(())
     }
 
@@ -438,7 +444,7 @@ impl SevenZArchiveWriter {
         if adaptive_store {
             self.stored += 1;
         }
-        if self.block_bytes >= self.solid_max || self.block.len() >= self.entry_cap {
+        if self.block_bytes >= self.solid_max || self.block.len() >= SOLID_BLOCK_ENTRIES {
             self.flush_block()?;
         }
         Ok(())
@@ -607,6 +613,17 @@ impl ArchiveWriter for SevenZArchiveWriter {
 
     fn finish(mut self: Box<Self>) -> Result<CreateReport> {
         self.flush_block()?;
+        if std::env::var_os("CRAM_PROFILE").is_some() {
+            eprintln!(
+                "-- 7z blocks --------------------------------------------------\n\
+                 packs {}  entries/block max {}  solid_max {} MiB  chunk {} MiB  threads {}",
+                self.packs_written,
+                SOLID_BLOCK_ENTRIES,
+                self.solid_max >> 20,
+                self.chunk >> 20,
+                self.threads
+            );
+        }
         let dirs = std::mem::take(&mut self.dirs);
         for dir in dirs {
             self.writer()?
