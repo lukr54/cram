@@ -13,7 +13,7 @@
 //! metadata reads with an empty password and the worker resolves the password lazily on the first
 //! block-decode failure, retrying from the start (safe: the failure precedes any emitted entry).
 
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use sevenz_rust2::{ArchiveEntry, ArchiveReader as SzReader, Error as SzError, Pa
 
 use crate::error::{ArchiveError, Result};
 use crate::format::Format;
+use crate::formats::lzma2seg;
 use crate::model::{Entry, EntryKind, EntryPath};
 use crate::reader::{ArchiveReader, EntryStream};
 use crate::secret::{PasswordProvider, PasswordRequest, Secret};
@@ -399,6 +400,33 @@ pub struct SevenZRandomAccess {
     /// Per block, indexed by block number.
     plan: Vec<BlockPlan>,
     blocks: usize,
+    /// Blocks cut into independently-decodable LZMA2 segments, where that was possible. Empty when
+    /// no block could be split, which is the case for everything cram writes (already many blocks)
+    /// and for any archive written by a single-threaded encoder.
+    segmented: Vec<BlockSegments>,
+    /// cram entry index → index into [`segmented`]'s flattened unit list. `None` for an entry whose
+    /// block was not split.
+    unit_of: Vec<Option<usize>>,
+}
+
+/// One block's LZMA2 segments, plus where its entries sit in the decoded stream.
+struct BlockSegments {
+    block: usize,
+    /// Absolute file offset one past the block's last packed byte, so a worker reading across a
+    /// segment boundary for a straddling entry knows where the stream really ends.
+    pack_end: u64,
+    segs: Vec<lzma2seg::Segment>,
+    /// `(archive file index, uncompressed offset within the block, size)`, in archive order.
+    layout: Vec<(usize, u64, u64)>,
+}
+
+/// One unit of parallel work: a segment of a segmented block.
+#[derive(Clone, Copy)]
+struct SegUnit {
+    /// Index into `segmented`.
+    group: usize,
+    /// Index into that group's `segs`.
+    seg: usize,
 }
 
 impl SevenZRandomAccess {
@@ -453,11 +481,39 @@ impl SevenZRandomAccess {
             })
             .collect();
 
+        // Where each file's bytes sit inside its block, in archive order. Needed to decide which
+        // segment serves an entry, and cheap enough to compute for every archive.
+        let mut layouts: Vec<Vec<(usize, u64, u64)>> = vec![Vec::new(); archive.blocks.len()];
+        let mut at = vec![0u64; archive.blocks.len()];
+        for (fi, f) in archive.files.iter().enumerate() {
+            if let Some(b) = archive.stream_map.file_block_index[fi] {
+                let off = at.get_mut(b)?;
+                layouts.get_mut(b)?.push((fi, *off, f.size));
+                *off += f.size;
+            }
+        }
+
+        // Cut what can be cut. A block written by a multi-threaded LZMA2 encoder carries dictionary
+        // resets, and each is somewhere a decoder can start cold.
+        let segmented = Self::segment_blocks(path, &archive, &mut layouts);
+        let is_segmented: Vec<bool> = {
+            let mut v = vec![false; archive.blocks.len()];
+            for g in &segmented {
+                v[g.block] = true;
+            }
+            v
+        };
+
         // Refuse only for a block that needs the cache and cannot have it. Single-entry blocks are
-        // streamed, so their size is not this decision's business. An archive with no block holding
-        // any bytes has nothing for this path to do and is left to the sequential one.
+        // streamed, and a segmented block is decoded a segment at a time, so neither one's size is
+        // this decision's business. An archive with no block holding any bytes has nothing for this
+        // path to do and is left to the sequential one.
         let has_content = archive.blocks.iter().any(|b| b.get_unpack_size() > 0);
-        if plan.is_empty() || !has_content || plan.iter().any(|p| p.entries > 1 && !p.fits) {
+        let stuck = plan
+            .iter()
+            .enumerate()
+            .any(|(b, p)| p.entries > 1 && !p.fits && !is_segmented[b]);
+        if plan.is_empty() || !has_content || stuck {
             return None;
         }
 
@@ -475,6 +531,31 @@ impl SevenZRandomAccess {
             return None;
         }
 
+        // Which segment serves each entry: the one its bytes START in. An entry straddling a
+        // boundary is served by that worker reading on past it, rather than by stitching two.
+        let mut group_of = vec![usize::MAX; archive.blocks.len()];
+        for (gi, g) in segmented.iter().enumerate() {
+            group_of[g.block] = gi;
+        }
+        let mut base = Vec::with_capacity(segmented.len());
+        let mut units = 0usize;
+        for g in &segmented {
+            base.push(units);
+            units += g.segs.len();
+        }
+        let unit_of: Vec<Option<usize>> = loc
+            .iter()
+            .map(|l| {
+                let (block, fi) = (*l)?;
+                let gi = *group_of.get(block)?;
+                let g = segmented.get(gi)?;
+                let (_, off, _) = *g.layout.iter().find(|(f, _, _)| *f == fi)?;
+                // The last segment starting at or before this entry's first byte.
+                let s = g.segs.partition_point(|s| s.unpacked_start <= off).max(1) - 1;
+                Some(base[gi] + s)
+            })
+            .collect();
+
         let blocks = archive.blocks.len();
         Some(Self {
             id: RA_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -485,7 +566,57 @@ impl SevenZRandomAccess {
             loc,
             plan,
             blocks,
+            segmented,
+            unit_of,
         })
+    }
+
+    /// Cut every block that is a lone LZMA2 coder into independently-decodable segments.
+    ///
+    /// Restricted to a single coder on purpose. A BCJ or delta filter carries state across the
+    /// boundary and BCJ2 is several interleaved streams, so a chain would need the filter re-run
+    /// from the folder start and the cut would buy nothing. Those blocks keep the whole-block path.
+    fn segment_blocks(
+        path: &Path,
+        archive: &sevenz_rust2::Archive,
+        layouts: &mut [Vec<(usize, u64, u64)>],
+    ) -> Vec<BlockSegments> {
+        /// 7z method id for LZMA2.
+        const LZMA2: [u8; 1] = [0x21];
+        /// A 7z file opens with a 32-byte signature header; pack offsets are relative to its end.
+        const SIGNATURE_HEADER: u64 = 32;
+
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (b, block) in archive.blocks.iter().enumerate() {
+            if block.coders.len() != 1 || block.coders[0].encoder_method_id() != LZMA2 {
+                continue;
+            }
+            let Some(&pi) = archive.stream_map.block_first_pack_stream_index().get(b) else {
+                continue;
+            };
+            let (Some(&rel), Some(&len)) = (
+                archive.stream_map.pack_stream_offsets().get(pi),
+                archive.pack_sizes().get(pi),
+            ) else {
+                continue;
+            };
+            let start = SIGNATURE_HEADER + archive.pack_pos() + rel;
+            // A walk that fails or finds one segment is not a fault: it means this stream is not
+            // splittable, which is the answer for everything a single-threaded encoder wrote.
+            let Ok(Some(segs)) = lzma2seg::walk(&mut file, start, len) else {
+                continue;
+            };
+            out.push(BlockSegments {
+                block: b,
+                pack_end: start + len,
+                segs,
+                layout: std::mem::take(&mut layouts[b]),
+            });
+        }
+        out
     }
 
     /// Run `f` over the decoded bytes of cram entry `index`, decoding its block if this thread does
@@ -590,6 +721,86 @@ impl SevenZRandomAccess {
         Ok(written)
     }
 
+    /// Resolve a flattened unit index back to its group and segment.
+    fn unit(&self, unit: usize) -> Option<SegUnit> {
+        let mut base = 0usize;
+        for (group, g) in self.segmented.iter().enumerate() {
+            if unit < base + g.segs.len() {
+                return Some(SegUnit {
+                    group,
+                    seg: unit - base,
+                });
+            }
+            base += g.segs.len();
+        }
+        None
+    }
+
+    /// Decode one LZMA2 segment and hand over the entries that start inside it, in order.
+    ///
+    /// The reader is given the rest of the block's pack stream rather than just this segment, so an
+    /// entry straddling the boundary is served by reading on into the next segment. Crossing a
+    /// dictionary reset mid-read is ordinary — it is what the sequential decoder does — and it
+    /// costs only the tail of the one entry, since the reader is dropped straight after.
+    fn stream_segment(
+        &self,
+        u: SegUnit,
+        want: &[(usize, usize)],
+        visit: &mut dyn FnMut(usize, &mut dyn Read) -> bool,
+    ) -> Result<()> {
+        let g = &self.segmented[u.group];
+        let seg = &g.segs[u.seg];
+
+        // (cram index, offset within the block, size), in stream order.
+        let mut serve: Vec<(usize, u64, u64)> = want
+            .iter()
+            .filter_map(|&(fi, index)| {
+                g.layout
+                    .iter()
+                    .find(|(f, _, _)| *f == fi)
+                    .map(|&(_, off, size)| (index, off, size))
+            })
+            .collect();
+        serve.sort_unstable_by_key(|&(_, off, _)| off);
+        if serve.is_empty() {
+            return Ok(());
+        }
+
+        // How far past this segment the last entry reaches, which the dictionary must also cover.
+        let seg_end = seg.unpacked_start + seg.unpacked;
+        let spill = serve
+            .iter()
+            .map(|&(_, off, size)| (off + size).saturating_sub(seg_end))
+            .max()
+            .unwrap_or(0);
+
+        let mut file = std::fs::File::open(&self.path)
+            .map_err(|e| ArchiveError::Backend(format!("{}: {e}", self.path.display())))?;
+        file.seek(std::io::SeekFrom::Start(seg.comp_off))
+            .map_err(|e| ArchiveError::Backend(format!("{}: {e}", self.path.display())))?;
+        let src = file.take(g.pack_end.saturating_sub(seg.comp_off));
+        let mut r = lzma_rust2::Lzma2Reader::new(src, lzma2seg::dict_window(seg, spill), None);
+
+        let mut pos = seg.unpacked_start;
+        for (index, off, size) in serve {
+            if off > pos {
+                // The head of an entry that began in the previous segment. It belongs to that
+                // segment's worker, so decode past it without keeping it.
+                io::copy(&mut (&mut r).take(off - pos), &mut io::sink())?;
+            }
+            let mut body = (&mut r).take(size);
+            let go = visit(index, &mut body);
+            // Whatever the visitor left has to go through the decoder anyway: the next entry starts
+            // where this one ends.
+            io::copy(&mut body, &mut io::sink())?;
+            pos = off + size;
+            if !go {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// Where entry `index` lives and what its block costs, or `None` when it has no bytes.
     fn placement(&self, index: usize) -> Option<(usize, usize, &BlockPlan)> {
         let (block, file_idx) = self.loc.get(index).copied().flatten()?;
@@ -636,8 +847,15 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
         }
     }
 
-    /// The block, so the engine keeps a block's entries on one worker and decodes it about once.
+    /// The decode unit, so the engine keeps its entries on one worker and decodes it about once:
+    /// the LZMA2 segment where the block was splittable, the block itself where it was not.
+    ///
+    /// One key space for both, with segments numbered above every block, so a segmented and an
+    /// unsegmented block can never collide onto one work item.
     fn locality_key(&self, index: usize) -> Option<u64> {
+        if let Some(unit) = self.unit_of.get(index).copied().flatten() {
+            return Some((self.blocks + unit) as u64);
+        }
         self.loc
             .get(index)
             .copied()
@@ -670,10 +888,18 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
     ) -> Result<()> {
         let mut by_block: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
             std::collections::BTreeMap::new();
+        let mut by_segment: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
         let mut streamless = Vec::new();
         for &i in indices {
             match self.loc.get(i).copied().flatten() {
-                Some((block, file_idx)) => by_block.entry(block).or_default().push((file_idx, i)),
+                Some((block, file_idx)) => {
+                    match self.unit_of.get(i).copied().flatten() {
+                        // A segmented block: the work item is the segment, not the block.
+                        Some(unit) => by_segment.entry(unit).or_default().push((file_idx, i)),
+                        None => by_block.entry(block).or_default().push((file_idx, i)),
+                    }
+                }
                 // A directory or an empty file: no block holds it, and it costs nothing to serve.
                 None => streamless.push(i),
             }
@@ -682,6 +908,15 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
             if !visit(i, &mut io::empty()) {
                 return Ok(());
             }
+        }
+
+        for (unit, want) in by_segment {
+            let Some(u) = self.unit(unit) else {
+                return Err(ArchiveError::Corrupt(format!(
+                    "7z: no such decode unit {unit}"
+                )));
+            };
+            self.stream_segment(u, &want, visit)?;
         }
 
         for (block, mut want) in by_block {
@@ -723,8 +958,11 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
         Ok(())
     }
 
+    /// What the planner fans out over. A segmented block contributes its segments rather than
+    /// itself — the whole point being that a 7-Zip archive is one block and 21 units.
     fn decode_units(&self) -> Option<usize> {
-        Some(self.blocks)
+        let segs: usize = self.segmented.iter().map(|g| g.segs.len()).sum();
+        Some(self.blocks - self.segmented.len() + segs)
     }
 }
 

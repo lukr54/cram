@@ -12,6 +12,7 @@ use crate::writer::{ArchiveWriter, CreateOptions};
 
 pub mod cram;
 pub mod iso;
+pub(crate) mod lzma2seg;
 pub mod rar;
 pub mod raw;
 pub mod seqcache;
