@@ -432,6 +432,19 @@ struct BlockSegments {
     layout: Vec<(usize, u64, u64)>,
 }
 
+/// A block that walked cleanly into segments, before the memory decision is made about it.
+///
+/// The walk has to happen for every candidate before any of them can be judged, because the budget
+/// depends on how many units there turn out to be in total.
+struct SegmentCandidate {
+    block: usize,
+    pack_end: u64,
+    segs: Vec<lzma2seg::Segment>,
+    dict: Option<u32>,
+    /// The largest dictionary window any of `segs` will need, which is what a worker holds.
+    widest: u64,
+}
+
 /// One unit of parallel work: a segment of a segmented block.
 #[derive(Clone, Copy)]
 struct SegUnit {
@@ -505,10 +518,13 @@ impl Read for FuseOnError<'_> {
 impl SevenZRandomAccess {
     /// Build the view, or `None` when block-caching would not be safe.
     fn build(path: &Path, secret: &Secret, entries: &[Entry]) -> Option<Self> {
-        // The budget is per worker, since each caches its own block.
+        // The budget is per worker, since each caches its own block. `workers` goes along with it
+        // so the segment path can tell the difference between "a quarter of RAM shared by everyone"
+        // and "a quarter of RAM divided by cores that will not all be busy".
         let hw = crate::hw::HwProfile::detect();
-        let per_thread = (hw.ram_total / BLOCK_CACHE_RAM_FRACTION) / hw.physical.max(1) as u64;
-        Self::build_within(path, secret, entries, per_thread)
+        let workers = hw.physical.max(1);
+        let per_thread = (hw.ram_total / BLOCK_CACHE_RAM_FRACTION) / workers as u64;
+        Self::build_within(path, secret, entries, per_thread, workers)
     }
 
     /// [`build`](Self::build) with the cache budget supplied rather than derived, so the decision
@@ -520,6 +536,7 @@ impl SevenZRandomAccess {
         secret: &Secret,
         entries: &[Entry],
         per_thread: u64,
+        workers: usize,
     ) -> Option<Self> {
         let password = Password::new(secret.expose());
         let mut file = std::fs::File::open(path).ok()?;
@@ -568,7 +585,7 @@ impl SevenZRandomAccess {
 
         // Cut what can be cut. A block written by a multi-threaded LZMA2 encoder carries dictionary
         // resets, and each is somewhere a decoder can start cold.
-        let segmented = Self::segment_blocks(path, &archive, &mut layouts, per_thread);
+        let segmented = Self::segment_blocks(path, &archive, &mut layouts, per_thread, workers);
 
         // An archive with no block holding any bytes has nothing for this path to do and is left to
         // the sequential one. Nothing else is refused.
@@ -654,6 +671,7 @@ impl SevenZRandomAccess {
         archive: &sevenz_rust2::Archive,
         layouts: &mut [Vec<(usize, u64, u64)>],
         per_thread: u64,
+        workers: usize,
     ) -> Vec<BlockSegments> {
         /// 7z method id for LZMA2.
         const LZMA2: [u8; 1] = [0x21];
@@ -663,7 +681,12 @@ impl SevenZRandomAccess {
         let Ok(mut file) = std::fs::File::open(path) else {
             return Vec::new();
         };
-        let mut out = Vec::new();
+
+        // Walk first and judge afterwards. The walk reads chunk headers and seeks over payload, so
+        // it costs two syscalls per chunk and no memory whatever the archive's size -- cheap enough
+        // to do for every candidate before deciding anything, which is what lets the decision below
+        // know how many units there will actually be.
+        let mut found: Vec<SegmentCandidate> = Vec::new();
         for (b, block) in archive.blocks.iter().enumerate() {
             if block.coders.len() != 1 || block.coders[0].encoder_method_id() != LZMA2 {
                 continue;
@@ -685,34 +708,54 @@ impl SevenZRandomAccess {
             };
             let dict = lzma2seg::declared_dict(block.coders[0].properties());
 
-            // Each concurrent segment holds a dictionary window, so the same per-worker budget that
-            // bounds the block cache has to bound these. Workers never exceed the core count and the
-            // budget is a quarter of RAM divided by it, so passing here caps the whole fan-out at a
-            // quarter of RAM however many segments the archive turns out to have.
-            //
-            // Without this the segment path had no memory bound at all: 19 workers each holding a
-            // 128 MiB window reached 2.8 GB on the corpus, which is fine on this machine and would
-            // not have been on a small one.
-            //
             // **Judge the window, not the segment.** Those were the same number only while the
             // declared dictionary was unreadable and the segment's own length was the bound. It is
             // readable now and is typically a quarter of it — 7-Zip writes 32 MiB dictionaries into
-            // 128 MiB blocks — so measuring the segment here refuses fan-outs that would cost a
-            // quarter of what the refusal assumes.
+            // 128 MiB blocks — so measuring the segment would refuse fan-outs costing a quarter of
+            // what the refusal assumes.
             let widest = segs
                 .iter()
                 .map(|s| lzma2seg::dict_window(s, 0, dict) as u64)
                 .max()
                 .unwrap_or(0);
-            if widest > per_thread {
-                continue;
-            }
-            out.push(BlockSegments {
+            found.push(SegmentCandidate {
                 block: b,
                 pack_end: start + len,
                 segs,
                 dict,
-                layout: std::mem::take(&mut layouts[b]),
+                widest,
+            });
+        }
+
+        // Each concurrent segment holds a dictionary window, and without a bound the fan-out had
+        // none at all: 19 workers each holding a 128 MiB window reached 2.8 GB on the corpus, fine
+        // on this machine and not on a small one.
+        //
+        // **The bound is the whole fan-out, not a fixed share per core.** Dividing the budget by
+        // the core count assumes every core will hold a window, which is only true when there are
+        // at least that many units. An archive yielding five of them can never have more than five
+        // windows live, and charging it for twenty-four refused segmentation on exactly the
+        // archives whose segments are largest: a 1 GiB `-mx=9` archive has 256 MiB segments against
+        // a 245 MB per-core share, missed the cut by 4%, and decoded on one thread.
+        //
+        // Rejecting a block only lowers the real concurrency below the estimate, so a budget
+        // derived from every candidate stays an upper bound on what is accepted.
+        let total_segs: usize = found.iter().map(|c| c.segs.len()).sum();
+        let envelope = per_thread.saturating_mul(workers.max(1) as u64);
+        let concurrency = workers.max(1).min(total_segs.max(1)) as u64;
+        let budget = envelope / concurrency;
+
+        let mut out = Vec::new();
+        for c in found {
+            if c.widest > budget {
+                continue;
+            }
+            out.push(BlockSegments {
+                block: c.block,
+                pack_end: c.pack_end,
+                segs: c.segs,
+                dict: c.dict,
+                layout: std::mem::take(&mut layouts[c.block]),
             });
         }
         out
@@ -1419,7 +1462,7 @@ mod gate_tests {
         let secret = Secret::new(String::new());
 
         // A budget under the big block but over the small one: the exact 5.5%-miss shape.
-        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, (big / 2) as u64)
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, (big / 2) as u64, 1)
             .expect("a single-entry block over budget must not refuse the archive");
         assert!(
             ra.plan.iter().any(|p| !p.fits && p.entries == 1),
@@ -1453,7 +1496,7 @@ mod gate_tests {
         // block in one streaming pass, so the archive is still worth taking. This assertion is the
         // reverse of the one it replaces -- refusing here sent a 1 GiB `.7z` to the sequential
         // reader, where it took twice 7-Zip's time and nineteen times its memory.
-        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, 1)
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, 1, 1)
             .expect("a block too large to cache is streamed, not a reason to refuse the archive");
 
         // And the bytes have to be right, which is the part that would make this a bad trade.
@@ -1478,6 +1521,48 @@ mod gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The fan-out budget is the whole envelope, not a fixed share per core.
+    ///
+    /// A per-core share charges an archive for cores that cannot be busy: with fewer units than
+    /// cores, most of them will never hold a window. That refused segmentation on precisely the
+    /// archives whose segments are largest -- a 1 GiB `-mx=9` archive missed a 245 MB per-core
+    /// share by 4% and decoded on one thread. The arithmetic is asserted directly because the
+    /// failure it guards against is invisible: the archive still extracts, just serially.
+    #[test]
+    fn the_segment_budget_is_shared_by_the_units_that_exist_not_by_every_core() {
+        // envelope = per_thread * workers, divided by min(workers, units).
+        let per_thread = 245u64 << 20;
+        let workers = 24usize;
+        let envelope = per_thread * workers as u64;
+
+        let budget = |units: usize| envelope / (workers.min(units.max(1)) as u64);
+
+        // Five units on a 24-core machine: each may hold about a fifth of the envelope, and a
+        // 256 MiB window fits comfortably. Under the old per-core share it did not.
+        assert!(
+            budget(5) > 256 << 20,
+            "five units must not be charged for 24"
+        );
+        assert!(
+            per_thread < 256 << 20,
+            "the per-core share is what used to refuse this"
+        );
+
+        // Once there are at least as many units as cores the two agree, which is the case the old
+        // arithmetic was written for and must not change.
+        assert_eq!(budget(24), per_thread);
+        assert_eq!(budget(100), per_thread);
+
+        // And the envelope never grows: whatever the unit count, total held is bounded by it.
+        for units in [1usize, 3, 5, 21, 24, 64] {
+            let concurrency = workers.min(units.max(1)) as u64;
+            assert!(
+                budget(units) * concurrency <= envelope,
+                "fan-out for {units} units exceeded the envelope"
+            );
+        }
+    }
+
     /// The unit pass must hand over every entry, in archive order, with the right bytes. This is the
     /// path extraction and `cram t` both take, so a fault here is silent wrong output.
     #[test]
@@ -1485,7 +1570,7 @@ mod gate_tests {
         let dir = scratch("unit-all");
         let (path, entries) = two_block_archive(&dir, 512 * 1024);
         let secret = Secret::new(String::new());
-        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX, 1).unwrap();
 
         let all: Vec<usize> = (0..entries.len())
             .filter(|&i| entries[i].kind == EntryKind::File)
@@ -1518,7 +1603,7 @@ mod gate_tests {
         let dir = scratch("unit-some");
         let (path, entries) = two_block_archive(&dir, 512 * 1024);
         let secret = Secret::new(String::new());
-        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX, 1).unwrap();
 
         let files: Vec<usize> = (0..entries.len())
             .filter(|&i| entries[i].kind == EntryKind::File)
@@ -1543,7 +1628,7 @@ mod gate_tests {
         let dir = scratch("unit-stop");
         let (path, entries) = two_block_archive(&dir, 512 * 1024);
         let secret = Secret::new(String::new());
-        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+        let ra = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX, 1).unwrap();
 
         let files: Vec<usize> = (0..entries.len())
             .filter(|&i| entries[i].kind == EntryKind::File)
@@ -1571,9 +1656,11 @@ mod gate_tests {
             .position(|e| e.path.raw().ends_with("big.bin"))
             .unwrap();
 
-        let cached = SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX).unwrap();
+        let cached =
+            SevenZRandomAccess::build_within(&path, &secret, &entries, u64::MAX, 1).unwrap();
         let streamed =
-            SevenZRandomAccess::build_within(&path, &secret, &entries, (big / 2) as u64).unwrap();
+            SevenZRandomAccess::build_within(&path, &secret, &entries, (big / 2) as u64, 1)
+                .unwrap();
         assert!(cached.plan.iter().all(|p| p.fits));
         assert!(streamed.plan.iter().any(|p| !p.fits));
 
