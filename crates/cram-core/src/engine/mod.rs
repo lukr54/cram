@@ -176,16 +176,39 @@ pub fn extract(
         // is not the one Cram happens to have been run from.
         let hw = HwProfile::detect_for(dest);
         let (rates, wall) = rates_and_wall(&hw, dest);
-        hw::derive_plan(
+        let units = units.unwrap_or_else(|| block_count(fmt, entries));
+        let plan = hw::derive_plan(
             Op::Extract,
             plan_codec(fmt, entries),
             // The backend's own count where it has one (`.cram` packs); the entry list otherwise.
-            units.unwrap_or_else(|| block_count(fmt, entries)),
+            units,
             &hw,
             Topology::SameDrive,
             &rates,
             wall,
-        )
+        );
+        // Why this extraction ran the way it did, on request. Every input to the decision, because
+        // the useless answer is the one that says what was chosen without saying what decided it.
+        // Working out why 7z extraction used two cores on twelve and twelve on twenty-four took an
+        // afternoon of bisecting with `taskset`; it is one line with this.
+        if std::env::var_os("CRAM_PROFILE").is_some() {
+            eprintln!(
+                "cram: extract plan {:?} {:?} workers={} writers={} units={} \
+                 logical={} physical={} decode={:.1} MiB/s wall={:.1} MiB/s random_access={} ({})",
+                plan.bottleneck,
+                plan.shape,
+                plan.workers,
+                plan.writers,
+                units,
+                hw.logical,
+                hw.physical,
+                rates.decode_rate(plan_codec(fmt, entries)),
+                wall,
+                reader.as_random_access().is_some(),
+                plan.note,
+            );
+        }
+        plan
     };
 
     // Cancelling should leave the destination as it was found, so the engines record what they
