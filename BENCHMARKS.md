@@ -7,6 +7,25 @@ by file and by byte as well. Commands are given in full so the numbers can be ch
 
 Nothing here is estimated. Where cram loses, the row is in the same table.
 
+> **The `extract` column in the four tool-comparison tables is not trustworthy, and is left in place
+> rather than quietly deleted.** Re-measuring on 14 August found that the published extraction times
+> imply write rates the destination volume cannot reach. The kernel tree is 1,920,837,858 bytes;
+> extracting it in the 2.21 s published for cram `--auto` requires 829 MiB/s, and this volume
+> measures **84 MiB/s sustained** and 321.8 MiB/s burst by cram's own probe. Four rows in that table
+> exceed even the burst figure. Whatever those runs measured, it was not bytes arriving on that
+> disk — and it affects every tool in the column equally, not only cram.
+>
+> Re-running the same extractions with `sync` inside the timed region gives 31–124 MiB/s, which is
+> physically plausible and 3–20× slower than published. Those numbers are not offered as
+> replacements: taken on a machine that had been written to all night, they vary by 2.4× between
+> identical runs, and publishing them would repeat the original error pointing the other way.
+>
+> The **create** column re-measured exactly — every archive size matches to the byte across four
+> corpora and three levels, on a build nine days and twenty-odd commits newer. That column stands.
+>
+> Note also that the method below never says *where* extractions were written. That is the gap this
+> got through, and it is stated here rather than fixed quietly.
+
 **Four corpora, and they say different things.** Silesia, enwik9 and the kernel tree contain no
 duplicate content at all, so they measure cram's compressor with its main structural advantage
 switched off. The Cram corpus is 15% duplicate by construction and is the one that measures
