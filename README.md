@@ -321,7 +321,7 @@ same way.
 cram l  <archive>                                 list entries
 cram x  <archive> [-o <dir>] [-p <pw>] [--skip]   extract
 cram a  <archive> <input...> [-p <pw>]            create [--fast|--auto|--small|--store]
-           [--overwrite]                          [--overwrite] replaces an existing <archive>
+           [--solid|--no-solid] [--overwrite]     [--overwrite] replaces an existing <archive>
 cram t  <archive> [-p <pw>]                       test integrity (decode + checksums, no extract)
 cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--fast|--auto|--small]
            [--overwrite]                          [--overwrite] replaces an existing <out>
@@ -370,6 +370,11 @@ cram --version                                    version + which optional featu
   tar, RAR, ISO, a bare compressed file and `.cram` there is no stored CRC to compare against and
   every entry is re-extracted as normal.
 - `--encrypt-names` (7z and `.cram` only) hides the file listing as well as the contents.
+- `--no-solid` (7z only) writes one independently-decodable pack per entry rather than packing
+  members together. That gives up most of the ratio — a shared dictionary across many similar small
+  files is where solid compression earns its name — and buys a cheaper read of one member out of a
+  large archive. Solid is the default; `--solid` states it explicitly for a script that would rather
+  not rely on a default.
 - `--overwrite`, alias `-y`, lets `cram a`, `cram conv` and `cram make-sfx` write over a file that
   already exists. Without it they refuse and exit non-zero, leaving the file as it was. `cram a` is
   spelled like 7-Zip's *add to archive* but creates a new one, which is the case the guard exists

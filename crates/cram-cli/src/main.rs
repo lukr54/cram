@@ -316,6 +316,7 @@ usage: cram <command> …
   l  <archive>                        list entries
   x  <archive> [-o <dir>] [-p <pw>]   extract [--skip]
   a  <archive> <input...> [-p <pw>]   create [--fast|--auto|--small|--store] [--encrypt-names]
+       [--solid|--no-solid]
        --fast is the quickest and still compresses; --auto (the default) balances; --small
        is as small as cram goes -- the widest window the format allows, LZMA's extreme
        match search, and a per-pack search over pre-filters and coder parameters, for a
@@ -326,6 +327,9 @@ usage: cram <command> …
        --recompress losslessly recompresses JPEGs, ~23% off each one with the exact
        originals restored on extract. It is slow -- roughly 4x the create time -- so it
        is on only with --small or when asked for by name; --no-recompress overrides both
+       --no-solid (7z) writes one independently-decodable pack per entry instead of
+       packing members together. Much larger archive, and cheaper to read one member out
+       of. Solid is the default and --solid says so explicitly
        --overwrite (-y) replaces an existing <archive>; without it cram refuses, because
        `a` creates a new archive rather than adding to one
   t  <archive> [-p <pw>]              test integrity (decode + checksums, no extract)
@@ -1410,6 +1414,8 @@ fn create_inputs(args: &[String]) -> Vec<PathBuf> {
         "--overwrite",
         "--recompress",
         "--no-recompress",
+        "--solid",
+        "--no-solid",
         "-y",
     ];
     let mut out = Vec::new();
@@ -1477,7 +1483,9 @@ fn create(args: &[String]) -> Result<()> {
         level,
         encrypt,
         codec: has(args, "--store").then_some(Codec::None),
-        solid: false,
+        // Solid unless asked otherwise. `--solid` is accepted and is the default, so a script can
+        // say what it means rather than relying on it.
+        solid: !has(args, "--no-solid"),
         threads: None,
         recompress_images: recompress_choice(args),
     };
@@ -1568,6 +1576,8 @@ fn convert_cmd(args: &[String]) -> Result<()> {
             "--encrypt-names",
             "--recompress",
             "--no-recompress",
+            "--solid",
+            "--no-solid",
             "--overwrite",
             "-y",
         ],
@@ -1598,7 +1608,9 @@ fn convert_cmd(args: &[String]) -> Result<()> {
         level,
         encrypt,
         codec: has(args, "--store").then_some(Codec::None),
-        solid: false,
+        // Solid unless asked otherwise. `--solid` is accepted and is the default, so a script can
+        // say what it means rather than relying on it.
+        solid: !has(args, "--no-solid"),
         threads: None,
         recompress_images: recompress_choice(args),
     };

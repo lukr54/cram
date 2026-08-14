@@ -74,6 +74,11 @@ pub struct CreateOptions {
     /// Solid compression (7z): pack members into one stream for a better ratio at the cost of
     /// random access. The adaptive engine may still author multi-block layouts so *our own*
     /// extraction parallelizes.
+    ///
+    /// **Defaults to `true`, and did in behaviour long before it did here.** The 7z writer read an
+    /// environment variable and ignored this field entirely, so the struct said `false` while every
+    /// archive came out solid. A caller reading `CreateOptions` was told the opposite of what it
+    /// would get.
     pub solid: bool,
     /// Worker threads; `None` = derive from [`hw::derive_plan`](crate::hw).
     pub threads: Option<usize>,
@@ -93,7 +98,7 @@ impl Default for CreateOptions {
             level: Level::default(),
             encrypt: None,
             codec: None,
-            solid: false,
+            solid: true,
             threads: None,
             recompress_images: true,
         }

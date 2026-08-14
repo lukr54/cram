@@ -137,6 +137,13 @@ const SOLID_BLOCK_BYTES: u64 = 128 << 20;
 
 /// Set to `0` to go back to one independently-decodable pack per entry: smaller random-access cost,
 /// much larger archive, single-threaded create.
+///
+/// **Superseded by `CreateOptions::solid`, which `cram a --no-solid` sets.** Kept because it was
+/// documented and someone may have it in a script, and because it is still the only way to reach
+/// this from a caller that does not build its own `CreateOptions`. When set it wins, so an
+/// environment that forces it keeps working; when unset the option decides, which is what a library
+/// caller expects. A user-facing choice that changes archive layout should not have lived only in
+/// an environment variable, and did for too long.
 const ENV_SOLID: &str = "CRAM_7Z_SOLID";
 
 /// Overrides [`SOLID_BLOCK_BYTES`], in bytes.
@@ -348,7 +355,9 @@ impl SevenZArchiveWriter {
             in_bytes: 0,
             stored: 0,
             start: Instant::now(),
-            solid: std::env::var(ENV_SOLID).map(|v| v != "0").unwrap_or(true),
+            solid: std::env::var(ENV_SOLID)
+                .map(|v| v != "0")
+                .unwrap_or(opts.solid),
             adaptive: opts.level == Level::Auto && opts.codec.is_none(),
             solid_max: std::env::var(ENV_BLOCK)
                 .ok()

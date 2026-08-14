@@ -49,11 +49,15 @@ fn build_tree(root: &Path) -> PathBuf {
 }
 
 fn create_7z(src: &Path, out: &Path) -> u64 {
+    create_7z_with(src, out, CreateOptions::default())
+}
+
+fn create_7z_with(src: &Path, out: &Path, opts: CreateOptions) -> u64 {
     let report = engine::create::create(
         out,
         Format::sevenz(),
         std::slice::from_ref(&src.to_path_buf()),
-        CreateOptions::default(),
+        opts,
         &NullSink,
     )
     .expect("create 7z");
@@ -179,10 +183,19 @@ fn solid_beats_non_solid_on_size() {
     let solid = dir.join("solid.7z");
     let solid_entries = create_7z(&src, &solid);
 
+    // Through the option, which is what `cram a --no-solid` sets. The environment variable still
+    // works and still wins where it is set, but a user-facing choice that changes archive layout
+    // should be reachable without one, and for a long time it was not: `CreateOptions::solid` said
+    // `false` while the writer ignored it and made every archive solid anyway.
     let non_solid = dir.join("nonsolid.7z");
-    std::env::set_var("CRAM_7Z_SOLID", "0");
-    let non_solid_entries = create_7z(&src, &non_solid);
-    std::env::remove_var("CRAM_7Z_SOLID");
+    let non_solid_entries = create_7z_with(
+        &src,
+        &non_solid,
+        CreateOptions {
+            solid: false,
+            ..CreateOptions::default()
+        },
+    );
 
     assert_eq!(
         solid_entries, non_solid_entries,
@@ -199,5 +212,41 @@ fn solid_beats_non_solid_on_size() {
     // Both layouts must still extract; non-solid is the documented escape hatch, not dead code.
     let out = dir.join("out-nonsolid");
     assert_eq!(extract_and_count(&non_solid, &out), 60);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The environment variable still wins where it is set, and the option decides otherwise.
+///
+/// Both directions matter. `CRAM_7Z_SOLID` was the only way to reach this for months and may sit in
+/// somebody's script, so it cannot start being ignored; and a library caller that builds its own
+/// `CreateOptions` must get what it asked for without knowing the variable exists.
+#[test]
+fn the_environment_override_beats_the_option_and_nothing_else_does() {
+    let dir = scratch("override");
+    let src = build_tree(&dir);
+
+    let not_solid = CreateOptions {
+        solid: false,
+        ..CreateOptions::default()
+    };
+
+    // Option says non-solid, environment forces solid: the environment wins.
+    std::env::set_var("CRAM_7Z_SOLID", "1");
+    let forced = dir.join("forced-solid.7z");
+    create_7z_with(&src, &forced, not_solid.clone());
+    std::env::remove_var("CRAM_7Z_SOLID");
+
+    // Same option, no environment: the option decides.
+    let honoured = dir.join("honoured.7z");
+    create_7z_with(&src, &honoured, not_solid);
+
+    let a = fs::metadata(&forced).unwrap().len();
+    let b = fs::metadata(&honoured).unwrap().len();
+    assert!(
+        a < b,
+        "CRAM_7Z_SOLID=1 must override solid:false ({a} bytes should be the solid one, \
+         against {b} for the option-honoured non-solid archive)"
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }
