@@ -111,6 +111,10 @@ segment start — on the benchmark corpus 128 MiB rather than the whole 2.8 GB a
 missing is teaching `read_range` to start there instead of at the block, and deciding what a mount
 should do with an archive whose segments are large enough that even that is slow.
 
+The shape for it now exists: `RandomAccessReader::entry_splits` reports where one entry may be cut
+into independently-decodable pieces, and `.cram` implements it against its pack boundaries. The 7z
+version is the same question asked of segments, which makes this smaller than it was.
+
 **Streaming `cram conv`.** Conversion holds one whole entry in memory, so a `.cram` containing a
 single file over 512 MiB fails to convert even though `cram x` extracts it fine. Extraction streams
 each entry to disk; conversion should too.

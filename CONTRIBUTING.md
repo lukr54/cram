@@ -113,7 +113,7 @@ cargo test -p cram-core         # one crate
 cargo test -- --ignored         # runs ONLY the ignored (heavy) tests
 ```
 
-On default features that is **264 passing tests, 0 failures**, and **277** with the features the
+On default features that is **273 passing tests, 0 failures**, and **286** with the features the
 release is built with (`download,zstd-c,phash`), which compile code the default build leaves out.
 Counted on `main` after 1.1.0. Those counts drift with every commit and are given only as a sanity check; green
 is the gate.

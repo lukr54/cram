@@ -110,7 +110,8 @@ cannot be cut (single-threaded encoder output, anything under one thread-block, 
 BCJ or delta filter whose state crosses the boundary) the walk says so and the block is decoded
 whole. Nothing is assumed about the encoder.
 
-Two trait methods carry this, both on `RandomAccessReader`:
+Three trait methods carry this, all on `RandomAccessReader`, and each exists because its absence was
+measured:
 
 - `coalesce_locality` fuses a unit's entries into ONE work item. Adjacency is not enough — rayon
   steals across the ordered list, and a worker hopping units re-decodes them. Measured on a 34-block
@@ -119,6 +120,19 @@ Two trait methods carry this, both on `RandomAccessReader`:
 - `copy_unit` serves a whole unit in one pass, handing each entry over as its bytes decode. The
   per-entry `copy_entry` cannot express that for a solid format: serving a block through it means
   decoding the block and *keeping* it, which cost 1.8 GB of peak RSS where streaming costs 175 MB.
+- `entry_splits` answers the opposite question: not how wide the *archive* can fan out, but how wide
+  **one entry** can. That is the number that matters when an archive holds very few of them. A 1 GB
+  `.cram` of a single file spans sixty independent packs and still extracted on one thread, because
+  the unit of work was the entry and there was one — 9.05 s at 1.0 effective cores against 7-Zip's
+  1.64 s at 4.4. `.cram` cuts at pack boundaries, the only seams that do not make two workers decode
+  the same pack; the engine decodes a window of pieces concurrently and writes them in order, which
+  needs no positional writes and leaves every rule around the bytes where it was.
+
+**A block that will not fit the cache is streamed, not refused.** Both the archive-level gate and the
+segment gate used to judge the wrong quantity, and between them a `.7z` written by a
+single-threaded encoder fell out of this path entirely and back onto the sequential reader. The
+lesson generalises: a gate written for one shape of access outlives the reason for it silently, and
+the cost shows up as a whole path not being taken rather than as a failure.
 
 **Everything else, tar, RAR, a bare compressed stream; takes the sequential path**
 ([`engine/sequential.rs`](../crates/cram-core/src/engine/sequential.rs)), one entry at a time. These

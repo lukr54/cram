@@ -58,8 +58,11 @@ Cram corpus in 2.58 s against 7-Zip's 3.64 s and RAR's 7.25 s. Writing to a real
 land between 15 and 19 s, because extraction is write-bound and the disk does not care which
 decoder fed it.
 
-**One corpus exposes a real weakness.** enwik9 is a single 1 GB file, and cram extracts it in
-10.28 s against 7-Zip's 2.77 s. Parallel extraction of a `.cram` is per-entry, and there is one entry.
+**One corpus exposed a real weakness, and it is mostly closed.** enwik9 is a single 1 GB file, and
+extraction fanned out per entry — one entry, one thread, whatever the machine. Cutting the entry at
+its pack boundaries took it from **9.05 s at 1.0 effective cores to 2.06 s at 5.4**, against 7-Zip's
+1.64 s at 4.4, in 900 MB against 7-Zip's 1176 MB. Measured to tmpfs on 14 August, output compared
+byte-for-byte against the original file; a later build than the tables below.
 
 **Opening somebody else's `.7z` is now level with 7-Zip on time and well under it on memory**, at
 3.26 s against 3.68 s on the Cram corpus, in **867 MB against 7-Zip's 4876 MB**. That is a later

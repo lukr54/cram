@@ -9,11 +9,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-7z extraction. It ran on one thread whatever the archive or the machine, which on a 7-Zip-written
-archive of the benchmark corpus meant 25 s against 7-Zip's 3.7 s. It is now level with 7-Zip there
-and 2.4× faster on an archive cram wrote, in less memory than 7-Zip needs in either case.
+Extraction, from four directions. 7z ran on one thread whatever the archive or the machine — 25 s
+against 7-Zip's 3.7 s on the benchmark corpus — and is now level with it there and 2.4× faster on an
+archive cram wrote, in less memory either way. A single large file used one core because the unit of
+work was the entry and there was one; enwik9 went from 9.05 s to 2.06 s. An archive of many small
+files was pathologically slow and is now 760× quicker than the finding that recorded it. And a
+crafted `.7z` could hang `cram t` forever.
 
 ### Changed
+
+- **A single large file no longer extracts on one thread.** The parallel path's unit of work was the
+  entry, so an archive holding one file used one core however many were free. A `.cram` entry is a
+  list of chunks and every chunk names its pack, so the entry can be cut at pack boundaries — the
+  only seams that do not make two workers decode the same pack — and its pieces decoded
+  concurrently. enwik9 goes from **9.05 s at 1.0 effective cores to 2.06 s at 5.4**, byte-identical
+  to the original 1,000,000,000-byte file, in 900 MB against 7-Zip's 1176 MB. Still 26% behind
+  7-Zip's 1.64 s rather than 5.5× behind, and `BENCHMARKS.md` says so.
+
+- **A block too large to cache is streamed rather than refused.** Two gates were judging the wrong
+  quantity, and between them a 1 GiB `.7z` written by a single-threaded encoder fell all the way back
+  to the sequential reader: 10.62 s and 2477 MB against 7-Zip's 5.53 s and 127 MB. One refused any
+  multi-entry block that could not be held in the cache, months after `copy_unit` made holding it
+  unnecessary; the other charged an archive's segments for every core rather than for the workers it
+  could actually use. Now **7.90 s and 64 MB**, and a `-mx=9` archive that decoded on one thread
+  goes from 11.16 s to 3.09 s. Output byte-identical on every archive tested.
+
+- **The write-bound worker count no longer scales by a figure that is not a ceiling.** It is
+  `wall / decode_rate`, linear in a number the inline probe gets wrong: 512 MiB is absorbed whole by
+  a drive with a gigabyte of SLC cache, so it reports the cache — 331.9 MiB/s for a volume whose
+  4 GiB probe measures 84, and on a RAM disk it reports memory bandwidth. Twenty decoders were being
+  fielded where the measured knee is eight. A write figure now records whether it is a sustained
+  ceiling or a burst, only a ceiling is scaled by, and the distinction survives a reload (profile
+  schema 4, so older profiles are re-measured rather than misread). On the corpus that is **40% less
+  CPU and 41% less memory for 11% more wall time**, which is a trade and is written down as one.
+
+- **`cram t` and extraction of many small files.** Both were listed as open findings, one at the
+  highest severity, and both had been fixed by earlier work that never came back to say so. The
+  kernel tree extracts at **29,664 files/s against the 39 files/s** the finding recorded, and
+  verifies in **1.10 s against 17.64 s**. Every one of the 86,618 files byte-identical at both
+  compression levels.
 
 - **7z extraction uses a third of the memory it did this morning, by asking the archive how big its
   dictionary is.** A segment's own length was the only bound available while the 7z crate kept coder
@@ -72,6 +106,14 @@ and 2.4× faster on an archive cram wrote, in less memory than 7-Zip needs in ei
 
 ### Fixed
 
+- **Creating a `.7z` of a large tree died with `Too many open files`.** The kernel tree, 86,618
+  files, on a tree 7-Zip archives without complaint. A block holds up to 8,192 open handles and up to
+  `inflight_max` packs hold as many again, so on a 24-thread machine the writer wants around 205,000
+  descriptors against a raised soft limit of 65,536. The recovery existed and could not work: it
+  drained one finished pack and retried once, and because that drain succeeded it never went on to
+  flush the block holding most of the handles. It now releases progressively and retries after each
+  step, finished packs before the open block.
+
 - **A crafted 7z could make `cram t` and `cram x` run forever.** A solid block is one stream shared
   by several entries, so a reader that has reported corrupt input is asked for bytes again — once by
   the code that records the failed entry and carries on, and again by the drain that advances to the
@@ -96,6 +138,18 @@ and 2.4× faster on an archive cram wrote, in less memory than 7-Zip needs in ei
 - `CRAM_PROFILE=1` prints the extraction plan and every input to it — bottleneck, workers, decode
   units, measured decode rate and write wall — so "why did this run on two threads" is one line
   rather than an afternoon of bisecting.
+
+- `CRAM_WORKERS=n` forces the pool width, so a benchmark can ask what the plan is worth. There was
+  no way to: `taskset` narrows which CPUs the process may use without narrowing the core count the
+  planner sees, so it still asks for every worker and simply gets them descheduled, which measures
+  contention rather than the count. Deliberately not a CLI flag, and it prints a line of its own
+  when in effect so it cannot be quietly set during a measurement.
+
+- **A regression table for the planner.** Adaptive parallelism is the thesis everything here rests
+  on and nothing asserted it as a whole; the plan flipped between 8 and 24 workers twice in one day
+  and both times a human caught it reading `CRAM_PROFILE` output. Seven named scenarios across three
+  machines that have been measured, each asserting a whole plan and carrying the reason it is that
+  answer, so a change has to state what it meant to change.
 
 ---
 

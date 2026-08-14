@@ -663,7 +663,10 @@ case is, so no claim is made about `.7z` files in general.
 
 ## 18. A write-bound plan asked for a wall it then declined to reach
 
-**Confirmed and fixed, 13 August 2026. One part unresolved.**
+**Confirmed and fixed, 13 August 2026. Then largely undone on 14 August, and that is the right
+outcome** — the wall it was scaling by turned out not to be a ceiling, so most of the workers it
+added were bought with a number that was measuring a cache. Read to the end before acting on the
+middle of this item.
 
 `classify` computed `min(units, physical) × decode_rate = 21 × 143.7 = 3018 MiB/s` against a measured
 2689 MiB/s wall, called the extraction write-bound, and the write-bound branch then ran
@@ -678,10 +681,28 @@ and goes from 6.4 to 11.7 CPU-seconds. `decode_rate` is a static per-codec estim
 that half that corpus is stored data decoding at memcpy speed. A per-archive decode estimate, or a
 governor that sheds workers that are not moving bytes, would fix it.
 
-**Unresolved: the inline write probe reads high, and the worker count now depends on it.** The probe
-an extraction runs writes 512 MiB and reported 331.9 MiB/s for the dev box's `/scratch`;
-`calibrate --write-probe` writes 4 GiB and reported 84 MiB/s for the same box on 7 August. Both are
-measurements — the short one never leaves cache. A wall 4× high asks for 4× the workers.
+**RESOLVED 14 August: a write figure now says whether it is a ceiling.** The probe an extraction runs
+writes 512 MiB and reported 331.9 MiB/s for the dev box's `/scratch`; `calibrate --write-probe`
+writes 4 GiB and reported 84 MiB/s for the same volume. Both are measurements — the short one never
+leaves the drive's cache. A wall 4× high asked for 4× the workers, and on tmpfs (2841 MiB/s, which is
+memory bandwidth) it asked for twenty.
+
+`hw::Wall` carries `sustained: bool`. Only a probe that watched throughput step down and sampled past
+the step has seen a ceiling; anything else classifies the bottleneck but never sizes the pool, and
+the distinction survives a reload (profile schema 4).
+
+**A worker sweep, using the `CRAM_WORKERS` override added for it, put the knee at 8**: 1.33 s and
+6.33 CPU-seconds, against 20 workers' 1.24 s and 11.27. The planner now picks 8. That is **40% less
+CPU and 41% less memory for 11% more wall time** — a trade, and recorded as one rather than as a win.
+
+That also settles the paragraph above: the extra workers were bought by the inflated wall, so
+correcting the wall was the fix and no per-archive decode estimate was needed. The `Governor` in
+`hw.rs` remains implemented, unit-tested, and called from nowhere.
+
+**Worth knowing:** with an honest wall the scaling term is nearly always inert. On any destination
+slower than the codec, `needed` is under 1 and the floor decides; it only fires for a RAM disk. If
+that survives further measurement, the term is worth deleting rather than keeping as machinery that
+never runs.
 
 ---
 
@@ -697,6 +718,12 @@ Codec rates stay per machine — they belong to the CPU. Walls are now keyed by 
 unix, volume root on Windows) and a destination never measured gets no wall rather than another
 volume's. Verified on one machine, two volumes: `/dev/shm` → 2717.1 MiB/s → 19 workers; `/scratch`
 → 331.9 MiB/s → 8 workers.
+
+Schema 4 (14 August) adds the other half: a wall records whether it is a **ceiling** (`wall.<volume>`)
+or a **burst** that may be nothing but cache (`burst.<volume>`). Keying by volume stopped one
+destination's figure being offered for another; this stops a figure being scaled by when it was never
+a measurement of the thing it is being used for. Both entries above were burst figures, which is why
+neither now fields nineteen workers.
 
 **Benchmark trap this exposed.** Two cram builds on one machine share
 `~/.config/cram/profile.toml` and disagree about its schema, so each invalidated the other's *every

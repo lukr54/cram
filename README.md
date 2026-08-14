@@ -579,6 +579,10 @@ section is a performance claim; for those see [`BENCHMARKS.md`](BENCHMARKS.md).
   start from cold. A 7z written single-threaded, or smaller than one of those thread-blocks, has
   nothing to cut and decodes whole. tar, RAR and bare streams stream front-to-back through the same
   write machinery.
+- **An archive holding one large file is still parallel.** Otherwise the unit of work is the entry
+  and there is only one, so a machine with twenty-four cores uses one. A `.cram` entry is cut at its
+  pack boundaries — the seams where the pieces genuinely are independent — and the pieces decode
+  concurrently.
 - **`.cram`** applies content-defined chunking, then global BLAKE3-keyed dedup across every input in
   one archive, then compressed packs and a footer index. Dedup is global: identical data anywhere in
   the inputs is stored once, with no dictionary-window limit. Optional encryption is Argon2id +
