@@ -4,14 +4,19 @@
 //! chosen at construction and finalized explicitly in `finish` (each encoder needs its trailer
 //! flushed that dropping alone wouldn't guarantee cleanly).
 //!
-//! All encoders are pure-Rust and stream. Two of them are not a plain `Write` wrapper:
+//! Two encoders are not a plain `Write` wrapper:
 //!
-//! **zstd**: `ruzstd`'s encoder is pull-model with no `Write` sink, so `.tar.zst` accumulates a
-//! bounded chunk (8 MiB) and emits it as an independent zstd *frame*, concatenated frames are
-//! spec-legal (`cat`/pzstd produce them; our reader and `zstd -d` decode them all), so memory stays
-//! bounded instead of buffering the entire tar. Since ruzstd only implements its `Fastest` level,
-//! `.tar.zst` is a fast-tier archive regardless of `--best` (use `.tar.xz` for maximum ratio). A
-//! future `zstd-c` feature can swap in the C zstd.
+//! **zstd** depends on the `zstd-c` feature, and the difference is large enough to measure. With it,
+//! the C library's streaming encoder is used: a real `Write` sink at any level, writing what the
+//! `zstd` CLI writes. Without it, `ruzstd` has no `Write` sink and encodes only at its `Fastest`
+//! level, so the archive is built as a run of independent 8 MiB *frames* instead — spec-legal
+//! (`cat`/pzstd produce exactly that, and both our reader and `zstd -d` decode them all) and bounded
+//! in memory, but slower and considerably larger.
+//!
+//! That gap was measured on 2026-08-14 and it is why the feature now reaches here: writing the
+//! kernel tree took **18.78 s for 742,491,196 bytes** through ruzstd against `zstd -T0 -3`'s 1.73 s
+//! for 540,088,970 — 10.9× slower and 37% larger — in a shipping build that already linked the C
+//! library for `.cram` packs and simply never used it here.
 //!
 //! **gzip**: written pigz-style so create uses every core, see [`TarSink::Gz`]. Only *create* is
 //! parallel — a standard `.gz` cannot be extracted in parallel by anyone, ours included, because a
@@ -32,6 +37,7 @@ use flate2::{Compress, Compression, Crc, FlushCompress};
 use lz4_flex::frame::FrameEncoder;
 use lzma_rust2::{XzOptions, XzWriter};
 use rayon::prelude::*;
+#[cfg(not(feature = "zstd-c"))]
 use ruzstd::encoding::{compress_to_vec, CompressionLevel};
 use tar::{Builder, EntryType, Header};
 
@@ -115,19 +121,94 @@ enum TarSink {
     Bz2(Box<BzEncoder<BufWriter<File>>>),
     Lz4(Box<FrameEncoder<BufWriter<File>>>),
     Br(Box<CompressorWriter<BufWriter<File>>>),
-    /// zstd accumulates at most [`ZSTD_FRAME_CHUNK`] bytes (ruzstd has no `Write` sink), emitting
-    /// each full chunk as its own zstd frame, bounded memory instead of buffering the whole tar.
-    Zstd {
-        buf: Vec<u8>,
-        file: BufWriter<File>,
-        level: CompressionLevel,
-    },
+    /// zstd, whose implementation depends on the `zstd-c` feature. See [`ZstdSink`].
+    Zstd(ZstdSink),
+}
+
+/// The zstd sink. One type, two implementations, so the feature split lives here rather than in
+/// every arm of `write`, `flush` and `finish`.
+#[cfg(feature = "zstd-c")]
+struct ZstdSink(Box<zstd::stream::write::Encoder<'static, BufWriter<File>>>);
+
+#[cfg(feature = "zstd-c")]
+impl ZstdSink {
+    fn new(file: BufWriter<File>, level: Level) -> io::Result<Self> {
+        Ok(Self(Box::new(zstd::stream::write::Encoder::new(
+            file,
+            zstd_level(level),
+        )?)))
+    }
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+    fn finish(self) -> io::Result<BufWriter<File>> {
+        self.0.finish()
+    }
+}
+
+/// Pure-Rust fallback: `ruzstd` has no `Write` sink, so the tar is cut into bounded chunks and each
+/// is emitted as its own zstd *frame*. Concatenated frames are what `cat` and `pzstd` produce, so
+/// every reader handles them; the cost is ratio, and ruzstd's single `Fastest` level costs more.
+#[cfg(not(feature = "zstd-c"))]
+struct ZstdSink {
+    buf: Vec<u8>,
+    file: BufWriter<File>,
+    level: CompressionLevel,
+}
+
+#[cfg(not(feature = "zstd-c"))]
+impl ZstdSink {
+    fn new(file: BufWriter<File>, _level: Level) -> io::Result<Self> {
+        Ok(Self {
+            buf: Vec::new(),
+            file,
+            level: CompressionLevel::Fastest,
+        })
+    }
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        // A full chunk becomes one independent zstd frame, so memory stays ≤ ~1 chunk.
+        if self.buf.len() >= ZSTD_FRAME_CHUNK {
+            let frame = compress_to_vec(&self.buf[..], self.level);
+            self.file.write_all(&frame)?;
+            self.buf.clear();
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+    fn finish(mut self) -> io::Result<BufWriter<File>> {
+        // The final partial chunk becomes the last frame (built in memory then written; ruzstd's
+        // streaming `compress` swallows target write errors).
+        if !self.buf.is_empty() {
+            let frame = compress_to_vec(&self.buf[..], self.level);
+            self.file.write_all(&frame)?;
+        }
+        Ok(self.file)
+    }
+}
+
+/// Map the abstract [`Level`] onto zstd's 1–22 scale. `--auto` is zstd's own default, so a
+/// head-to-head against `zstd` at *its* default compares like with like, the same way `--auto` means
+/// gzip 6 and xz 6 above.
+#[cfg(feature = "zstd-c")]
+fn zstd_level(level: Level) -> i32 {
+    match level {
+        Level::Auto | Level::Balanced => 3,
+        Level::Fastest => 1,
+        Level::Best | Level::Cold => 19,
+        Level::Explicit(n) => (n as i32 * 2).clamp(1, 19),
+    }
 }
 
 /// Bytes of tar accumulated before being compressed out as one independent zstd frame. Bounds the
-/// `.tar.zst` writer's memory (the old design held the ENTIRE tar in RAM until `finish`, archiving
-/// a 100 GiB tree OOM'd the process). Per-frame compression costs a little ratio; at ruzstd's
-/// Fastest level the difference is small.
+/// pure-Rust `.tar.zst` writer's memory (the old design held the ENTIRE tar in RAM until `finish`,
+/// and archiving a 100 GiB tree OOM'd the process). Unused with `zstd-c`, which streams.
+#[cfg(not(feature = "zstd-c"))]
 const ZSTD_FRAME_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Bytes of tar per independently-deflated gzip chunk (see [`TarSink::Gz`]). pigz uses 128 KiB;
@@ -250,18 +331,7 @@ impl TarSink {
             TarSink::Bz2(e) => e.finish()?,
             TarSink::Lz4(e) => e.finish().map_err(io::Error::other)?,
             TarSink::Br(e) => e.into_inner(),
-            TarSink::Zstd {
-                buf,
-                mut file,
-                level,
-            } => {
-                // Compress the final partial chunk as the last frame (in memory, then write out;
-                // ruzstd's streaming `compress` swallows target write errors).
-                if !buf.is_empty() {
-                    file.write_all(&compress_to_vec(&buf[..], level))?;
-                }
-                file
-            }
+            TarSink::Zstd(z) => z.finish()?,
         };
         buf.into_inner().map_err(|e| e.into_error())
     }
@@ -294,19 +364,7 @@ impl Write for TarSink {
             TarSink::Bz2(w) => w.write(buf),
             TarSink::Lz4(w) => w.write(buf),
             TarSink::Br(w) => w.write(buf),
-            TarSink::Zstd {
-                buf: b,
-                file,
-                level,
-            } => {
-                b.extend_from_slice(buf);
-                // A full chunk becomes one independent zstd frame, memory stays ≤ ~1 chunk.
-                if b.len() >= ZSTD_FRAME_CHUNK {
-                    file.write_all(&compress_to_vec(&b[..], *level))?;
-                    b.clear();
-                }
-                Ok(buf.len())
-            }
+            TarSink::Zstd(z) => z.write(buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -319,7 +377,7 @@ impl Write for TarSink {
             TarSink::Bz2(w) => w.flush(),
             TarSink::Lz4(w) => w.flush(),
             TarSink::Br(w) => w.flush(),
-            TarSink::Zstd { buf: b, .. } => b.flush(),
+            TarSink::Zstd(z) => z.flush(),
         }
     }
 }
@@ -396,12 +454,7 @@ impl TarArchiveWriter {
                 br_quality(opts.level),
                 22,
             ))),
-            // ruzstd only implements its `Fastest` level (see the module docs).
-            Codec::Zstd => TarSink::Zstd {
-                buf: Vec::new(),
-                file,
-                level: CompressionLevel::Fastest,
-            },
+            Codec::Zstd => TarSink::Zstd(ZstdSink::new(file, opts.level)?),
         };
         Ok(Self {
             builder: Some(Builder::new(sink)),
@@ -694,10 +747,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An input larger than one `ZSTD_FRAME_CHUNK` forces the bounded writer to emit several
-    /// concatenated zstd frames, the decode side must reassemble the tar byte-for-byte.
+    /// An input larger than one `ZSTD_FRAME_CHUNK`, which is the size that matters for the pure-Rust
+    /// writer: it forces several concatenated frames and the decode side has to reassemble the tar
+    /// byte-for-byte. With `zstd-c` the same input is one streamed frame, so this covers whichever
+    /// writer the build actually has, and asserts the same thing of both.
     #[test]
-    fn tar_zst_multi_frame_round_trips() {
+    fn tar_zst_round_trips_whichever_writer_is_built() {
         use crate::codec::decode_stream;
         use crate::model::{EntryKind, EntryPath};
 
