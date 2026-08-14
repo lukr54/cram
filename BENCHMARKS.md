@@ -1,30 +1,35 @@
 # Benchmarks
 
 Measured 5–6 August 2026 against 7-Zip 26.01, RAR 7.12, xz 5.4.5 and zstd 1.5.5 on one Linux
-machine. Every archive in every table was extracted and compared byte-for-byte against the
-source; **98 of 98 verified, no failures**, and on the Cram corpus every extraction was counted
-by file and by byte as well. Commands are given in full so the numbers can be checked.
+machine, with the extraction figures re-measured on 14 August. Every archive in every table was
+extracted and compared byte-for-byte against the source; **98 of 98 verified, no failures**, and on
+the Cram corpus every extraction was counted by file and by byte as well. Commands are given in full
+so the numbers can be checked.
 
 Nothing here is estimated. Where cram loses, the row is in the same table.
 
-> **The `extract` column in the four tool-comparison tables is not trustworthy, and is left in place
-> rather than quietly deleted.** Re-measuring on 14 August found that the published extraction times
-> imply write rates the destination volume cannot reach. The kernel tree is 1,920,837,858 bytes;
-> extracting it in the 2.21 s published for cram `--auto` requires 829 MiB/s, and this volume
-> measures **84 MiB/s sustained** and 321.8 MiB/s burst by cram's own probe. Four rows in that table
-> exceed even the burst figure. Whatever those runs measured, it was not bytes arriving on that
-> disk — and it affects every tool in the column equally, not only cram.
+**The create figures were re-run on 14 August against a build thirty commits newer and reproduced to
+the byte** — every archive size, across four corpora and three effort levels. The extraction figures
+did not, and the section that replaces them says why.
+
+> **The `extract` column in the four tool-comparison tables was wrong, and is left in place with
+> this warning rather than quietly deleted.** Its times imply write rates the destination cannot
+> reach: extracting the 1,920,837,858-byte kernel tree in the 2.21 s published for cram `--auto`
+> needs 829 MiB/s, on a volume measuring **84 MiB/s sustained** and 321.8 burst. Four rows exceed
+> even the burst figure. Those runs did not measure bytes arriving on the disk, and it affects every
+> tool in the column equally rather than cram alone.
 >
-> Re-running the same extractions with `sync` inside the timed region gives 31–124 MiB/s, which is
-> physically plausible and 3–20× slower than published. Those numbers are not offered as
-> replacements: taken on a machine that had been written to all night, they vary by 2.4× between
-> identical runs, and publishing them would repeat the original error pointing the other way.
+> The cause is in the method below: `sync` flushes the *whole system*, not what the tool just wrote,
+> and the method never says where extractions were written. Both are stated here rather than fixed
+> quietly.
+>
+> **[Extraction, measured properly](#extraction-measured-properly)** below replaces it for the one
+> corpus this machine can measure. The short version: on a real disk with the writes actually
+> landing, the four tools are within **23%** of each other, because extraction is write-bound. The
+> prose in this document always said that; its own table disagreed with it.
 >
 > The **create** column re-measured exactly — every archive size matches to the byte across four
-> corpora and three levels, on a build nine days and twenty-odd commits newer. That column stands.
->
-> Note also that the method below never says *where* extractions were written. That is the gap this
-> got through, and it is stated here rather than fixed quietly.
+> corpora and three levels, on a build nine days and thirty commits newer. That column stands.
 
 **Four corpora, and they say different things.** Silesia, enwik9 and the kernel tree contain no
 duplicate content at all, so they measure cram's compressor with its main structural advantage
@@ -53,10 +58,13 @@ on the pure-compression corpora**: 7-Zip `-mx=9` is 1.84% smaller on the kernel 
 smaller on enwik9, and on the kernel tree cram `--small` is *strictly dominated* — bigger and
 slower than 7-Zip `-mx=9`.
 
-**Extraction is a decoder win and a wash on disk.** With the write wall removed, cram decodes the
-Cram corpus in 2.58 s against 7-Zip's 3.64 s and RAR's 7.25 s. Writing to a real disk all three
-land between 15 and 19 s, because extraction is write-bound and the disk does not care which
-decoder fed it.
+**Extraction is a decoder win and very nearly a wash on disk.** With the write wall removed, cram
+decodes the Cram corpus in 2.58 s against 7-Zip's 3.64 s and RAR's 7.25 s. On a real disk with the
+writes actually counted, the kernel tree gives cram 35.94 s against zstd's 36.98, xz's 44.10 and
+7-Zip's 44.12 — **first, by 1.23× over 7-Zip, with every tool inside 23% of every other**. That is
+what write-bound means, and it is the honest shape of this comparison. See
+[Extraction, measured properly](#extraction-measured-properly); the `extract` column in the tables
+below predates it and is wrong.
 
 **One corpus exposed a real weakness, and it is mostly closed.** enwik9 is a single 1 GB file, and
 extraction fanned out per entry — one entry, one thread, whatever the machine. Cutting the entry at
@@ -65,12 +73,17 @@ its pack boundaries took it from **9.05 s at 1.0 effective cores to 2.06 s at 5.
 byte-for-byte against the original file; a later build than the tables below.
 
 **Opening somebody else's `.7z` is now level with 7-Zip on time and well under it on memory**, at
-3.26 s against 3.68 s on the Cram corpus, in **867 MB against 7-Zip's 4876 MB**. That is a later
-build than the rest of this document and is measured separately below. It applies to a `.7z` holding
-more than 128 MiB written at stock settings, which is where the encoder leaves seams a decoder can
-start from. With fewer seams there is less to fan out over and cram gives time back — at `-mmt=1`,
-which leaves none at all, it is 47% slower in a third of the memory. Every case is measured in that
-section.
+3.26 s against 3.68 s on the Cram corpus, in **867 MB against 7-Zip's 4876 MB**. Measured to tmpfs
+on a later build than the tables below, and stated with its conditions because they are load-bearing:
+
+- It applies to a `.7z` holding **more than 128 MiB, written at stock settings**. That is where a
+  multi-threaded encoder leaves dictionary resets a decoder can start from. The rule is exact —
+  block size is four times the dictionary — and derived from measurement rather than assumed.
+- Below that threshold, or with `-mmt=1`, there are no seams. cram gives time back and is **47%
+  slower**, in a third of the memory.
+- At `-mx=9` the segments are 256 MiB and cram is **26% slower**, in 1.75× less memory.
+
+Every one of those is measured in that section, including the ones where cram loses.
 
 **Memory is where cram is unambiguously cheaper.** Default against default on the Cram corpus,
 2.4 GB against 7-Zip's 7.1 GB. At maximum, 7-Zip needs **17.4 GB** and does not fit on a 16 GB
@@ -211,10 +224,28 @@ in a quarter of the time.
 | RAR | `-m3` (default) | 43.47 s | 581,071,715 | 0.3025 | 345 MB | 11.14 s |
 
 Default against default, cram is **5.9× faster than 7-Zip** and **5.2× faster than RAR while
-also being 15% smaller**. It extracts in 2.21 s where 7-Zip takes 5.96 s and RAR 11.14 s.
+also being 15% smaller**. Ignore the extract column here and read
+[Extraction, measured properly](#extraction-measured-properly) instead: on a real disk the four
+tools land within 23% of each other, and the figures in this table were taken before the writes
+were being counted.
 
 7-Zip `-mx=9` reaches a ratio cram does not, and does it in half `--small`'s time. It pays
 **18.9 GB of RAM** to get there, against cram's 7.5 GB.
+
+**Writing a `.7z` rather than a `.cram`, cram beats 7-Zip at its own format and its own maximum.**
+Same tree, same machine, 14 August:
+
+| tool | setting | create | archive | peak RSS |
+|---|---|---:|---:|---:|
+| **cram** | **`--small`, `.7z`** | **95.0 s** | **135 MiB** | **4393 MB** |
+| 7-Zip | `-mx=9` | 96.8 s | 136 MiB | 14851 MB |
+| cram | `--auto`, `.7z` | 58.1 s | 140 MiB | 1265 MB |
+| 7-Zip | `-mx=5` (default) | 41.0 s | 145 MiB | 5588 MB |
+
+Smaller, marginally faster, and **3.4× less memory**, all three at once. `--auto` is the better
+default even so: 96% of `--small`'s ratio for 61% of the time and 29% of its memory, and still
+smaller than 7-Zip's default. Note this is cram *writing the 7z format*; the `.cram` rows above are a
+different comparison and `--small` loses that one.
 
 ## Cram corpus 1.0, 2,800,604,582 bytes, 42,151 files
 
@@ -379,6 +410,44 @@ units, and it extracts fastest of all at 0.71 s in 235 MB.
 Extraction to a real disk is not reported here. On this machine it is write-bound and the four
 columns do not separate: repeated runs of the same command ranged 9.85–26.68 CPU-seconds and
 16.33–30.32 s wall, which supports no claim in either direction.
+
+## Extraction, measured properly
+
+Measured 14 August after the `extract` column above was found to describe writes that never reached
+the disk. Every tool at its own default, destination `/scratch` (ext4, the volume named under
+[Machine](#machine)), **`fsync` of every extracted file inside the timed region**, median of 3 with
+the tool order rotated each round, warm-up discarded. All 48 extractions were counted by file and by
+byte and `diff -rq`'d against the corpus; all 48 verified.
+
+**Only the kernel tree is reported, and the reason is the point.** This drive cliffs at about 2 GiB.
+The kernel tree is 1832 MiB, exceeds it, and every run lands on the sustained floor — three rounds
+within **8%**. Silesia (202 MiB) and enwik9 (954 MiB) fit inside the cache, so each run measures
+whatever the cache was doing and they swing **2.5–3.6× between identical runs**. No method fixes
+that; it needs a corpus larger than the cache, or a different drive. So they are not reported at all
+rather than reported badly.
+
+### Linux kernel tree, 1,920,837,858 bytes, 94,778 files, to ext4
+
+| tool | setting | extract | peak RSS |
+|---|---|---|---|
+| **cram** | `--auto` (default) | **35.94 s** | 1146 MB |
+| zstd | `-3` (default) | 36.98 s | 10 MB |
+| xz | `-6` (default) | 44.10 s | 10 MB |
+| 7-Zip | `-mx=5` (default) | 44.12 s | 2284 MB |
+
+1832 MiB in 35.94 s is **51 MiB/s**, which is what this disk does when 94,778 files are each
+flushed to it.
+
+**The ordering holds and the margins collapse.** cram is still first, by 1.23× over 7-Zip rather
+than the 2.7× the old table implied, and every tool is within 23% of every other. At these rates the
+disk is the whole story and does not care which decoder fed it. Memory still separates them: 1146 MB
+against 7-Zip's 2284 MB, with the two pipe-based tools holding almost nothing because a tar pipe has
+nothing to hold.
+
+**Decode is a different question and cram wins it comfortably.** Extracting Silesia to tmpfs, where
+no disk is involved, takes cram **0.22 s** against zstd's 0.18 s and 7-Zip's 0.89 s. That is the
+number the old table was closer to measuring, and it is worth knowing — but it is not what happens
+when you extract an archive onto a disk.
 
 ## Where cram loses
 
