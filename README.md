@@ -293,7 +293,7 @@ writes different `.cram` bytes than the pure-Rust default, so it is worth checki
 two archives.
 
 Run the tests with `cargo test`; that is 212 tests across the workspace, and 224 with the features
-the release is built with (`download,zstd-c,phash`), which compile code the default build leaves out.
+the release is built with (`download,zstd-c,phash,mimalloc`), which compile code the default build leaves out.
 Exact counts drift with every commit; what matters is that the suite is green.
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
 See [CONTRIBUTING.md](CONTRIBUTING.md).

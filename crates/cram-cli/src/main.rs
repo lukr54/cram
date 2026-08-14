@@ -28,6 +28,18 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+
+/// Create is allocation-heavy — a pack buffer per lane, a chunk buffer per file, and a small `Vec`
+/// per chunk of every file — so the allocator is on the hot path rather than beside it, and the
+/// system one is what the workspace measured against.
+///
+/// Behind a feature because it is a C dependency and the default build has to stay compilable on a
+/// bare mingw toolchain. On in the shipped binary, which already links C for UnRAR and zstd, so it
+/// costs that build nothing it was not already paying. `cram --version` reports it, since an
+/// allocator swap is exactly the sort of thing worth knowing about a machine that reported a timing.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::time::Instant;
 
 use cram_core::engine::ExtractOptions;
@@ -102,6 +114,7 @@ fn main() -> ExitCode {
                 ("zstd-c", cfg!(feature = "zstd-c")),
                 ("download", cfg!(feature = "download")),
                 ("phash", cfg!(feature = "phash")),
+                ("mimalloc", cfg!(feature = "mimalloc")),
             ]
             .iter()
             .filter(|(_, on)| *on)

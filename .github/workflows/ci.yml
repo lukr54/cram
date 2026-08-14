@@ -53,7 +53,7 @@ jobs:
       # backend and the download feature on, and those code paths are otherwise never compiled here.
       - name: Build the release configuration
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c,phash
+          cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc
           cargo build --release -p cram-extract
           cargo build --release -p cram-shell
 
@@ -93,7 +93,7 @@ jobs:
       # resolves reqwest to rustls (no system OpenSSL), per the per-OS split in the crate manifests.
       - name: Build the release configuration
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c,phash
+          cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc
           cargo build --release -p cram-extract
 
       - name: Fuzz smoke tests
@@ -125,7 +125,7 @@ jobs:
       # manifests treats macOS as non-Windows), so no system OpenSSL is needed.
       - name: Build the release configuration
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c,phash
+          cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc
           cargo build --release -p cram-extract
 
       - name: Fuzz smoke tests
@@ -207,7 +207,7 @@ jobs:
       - name: Regenerate the licence appendix and check the committed copy against it
         run: |
           cargo about generate -c about.toml about.hbs -o /tmp/regenerated.md \
-            --workspace --features "download zstd-c phash"
+            --workspace --features "download zstd-c phash mimalloc"
           tr -d '\r' < /tmp/regenerated.md > /tmp/regenerated.lf.md
           if ! diff -u THIRD-PARTY-LICENSES.md /tmp/regenerated.lf.md; then
             echo "::error::THIRD-PARTY-LICENSES.md no longer matches the dependency graph. Regenerate it with the command in THIRD-PARTY-NOTICES.md and commit the result."
@@ -244,7 +244,7 @@ jobs:
 
       - name: Build the shipped binaries
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c,phash
+          cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc
           cargo build --release -p cram-extract
           cargo build --release -p cram-shell
 
@@ -337,7 +337,7 @@ jobs:
 
       - name: Build the shipped binaries
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c,phash
+          cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc
           cargo build --release -p cram-extract
 
       - name: Stage the distributable
@@ -384,7 +384,7 @@ jobs:
 
       - name: Build the shipped binaries
         run: |
-          cargo build --release -p cram-cli --features download,zstd-c,phash
+          cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc
           cargo build --release -p cram-extract
 
       - name: Stage the distributable

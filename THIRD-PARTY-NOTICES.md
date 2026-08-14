@@ -287,7 +287,7 @@ which violates nothing; omitting one is the violation, and the asymmetry says er
 ```bash
 cargo install cargo-about --locked --version 0.9.1 --features cli
 cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
-  --workspace --features "download zstd-c phash"
+  --workspace --features "download zstd-c phash mimalloc"
 ```
 
 No `--target` flag: `about.toml` pins the triples itself, which is also why the check runs on any

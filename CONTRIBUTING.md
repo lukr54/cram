@@ -57,11 +57,12 @@ Optional features are opt-in so the base build always compiles:
 | `zstd-c` | full-range zstd encoder (C libzstd). **The shipped binary is built with this**, it is not a pure-Rust build. |
 | `download` | `cram dl` segmented downloader, and `cram update`. Opens no listening socket. |
 | `phash` | perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos. Pure Rust, but a large dependency tree. |
+| `mimalloc` | replaces the system allocator. Create is allocation-heavy — a pack buffer per lane, a chunk buffer per file, a small `Vec` per chunk of every file — so the allocator sits on the hot path. C, so it is opt-in; **on in the shipped binary**. |
 
 The release CLI is built as:
 
 ```sh
-cargo build --release -p cram-cli --features download,zstd-c,phash --bin cram
+cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc --bin cram
 ```
 
 The Explorer menu is a separate cdylib and has to be built too, or `cram shell install` has nothing
@@ -114,7 +115,7 @@ cargo test -- --ignored         # runs ONLY the ignored (heavy) tests
 ```
 
 On default features that is **273 passing tests, 0 failures**, and **286** with the features the
-release is built with (`download,zstd-c,phash`), which compile code the default build leaves out.
+release is built with (`download,zstd-c,phash,mimalloc`), which compile code the default build leaves out.
 Counted on `main` after 1.1.0. Those counts drift with every commit and are given only as a sanity check; green
 is the gate.
 
@@ -162,7 +163,7 @@ Two more CI jobs block a PR, and neither is fmt or clippy:
 
   ```sh
   cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
-    --workspace --features "download zstd-c phash"
+    --workspace --features "download zstd-c phash mimalloc"
   ```
 
   It exists because the appendix shipped once already missing eleven crates.

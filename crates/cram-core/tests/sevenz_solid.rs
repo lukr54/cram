@@ -11,18 +11,34 @@
 //! new directory. They are therefore deferred and written after every file block, which reorders
 //! the header. These tests pin down that nothing is lost by that.
 //!
-//! `CRAM_7Z_SOLID` is process-wide. Each integration test file is its own binary, so the env work
-//! is confined to a single test here to avoid racing the other one.
+//! `CRAM_7Z_SOLID` is process-wide, and the tests in one file run **concurrently in one binary**.
+//! A test that sets it changes what every other test's create does while it is set, so they are
+//! serialised through [`ENV_LOCK`] rather than trusted to miss each other.
+//!
+//! That is not hypothetical. Adding a second env-setting test here made
+//! `solid_beats_non_solid_on_size` fail intermittently — its "non-solid" archive came out solid —
+//! and because it depended on timing it first appeared when an unrelated feature changed how fast
+//! the binary ran, which reads as "that feature broke 7z" and is not what happened.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use cram_core::engine;
 use cram_core::format::Format;
 use cram_core::progress::NullSink;
 use cram_core::secret::NoPassword;
 use cram_core::writer::CreateOptions;
+
+/// Serialises every test in this file. See the module comment: one of them sets a process-wide
+/// environment variable that changes what a create does.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take the lock, surviving a panic in another test rather than cascading into a poisoned-mutex
+/// failure that hides which test actually broke.
+fn serialised() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("cram-7z-solid-{}-{}", std::process::id(), tag));
@@ -112,6 +128,7 @@ fn walk(root: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn solid_7z_round_trips_and_keeps_empty_directories() {
+    let _serial = serialised();
     let dir = scratch("roundtrip");
     let src = build_tree(&dir);
     let before = tree_files(&src);
@@ -150,6 +167,7 @@ fn solid_7z_round_trips_and_keeps_empty_directories() {
 /// exercises the descriptor-exhaustion path for real rather than merely covering multiple blocks.
 #[test]
 fn more_files_than_the_descriptor_limit_still_archives() {
+    let _serial = serialised();
     let dir = scratch("fdlimit");
     let data = dir.join("many");
     fs::create_dir_all(&data).unwrap();
@@ -177,6 +195,7 @@ fn more_files_than_the_descriptor_limit_still_archives() {
 /// materially smaller archive than one dictionary per entry.
 #[test]
 fn solid_beats_non_solid_on_size() {
+    let _serial = serialised();
     let dir = scratch("size");
     let src = build_tree(&dir);
 
@@ -222,6 +241,7 @@ fn solid_beats_non_solid_on_size() {
 /// `CreateOptions` must get what it asked for without knowing the variable exists.
 #[test]
 fn the_environment_override_beats_the_option_and_nothing_else_does() {
+    let _serial = serialised();
     let dir = scratch("override");
     let src = build_tree(&dir);
 

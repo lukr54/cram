@@ -33,6 +33,8 @@ cram-core = { path = "../cram-core", version = "1.1.0" }
 # Reading the release JSON for `cram update`. Optional, so a default build (no `download`) does not
 # compile it; already in the graph via rdm-core, so it costs nothing extra in a shipped build.
 serde_json = { version = "1", optional = true }
+# See the `mimalloc` feature. Optional, so a default build never compiles it.
+mimalloc = { version = "0.1", optional = true }
 cram-mount = { path = "../cram-mount", version = "1.1.0" }
 cram-recovery = { path = "../cram-recovery", version = "1.1.0" }
 cram-sign = { path = "../cram-sign", version = "1.1.0" }
@@ -44,3 +46,8 @@ download = ["cram-core/download", "dep:serde_json"]
 zstd-c = ["cram-core/zstd-c"]
 # Perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos.
 phash = ["cram-core/phash"]
+# Replace the system allocator with mimalloc. Create is allocation-heavy -- a pack buffer per lane,
+# a chunk buffer per file, and one small Vec per chunk of every file -- and the system allocator is
+# where that lands. Opt-in because it is a C dependency and the default build must stay compilable
+# on a bare mingw toolchain; on in the shipped binary, which already carries C for UnRAR and zstd.
+mimalloc = ["dep:mimalloc"]
