@@ -104,16 +104,20 @@ into an unbounded walk.
 refuses anything over 2 GiB. tar and RAR have no random-access boundary at all, the way ZIP, ISO and
 `.cram` do; those three are already projected on demand.
 
-7z is no longer in that category and the entry is kept here because the work is now worth doing
-rather than impossible. Extraction addresses a 7z by solid block, and by LZMA2 segment within a
-block where the archive carries dictionary resets, so a ranged read costs decoding from the nearest
-segment start — on the benchmark corpus 128 MiB rather than the whole 2.8 GB archive. What is
-missing is teaching `read_range` to start there instead of at the block, and deciding what a mount
-should do with an archive whose segments are large enough that even that is slow.
+7z is no longer in that category. `read_range` now starts at the LZMA2 segment holding the range
+rather than at the start of the block, so on a block too large to cache a ranged read costs decoding
+from the nearest segment — on the benchmark corpus 128 MiB rather than the whole 2.8 GB — instead of
+the entire block every time. Nothing is held while it does: only the dictionary window stays
+resident, so a segment far larger than memory costs its window, not its length.
 
-The shape for it now exists: `RandomAccessReader::entry_splits` reports where one entry may be cut
-into independently-decodable pieces, and `.cram` implements it against its pack boundaries. The 7z
-version is the same question asked of segments, which makes this smaller than it was.
+That was the piece a lazy 7z mount was missing, and it also settles the question this entry used to
+ask about segments too large to hold — they are streamed, not held, so the size of a segment is a
+question about latency rather than memory. What is left is a mount-side decision: a read near the
+end of a segment pays the decode from that segment's start, so a mount may want to keep the
+last-decoded window, read ahead, or simply accept the cost.
+
+The shape for it exists: `RandomAccessReader::entry_splits` reports where one entry may be cut into
+independently-decodable pieces, and `.cram` implements it against its pack boundaries.
 
 **Streaming `cram conv`.** Conversion holds one whole entry in memory, so a `.cram` containing a
 single file over 512 MiB fails to convert even though `cram x` extracts it fine. Extraction streams

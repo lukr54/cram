@@ -65,6 +65,11 @@ the three cram loses, in [Decode](#decode).
 **On a real disk none of that shows.** Extraction is write-bound: the same four tools land within
 23% of each other, and the choice barely matters if you are writing to a spinning or SATA disk.
 
+**Writing a `.tar.gz` is 5.9× to 9.6× faster than `tar czf`**, for archives within 0.2% of gzip's
+own on two corpora and 1.40% smaller on the kernel tree. Create only — a standard `.gz` cannot be
+extracted in parallel by anybody, and cram does not pretend otherwise. Numbers, and what the
+chunking costs, in [Writing `.tar.gz`](#writing-targz).
+
 **One corpus exposed a real weakness, and it is mostly closed.** enwik9 is a single 1 GB file, and
 extraction fanned out per entry — one entry, one thread, whatever the machine. Cutting the entry at
 its pack boundaries took it from **9.05 s at 1.0 effective cores to 2.06 s at 5.4**, against 7-Zip's
@@ -474,6 +479,34 @@ is decisively cheaper: 1223 MB against 2285 on the kernel tree, and **1310 MB ag
 Cram corpus. Against the pipe-based tools it is much heavier — zstd and xz sit at 6–10 MB because a
 tar pipe holds nothing at all, and RAR at 44 MB. "Cheaper on memory" is true of 7-Zip and false of
 zstd.
+
+## Writing `.tar.gz`
+
+`.tar.gz` is its own comparison because the competitor is not an archiver, it is `tar czf`. Same
+machine and method as the Decode table: destination `/dev/shm`, warm-up discarded, median of 3 with
+the order rotated, cram at its default level against stock `tar -czf` (gzip 1.12).
+
+| | cram | `tar czf` | | cram bytes | `tar czf` bytes |
+|---|---|---|---|---|---|
+| Silesia 203 MiB | **0.72 s** | 5.72 s | 7.9× | 68,283,059 | 68,227,507 |
+| enwik9 954 MiB | **3.07 s** | 29.43 s | 9.6× | 324,378,802 | 323,741,701 |
+| kernel tree 2.1 GB | **5.43 s** | 32.29 s | 5.9× | 558,362,143 | 566,298,666 |
+
+The archives are within 0.2% of gzip's on the first two and **1.40% smaller** on the kernel tree.
+
+**Create only.** A standard `.gz` cannot be extracted in parallel by anyone, cram included: a
+decoder cannot find the block boundaries without inflating everything before them. Nothing here says
+`cram x` on a `.tar.gz` is faster than `tar xzf`, and it is not.
+
+**What it costs.** The stream is cut into 1 MiB chunks compressed independently, so each starts with
+an empty dictionary and the archive grows by 0.19–0.34% against a single-stream gzip. Peak memory is
+the window — 177 MB on Silesia against 17 MB before, 235 MB on the kernel tree — and CPU rises
+30–39% for the wall-clock. On one core the chunked writer is neither faster nor slower than the
+streaming one (6.12 s against 6.28 s on Silesia), so the CPU is the price of concurrency rather than
+of chunking, and a machine with nothing to parallelise over does not pay it.
+
+The output does not depend on how many cores wrote it: chunk boundaries are byte offsets in the tar
+stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
 
 ## Where cram loses
 

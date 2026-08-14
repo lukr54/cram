@@ -733,6 +733,85 @@ A/B of two builds must give each its own `XDG_CONFIG_HOME` and a warm-up pass.
 
 ---
 
+## 20. `.tar.gz` create used one core, and cutting the stream up costs almost nothing
+
+**Fixed and measured, 14 August 2026.**
+
+gzip is a single stream with no boundaries a writer has to respect, so cram wrote it through one
+`GzEncoder` and used one core. It was marginally *slower* than stock `tar czf` on Silesia, 6.26 s
+against 5.72 s.
+
+pigz's trick applies: cut the tar stream into fixed chunks, deflate each with its own compressor,
+end each with a **sync flush** so it stops on a byte boundary, and concatenate. Each compressor
+starts empty, so no back-reference points outside its own chunk, which is what makes the chunks
+separable. The result is one ordinary gzip member and `gzip -t` accepts it.
+
+Dev box, 24 threads, default level, destination tmpfs, warm-up discarded, median of 3 rotated:
+
+| corpus | before | after | stock `tar czf` |
+|---|---|---|---|
+| Silesia 203 MiB | 6.26 s | **0.72 s** | 5.72 s |
+| enwik9 954 MiB | 29.82 s | **3.07 s** | 29.43 s |
+| kernel tree 2.1 GB | 37.43 s | **5.43 s** | 32.29 s |
+
+**Only create is parallel.** A standard `.gz` cannot be extracted in parallel by anyone, this
+included: a decoder cannot find the block boundaries without inflating everything before them.
+
+**The seam cost is 0.19–0.34%**, a quarter of what pigz reports for independent chunks, because the
+chunk is 1 MiB rather than pigz's 128 KiB and a 32 KiB dictionary loss against a megabyte is
+proportionally eight times smaller. On the kernel tree the archive is 1.40% *smaller* than gzip's
+own output even after paying it.
+
+**The trade is CPU and memory:** 30–39% more CPU, and peak RSS from 17 to 177 MB on Silesia. The
+memory is the window — one core's worth of chunk each, plus output buffers — and nothing else.
+
+**The CPU rise is not the seams, and one core does not regress.** That was worth checking rather
+than assuming, since a single-core machine would pay the CPU and get no parallelism back. With
+`RAYON_NUM_THREADS=1` on Silesia the chunked writer is 6.12 s / 6.07 CPU-s against the streaming
+writer's 6.28 s / 6.23 — fractionally *cheaper*, twice. So cutting the stream up is free, and the
+extra CPU appears only when the chunks run concurrently. Which of barrier spin or memory-bandwidth
+contention it is has not been established and is not claimed here.
+
+**Output is byte-identical at 1 thread and at 24.** Chunk boundaries come from byte offsets in the
+tar stream, not from scheduling, so the pool width cannot change the archive.
+
+## 21. A ranged 7z read decoded from the block, when it could start at a segment
+
+**Fixed and measured, 14 August 2026.**
+
+`read_range` is the mount primitive. On a block too large to cache it fell back to streaming from the
+block's first byte, so reading sixteen bytes out of a 2.3 GB solid archive decoded however much of
+that archive lay in front of them. A mount built on it would have been unusable, and the ROADMAP
+said as much.
+
+Finding 17 already cuts such a block into independently-decodable LZMA2 segments for extraction.
+The ranged path now uses the same seams: decode starts at the segment holding the range. Reading on
+past a segment boundary is ordinary — it is what the sequential decoder does — so a range crossing
+one costs only its tail.
+
+Measured against the 2.3 GB 7-Zip-written corpus archive, subject a 13,964,658-byte entry:
+
+| | |
+|---|---|
+| decode from the block start, i.e. the old cost | 24.80 s |
+| range at the entry's start | 0.535 s |
+| range at the entry's end | 0.546 s |
+
+**45× on the worst of them, and flat.** The flatness is the result: cost is now the segment holding
+the range rather than the distance into the archive. Every range matched the same slice of the entry
+decoded whole, which is the check that matters — a segment chosen one too far along raises no error,
+it serves the wrong bytes.
+
+**Nothing is held.** Only the LZMA2 dictionary window stays resident, so a segment far larger than
+memory costs its window rather than its length. That settles the memory form of the ROADMAP's open
+question about large segments; what is left is a mount-side latency decision, because nothing is
+kept between calls — 32 single-byte reads at the tail cost 0.536 s each.
+
+**A block that fits the cache is deliberately unchanged.** There the first read pays one decode and
+every later one is free, and a segment decode per read would be worse.
+
+---
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for

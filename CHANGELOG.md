@@ -9,6 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Things that ran on one thread, and one that could not run at all.
+
 Extraction, from four directions. 7z ran on one thread whatever the archive or the machine — 25 s
 against 7-Zip's 3.7 s on the benchmark corpus — and is now level with it there and 2.4× faster on an
 archive cram wrote, in less memory either way. A single large file used one core because the unit of
@@ -16,7 +18,36 @@ work was the entry and there was one; enwik9 went from 9.05 s to 2.06 s. An arch
 files was pathologically slow and is now 760× quicker than the finding that recorded it. And a
 crafted `.7z` could hang `cram t` forever.
 
+Then creation: `.tar.gz` used one core and is now 6.9× to 9.7× faster, for a fifth of a percent in
+size. And a ranged read of a large solid `.7z` — the thing a mount is built on — decoded from the
+start of the block every time, which made mounting one impractical; it now starts at the segment
+holding the range, 0.54 s against 24.80.
+
 ### Changed
+
+- **`.tar.gz` is created on every core.** gzip is one stream with no boundaries a writer has to
+  respect, so cram wrote it through a single encoder and used one thread — marginally slower than
+  stock `tar czf`. The tar stream is now cut into 1 MiB chunks, each deflated by its own compressor
+  and ended with a sync flush so it stops on a byte boundary, and the chunks are concatenated; the
+  result is one ordinary gzip member that `gzip -t`, `zcat` and `tar -xzf` read as usual. On the
+  24-thread box, to tmpfs: **Silesia 6.26 s → 0.72 s, enwik9 29.82 → 3.07, the kernel tree 37.43 →
+  5.43** — 5.9× to 9.6× faster than `tar czf` on the same corpus. Old and new decompress to a
+  byte-identical tar.
+
+  It costs **0.19–0.34% in size**, because each chunk starts with an empty dictionary, and 30–39%
+  more CPU and about 160 MB of window. On the kernel tree the archive is still 1.40% smaller than
+  gzip's own. **Only create is parallel** — a standard `.gz` cannot be extracted in parallel by
+  anyone, this included, because a decoder cannot find the block boundaries without inflating
+  everything before them.
+
+- **A ranged read of a large solid `.7z` starts at a segment instead of the block.** This is the
+  mount primitive, and on a block too large to cache it decoded from the block's first byte, so
+  reading sixteen bytes out of a 2.3 GB archive decoded however much of it lay in front of them.
+  It now begins at the LZMA2 segment holding the range, using the same seams block extraction
+  already uses. On that archive a range costs **0.54 s against 24.80 s**, and costs the same at the
+  start of an entry as at the end — the cost is the segment, not the distance into the archive.
+  Nothing is held while it decodes: only the dictionary window stays resident, so a segment far
+  larger than memory costs its window rather than its length.
 
 - **A single large file no longer extracts on one thread.** The parallel path's unit of work was the
   entry, so an archive holding one file used one core however many were free. A `.cram` entry is a
