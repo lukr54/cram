@@ -26,9 +26,14 @@
 //! tar means wrapping it in a `.cram`/`.zip`, so a create request carrying an `EncryptSpec` here
 //! returns [`ArchiveError::UnsupportedEncryption`] rather than silently producing a plaintext archive.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Instant, UNIX_EPOCH};
 
 use brotli::enc::BrotliEncoderParams;
@@ -189,21 +194,276 @@ impl ChunkCodec {
     }
 }
 
-/// Total chunk bytes allowed in flight. Bounds the pool rather than letting the core count do it:
-/// 24 workers each holding a 32 MiB xz chunk plus its output is most of a gigabyte on a machine that
-/// may not have one to spare, and `xz -T0` reaching 3.2 GB on this corpus is the behaviour being
-/// avoided rather than copied.
+/// Total chunk bytes allowed in flight, used **only when the machine's free RAM cannot be read**.
+///
+/// This was the sole bound until 2026-08-14 and it bounded the wrong quantity. It counts chunk bytes,
+/// and chunk bytes are the small part: an xz worker's encoder outweighs its 32 MiB chunk three to
+/// one, so a "512 MiB" budget was really 2.7 GB of resident memory at the 16 workers it permitted.
+/// It was also fixed, so it gave 16 on a 24-thread box with 23 GiB free — a third of the throughput
+/// for no memory saved that anyone asked for. See [`chunk_width`].
 const CHUNK_BUDGET: usize = 512 << 20;
 
-/// Cut the tar into independent chunks, compress a window of them in parallel, write them in order.
+/// Chunks allowed in flight at once — queued, compressing, or compressed and waiting their turn to
+/// be written. A permit is taken when a chunk is cut and given back by the **writer**, so the bound
+/// covers the reorder buffer as well as the pool: a slow chunk cannot let its faster successors pile
+/// up in memory without limit while they wait for it.
+struct Permits {
+    left: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Permits {
+    fn new(n: usize) -> Self {
+        Self {
+            left: Mutex::new(n),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) {
+        // A poisoned lock means a worker panicked. That is reported through the error slot; blocking
+        // the producer for ever on top of it would only turn a failure into a hang.
+        let mut left = self.left.lock().unwrap_or_else(|e| e.into_inner());
+        while *left == 0 {
+            left = self.cv.wait(left).unwrap_or_else(|e| e.into_inner());
+        }
+        *left -= 1;
+    }
+
+    fn release(&self) {
+        let mut left = self.left.lock().unwrap_or_else(|e| e.into_inner());
+        *left += 1;
+        self.cv.notify_one();
+    }
+}
+
+/// First error from any worker or from the writer. Kept beside the channels rather than returned
+/// through them so `write` can fail fast instead of only finding out at `finish`.
+type ErrSlot = Arc<Mutex<Option<io::Error>>>;
+
+fn set_err(slot: &ErrSlot, e: io::Error) {
+    let mut g = slot.lock().unwrap_or_else(|x| x.into_inner());
+    if g.is_none() {
+        *g = Some(e);
+    }
+}
+
+fn take_err(slot: &ErrSlot) -> Option<io::Error> {
+    slot.lock().unwrap_or_else(|x| x.into_inner()).take()
+}
+
+/// Workers compressing chunks, and one thread writing them out in index order.
+struct Pipeline {
+    tx: Option<SyncSender<(usize, Vec<u8>)>>,
+    workers: Vec<JoinHandle<()>>,
+    writer: Option<JoinHandle<io::Result<BufWriter<File>>>>,
+    permits: Arc<Permits>,
+    err: ErrSlot,
+}
+
+impl Pipeline {
+    fn start(file: BufWriter<File>, codec: ChunkCodec, level: Level, width: usize) -> Self {
+        let (tx, rx) = sync_channel::<(usize, Vec<u8>)>(width);
+        let (done_tx, done_rx) = sync_channel::<(usize, io::Result<Vec<u8>>)>(width);
+        let rx = Arc::new(Mutex::new(rx));
+        let permits = Arc::new(Permits::new(width));
+        let err: ErrSlot = Arc::new(Mutex::new(None));
+
+        let workers = (0..width)
+            .map(|_| {
+                let rx = Arc::clone(&rx);
+                let done_tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        // Held only across `recv`, never across the compression itself.
+                        let next = {
+                            let g = rx.lock().unwrap_or_else(|e| e.into_inner());
+                            g.recv()
+                        };
+                        let Ok((idx, data)) = next else { return };
+                        // A panicking codec would otherwise strand this chunk's permit and hang the
+                        // producer, turning a crash into a deadlock.
+                        let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            codec.compress(&data, level)
+                        }))
+                        .unwrap_or_else(|_| Err(io::Error::other("chunk compressor panicked")));
+                        if done_tx.send((idx, out)).is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(done_tx);
+
+        let writer = {
+            let permits = Arc::clone(&permits);
+            let err = Arc::clone(&err);
+            std::thread::spawn(move || writer_loop(file, done_rx, permits, err))
+        };
+
+        Self {
+            tx: Some(tx),
+            workers,
+            writer: Some(writer),
+            permits,
+            err,
+        }
+    }
+
+    /// Hand a cut chunk to the pool, blocking only when the in-flight bound is reached.
+    fn submit(&self, idx: usize, data: Vec<u8>) -> io::Result<()> {
+        if let Some(e) = take_err(&self.err) {
+            return Err(e);
+        }
+        self.permits.acquire();
+        if let Some(tx) = &self.tx {
+            // The workers only vanish after a failure, which the error slot already carries.
+            let _ = tx.send((idx, data));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<BufWriter<File>> {
+        // Closing the input ends the workers, which drops their senders, which ends the writer.
+        self.tx = None;
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+        let out = match self.writer.take().map(|w| w.join()) {
+            Some(Ok(r)) => r,
+            _ => Err(io::Error::other("chunk writer thread died")),
+        };
+        match take_err(&self.err) {
+            Some(e) => Err(e),
+            None => out,
+        }
+    }
+}
+
+/// Receive compressed chunks in whatever order they finish and write them in index order.
+fn writer_loop(
+    mut file: BufWriter<File>,
+    rx: Receiver<(usize, io::Result<Vec<u8>>)>,
+    permits: Arc<Permits>,
+    err: ErrSlot,
+) -> io::Result<BufWriter<File>> {
+    let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    let mut next = 0usize;
+    let mut failed = false;
+
+    for (idx, res) in rx {
+        if failed {
+            permits.release();
+            continue;
+        }
+        match res {
+            Err(e) => {
+                set_err(&err, e);
+                failed = true;
+                // Everything already queued behind the failure is never going to be written, so give
+                // its permits back now rather than leaving the producer blocked until the channel
+                // happens to close.
+                for _ in 0..pending.len() + 1 {
+                    permits.release();
+                }
+                pending.clear();
+            }
+            Ok(data) => {
+                pending.insert(idx, data);
+                while let Some(data) = pending.remove(&next) {
+                    if let Err(e) = file.write_all(&data) {
+                        set_err(&err, e);
+                        failed = true;
+                    }
+                    next += 1;
+                    permits.release();
+                }
+            }
+        }
+    }
+    Ok(file)
+}
+
+/// Peak RSS per worker, MiB — **measured on the kernel tree**, not modelled, by running the same
+/// create at several widths and taking the slope.
+///
+/// The chunk itself is the small half of it. An xz worker at preset 6 holds a 32 MiB chunk and about
+/// 100 MiB of encoder: LZMA's BT4 match finder runs to roughly 11.5× the dictionary, and the
+/// dictionary is 8 MiB. That is why bounding *chunk bytes* bounded almost nothing.
+///
+/// | codec | 8 workers | 16 | 24 | slope |
+/// |---|---|---|---|---|
+/// | xz | 1646 MB | 2695 | 3912 | ~136 MiB |
+/// | bzip2 | 322 MB | 535 | 810 | ~34 MiB |
+///
+/// `hw::codec_mem_per_thread_mib` is not reusable here: its 2400 MiB for LZMA is the **level 9**
+/// figure, and applying it at preset 6 would cap this machine at five workers — slower than the
+/// fixed bound it replaced.
+fn chunk_mem_per_worker_mib(codec: ChunkCodec) -> u64 {
+    match codec {
+        ChunkCodec::Xz => 136,
+        ChunkCodec::Bzip2 => 34,
+        // Not measured: the pure-Rust fallback encoder is far simpler than either of the above, so
+        // this is the 8 MiB chunk plus room, and it is deliberately on the generous side.
+        #[cfg(not(feature = "zstd-c"))]
+        ChunkCodec::Zstd => 24,
+    }
+}
+
+/// How many chunks may be in flight — queued, compressing, or awaiting their turn to be written.
+///
+/// This is the width of the pool, and it is what actually decides create speed: on the kernel tree
+/// xz runs at 7.1 effective cores at width 8, 12.8 at 16 and 18.9 at 24, and saturates there (width
+/// 32 buys 0.3 s for another gigabyte). The old fixed `CHUNK_BUDGET / chunk` gave 16 whatever the
+/// machine had, which is both too many for a small VM and a third of the throughput on a 24-thread
+/// box with 23 GiB spare.
+///
+/// So take it from the RAM that is actually free, the same 60% fraction `hw::derive_plan` uses.
+/// `CRAM_WORKERS` forces it, as it does elsewhere in the engine — including past this bound, since an
+/// explicit override is the caller saying they know what their machine has.
+fn chunk_width(codec: ChunkCodec) -> usize {
+    if let Some(n) = std::env::var("CRAM_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let avail = crate::hw::HwProfile::detect().ram_avail;
+    if avail == 0 {
+        // No usable reading: fall back to the old fixed budget rather than guessing from core count
+        // alone, which is how a 64-thread machine would try to hold 8 GiB of xz encoders.
+        return threads.min(CHUNK_BUDGET / codec.chunk()).max(1);
+    }
+    let per = chunk_mem_per_worker_mib(codec) << 20;
+    let cap = (((avail as f64) * 0.6) as u64 / per.max(1)) as usize;
+    threads.min(cap).max(1)
+}
+
+/// Cut the tar into independent chunks, compress them on every core, write them in order.
+///
+/// This used to be a window: fill N chunks, `par_iter` the lot, write them, repeat. That is a barrier
+/// twice over, and sampling CPU width every 100 ms during an xz create showed both halves of the cost
+/// as a sawtooth whose period matched the window size — roughly 9 s at 18–20 cores, then a 3–4 s
+/// decay while the window's slowest chunk finished **alone**, then ~1.5 s under two cores writing the
+/// output and accumulating the next 512 MiB with the pool completely idle.
+///
+/// A pipeline removes both. Workers take the next chunk the moment they finish one, so a straggler
+/// delays only the writer's cursor and not the pool, and cutting continues while compression runs.
 struct ChunkedSink {
     buf: Vec<u8>,
-    window: Vec<Vec<u8>>,
     chunk: usize,
-    window_max: usize,
-    file: BufWriter<File>,
+    /// Index of the next chunk to be cut. The writer reassembles on this.
+    next: usize,
+    width: usize,
     codec: ChunkCodec,
     level: Level,
+    /// Holds the file until the first chunk is cut, then the pipeline owns it. An archive smaller
+    /// than one chunk — which is most of them — never starts a thread.
+    file: Option<BufWriter<File>>,
+    pipe: Option<Pipeline>,
 }
 
 impl ChunkedSink {
@@ -211,62 +471,73 @@ impl ChunkedSink {
         let chunk = codec.chunk();
         Self {
             buf: Vec::new(),
-            window: Vec::new(),
             chunk,
-            window_max: rayon::current_num_threads()
-                .min(CHUNK_BUDGET / chunk)
-                .max(1),
-            file,
+            next: 0,
+            width: chunk_width(codec),
             codec,
             level,
+            file: Some(file),
+            pipe: None,
         }
     }
 
-    /// Compress a window in parallel and write it **in order** — the concatenation is the stream.
-    fn flush_window(&mut self) -> io::Result<()> {
-        let (codec, level) = (self.codec, self.level);
-        let done: Vec<io::Result<Vec<u8>>> = match self.window.len() {
-            0 => return Ok(()),
-            // One chunk is every archive below the chunk size, so it skips rayon rather than
-            // starting the global pool to run a single closure on the calling thread anyway.
-            1 => vec![codec.compress(&self.window[0], level)],
-            _ => self
-                .window
-                .par_iter()
-                .map(|c| codec.compress(c, level))
-                .collect(),
-        };
-        for item in done {
-            self.file.write_all(&item?)?;
+    fn cut(&mut self, data: Vec<u8>) -> io::Result<()> {
+        if self.pipe.is_none() {
+            let file = self
+                .file
+                .take()
+                .ok_or_else(|| io::Error::other("chunked sink already finished"))?;
+            self.pipe = Some(Pipeline::start(file, self.codec, self.level, self.width));
         }
-        self.window.clear();
-        Ok(())
+        let idx = self.next;
+        self.next += 1;
+        self.pipe.as_ref().expect("just started").submit(idx, data)
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.buf.extend_from_slice(buf);
         while self.buf.len() >= self.chunk {
             let tail = self.buf.split_off(self.chunk);
-            self.window.push(std::mem::replace(&mut self.buf, tail));
-            if self.window.len() >= self.window_max {
-                self.flush_window()?;
-            }
+            let full = std::mem::replace(&mut self.buf, tail);
+            self.cut(full)?;
         }
         Ok(buf.len())
     }
 
     /// Deliberately does not cut a chunk: a flush mid-archive would fragment the stream for nothing.
+    /// With the write now behind a thread there is also nothing here to push — the file is only
+    /// reachable from the writer until `finish` gives it back.
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        match &mut self.file {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
     }
 
     fn finish(mut self) -> io::Result<BufWriter<File>> {
-        if !self.buf.is_empty() {
-            let tail = std::mem::take(&mut self.buf);
-            self.window.push(tail);
+        let tail = std::mem::take(&mut self.buf);
+        match self.pipe.take() {
+            // The archive outgrew one chunk, so the pool is already running.
+            Some(pipe) => {
+                if !tail.is_empty() {
+                    let idx = self.next;
+                    self.next += 1;
+                    pipe.submit(idx, tail)?;
+                }
+                pipe.finish()
+            }
+            // It never did: compress the whole thing here rather than start threads to do it.
+            None => {
+                let mut file = self
+                    .file
+                    .take()
+                    .ok_or_else(|| io::Error::other("chunked sink already finished"))?;
+                if !tail.is_empty() {
+                    file.write_all(&self.codec.compress(&tail, self.level)?)?;
+                }
+                Ok(file)
+            }
         }
-        self.flush_window()?;
-        Ok(self.file)
     }
 }
 
@@ -884,9 +1155,11 @@ mod tests {
                 chunk_codec,
                 Level::Fastest,
             );
-            // Narrow the cut so a test-sized input still crosses several windows.
+            // Narrow the cut so a test-sized input still crosses several chunks, and keep the pool
+            // narrower than the chunk count so the writer really has to reorder rather than
+            // receiving everything in the order it was submitted.
             sink.chunk = TEST_CHUNK;
-            sink.window_max = 2;
+            sink.width = 2;
             // `write` here is the sink's own, not the `Write` trait: it always takes the whole
             // slice, since it only appends to the pending buffer.
             for piece in data.chunks(4096) {
@@ -1023,6 +1296,78 @@ mod tests {
             found = true;
         }
         assert!(found, "the entry must be present");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pipeline writes chunks in index order, not completion order, so the archive must not
+    /// depend on how many workers happened to be running. Chunks finish at genuinely different times
+    /// — an xz chunk of zeros is far quicker than one of noise — so with a wide pool the writer is
+    /// reordering for real, and a bug there would show up as a width-dependent file.
+    ///
+    /// This is the property the old barrier got for free by never letting two windows overlap, and
+    /// the one thing a pipeline can plausibly break.
+    #[test]
+    fn chunk_order_does_not_depend_on_pool_width() {
+        const TEST_CHUNK: usize = 96 * 1024;
+
+        let dir = std::env::temp_dir().join(format!("cram-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Alternating cheap and expensive chunks: runs of zeros compress almost instantly, xorshift
+        // noise does not, so completion order will not match submission order.
+        let mut data = Vec::with_capacity(TEST_CHUNK * 9);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for c in 0..9 {
+            if c % 2 == 0 {
+                data.resize(data.len() + TEST_CHUNK, 0u8);
+            } else {
+                for _ in 0..TEST_CHUNK {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    data.push(seed as u8);
+                }
+            }
+        }
+
+        let run = |width: usize| -> Vec<u8> {
+            let path = dir.join(format!("w{width}.xz"));
+            let mut sink = ChunkedSink::new(
+                BufWriter::new(File::create(&path).unwrap()),
+                ChunkCodec::Xz,
+                Level::Fastest,
+            );
+            sink.chunk = TEST_CHUNK;
+            sink.width = width;
+            for piece in data.chunks(4096) {
+                sink.write(piece).unwrap();
+            }
+            sink.finish().unwrap().into_inner().unwrap();
+            std::fs::read(&path).unwrap()
+        };
+
+        let one = run(1);
+        for width in [2usize, 3, 8] {
+            assert_eq!(
+                run(width),
+                one,
+                "pool width {width} produced a different archive: the writer is emitting chunks in \
+                 completion order rather than index order"
+            );
+        }
+
+        // And it must still decode back to exactly what went in.
+        use crate::codec::decode_stream;
+        let src: Box<dyn io::Read + Send> = Box::new(io::Cursor::new(one));
+        let mut out = Vec::new();
+        decode_stream(Codec::Xz, src)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), data.len(), "decoded length differs");
+        assert!(out == data, "decoded bytes differ");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
