@@ -238,7 +238,11 @@ pub fn create(
         total_bytes = total_bytes.saturating_add(item.entry.size);
         total_files += 1;
     }
-    let _ = (total_bytes, total_files);
+    let _ = total_files;
+    // The walk has already counted every byte for the progress bar, so handing the figure to the
+    // writer is free. brotli is the one backend that changes its output because of it; see
+    // `CreateOptions::total_bytes`.
+    opts.total_bytes = Some(total_bytes);
 
     // Adaptive probe (Level::Auto only): classify each file store-vs-compress. A per-entry hint is
     // honored by the random-access backends (ZIP, 7z); the aggregate summary lets a whole-stream

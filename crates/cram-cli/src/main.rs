@@ -1500,6 +1500,8 @@ fn create(args: &[String]) -> Result<()> {
         // say what it means rather than relying on it.
         solid: !has(args, "--no-solid"),
         threads: None,
+        // The engine's own walk counts the bytes and fills this in; the CLI has not walked yet.
+        total_bytes: None,
         recompress_images: recompress_choice(args),
     };
 
@@ -1625,6 +1627,8 @@ fn convert_cmd(args: &[String]) -> Result<()> {
         // say what it means rather than relying on it.
         solid: !has(args, "--no-solid"),
         threads: None,
+        // The engine's own walk counts the bytes and fills this in; the CLI has not walked yet.
+        total_bytes: None,
         recompress_images: recompress_choice(args),
     };
 

@@ -31,6 +31,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::time::{Instant, UNIX_EPOCH};
 
+use brotli::enc::BrotliEncoderParams;
 use brotli::CompressorWriter;
 use bzip2::write::BzEncoder;
 use flate2::{Compress, Compression, Crc, FlushCompress};
@@ -521,6 +522,47 @@ fn br_quality(level: Level) -> u32 {
     }
 }
 
+/// Output staging buffer for the brotli encoder. Purely an I/O granularity knob — the encoder holds
+/// its own input ring buffer sized by `lgwin` — so it costs nothing but syscalls, and 4 KiB against a
+/// 4 MiB window was a lot of syscalls.
+const BR_BUF: usize = 256 << 10;
+
+/// The window brotli's own CLI uses by default, and what we have always asked for.
+const BR_LGWIN: i32 = 22;
+
+/// Encoder settings for a `.tar.br`, **including the size hint**, which is the whole point of this
+/// function existing rather than a bare `CompressorWriter::new`.
+///
+/// brotli picks its hash table from `size_hint` alone: `ChooseHasher` reaches H6 — 15 bucket bits, a
+/// 5-byte hash — only when the hint is over 4 MiB and `lgwin` is at least 19, and otherwise a
+/// quality-6 stream falls to H5, whose bucket count drops to **14 bits** when the hint is under
+/// 1 MiB. `CompressorWriter::new` leaves the hint at 0.
+///
+/// A caller that never sets it does not get 0, which is the part that makes this easy to miss.
+/// `update_size_hint` fills it in from `available_in` **on the first write**, so whoever hands the
+/// encoder its whole input in one `write_all` is silently given a correct hint and a correct hasher.
+/// tar does the opposite: it streams through `io::copy` in ~8 KiB writes, so the inferred hint was
+/// ~8 KiB and every `.tar.br` cram ever wrote used a 16,384-bucket table however large the archive
+/// was. The table size is fixed, so the more data pushed through it the more matches it misses —
+/// which is why the loss against `brotli -q 6` *grew* with the corpus, 16.1% on 203 MiB against
+/// 23.55% on 2.1 GB. Setting it explicitly took silesia from 69,147,136 to 58,497,939 and the kernel
+/// tree from 608,920,976 to 487,982,888, both now slightly under what `brotli -q 6` writes.
+///
+/// The hint only has to be the right order of magnitude — it selects a hasher, it does not bound
+/// anything — so an absent count is not a reason to fall back to 0. An archive whose size we could
+/// not count beforehand is far more likely to be large than to be under 4 MiB, and guessing high
+/// costs a few MiB of hash table on a small one.
+fn br_params(level: Level, total_bytes: Option<u64>) -> BrotliEncoderParams {
+    BrotliEncoderParams {
+        quality: br_quality(level) as i32,
+        lgwin: BR_LGWIN,
+        size_hint: total_bytes
+            .unwrap_or(u64::from(u32::MAX))
+            .min(usize::MAX as u64) as usize,
+        ..Default::default()
+    }
+}
+
 /// The tar archive name for an entry: normalized-safe relative path, forward slashes.
 fn tar_name(entry: &Entry) -> String {
     entry.path.safe().to_string_lossy().replace('\\', "/")
@@ -560,11 +602,10 @@ impl TarArchiveWriter {
             Codec::Bzip2 => TarSink::Chunked(ChunkedSink::new(file, ChunkCodec::Bzip2, opts.level)),
             // lz4 stays a single streaming frame; see [`ChunkCodec`] for why it is not chunked.
             Codec::Lz4 => TarSink::Lz4(Box::new(FrameEncoder::new(file))),
-            Codec::Brotli => TarSink::Br(Box::new(CompressorWriter::new(
+            Codec::Brotli => TarSink::Br(Box::new(CompressorWriter::with_params(
                 file,
-                4096,
-                br_quality(opts.level),
-                22,
+                BR_BUF,
+                &br_params(opts.level, opts.total_bytes),
             ))),
             Codec::Zstd => TarSink::Zstd(ZstdSink::new(file, opts.level)?),
         };
@@ -983,5 +1024,108 @@ mod tests {
         }
         assert!(found, "the entry must be present");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// brotli's `ChooseHasher` reaches H6 only when `size_hint > 4 MiB` **and** `lgwin >= 19`, and
+    /// H5 drops to 14 bucket bits when the hint is under 1 MiB. Those two thresholds are the entire
+    /// reason [`br_params`] exists, so assert against the numbers rather than against "it is set".
+    ///
+    /// An **unknown** total must clear the bar, since a stream we could not count is far likelier to
+    /// be large than tiny. A *known* small total is a different thing and is left alone: H5 is the
+    /// right hasher for a small archive, and the bug was never about those.
+    #[test]
+    fn br_params_clear_brotlis_h6_threshold() {
+        const H6_MIN_HINT: usize = 1 << 22;
+        const H6_MIN_LGWIN: i32 = 19;
+
+        for level in [
+            Level::Fastest,
+            Level::Auto,
+            Level::Balanced,
+            Level::Best,
+            Level::Cold,
+            Level::Explicit(6),
+        ] {
+            for total in [None, Some(203 << 20), Some(2_100_000_000)] {
+                let p = br_params(level, total);
+                assert!(
+                    p.lgwin >= H6_MIN_LGWIN,
+                    "lgwin {} would force H5 whatever the hint",
+                    p.lgwin
+                );
+                assert!(
+                    p.size_hint > H6_MIN_HINT,
+                    "size_hint {} at level {level:?}, total {total:?} falls back to H5's small table",
+                    p.size_hint
+                );
+            }
+            // A counted-and-genuinely-small archive keeps its honest figure.
+            assert_eq!(br_params(level, Some(1234)).size_hint, 1234);
+        }
+    }
+
+    /// The hint is worth ratio, not just a different code path. Two encoders, same quality and
+    /// window, differing only in `size_hint` — the hinted one must not lose, and on data large
+    /// enough to saturate a 16K-bucket table it should win outright.
+    ///
+    /// **The input must be fed in small writes, the way tar feeds it.** A single `write_all` of the
+    /// whole buffer makes this test pass no matter what the code does: brotli's `update_size_hint`
+    /// infers a hint from `available_in` when none was set, so one big write hands the unhinted
+    /// encoder the right answer for free and both sides come out byte-identical. That is precisely
+    /// how the bug hid for as long as it did, and a probe written that way reported "the hint makes
+    /// no difference" on the very corpus where it was worth 15%.
+    #[test]
+    fn the_size_hint_is_worth_ratio() {
+        // ~6 MiB drawn from a large vocabulary. A handful of repeated words is the wrong shape for
+        // this test and was tried first: with only twelve tokens the two encoders produced byte-
+        // identical output, because 16K buckets hold twelve strings comfortably. The table size can
+        // only matter when the number of distinct contexts exceeds it, so the vocabulary here is
+        // deliberately bigger than H5's 16,384 buckets.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let vocab: Vec<String> = (0..40_000)
+            .map(|_| {
+                let n = 4 + (rng() % 9) as usize;
+                (0..n)
+                    .map(|_| (b'a' + (rng() % 26) as u8) as char)
+                    .collect()
+            })
+            .collect();
+        let mut corpus = Vec::with_capacity(6 << 20);
+        while corpus.len() < (6 << 20) {
+            let w = &vocab[(rng() % vocab.len() as u64) as usize];
+            corpus.extend_from_slice(w.as_bytes());
+            corpus.push(if rng() & 0xF == 0 { b'\n' } else { b' ' });
+        }
+
+        let encode = |params: &BrotliEncoderParams| {
+            let mut w = CompressorWriter::with_params(Vec::new(), BR_BUF, params);
+            // 8 KiB at a time: `io::copy`'s buffer, which is how the tar builder reaches the sink.
+            for c in corpus.chunks(8 << 10) {
+                w.write_all(c).unwrap();
+            }
+            w.into_inner().len()
+        };
+
+        let hinted = encode(&br_params(Level::Balanced, Some(corpus.len() as u64)));
+        let unhinted = encode(&BrotliEncoderParams {
+            size_hint: 0,
+            ..br_params(Level::Balanced, None)
+        });
+
+        assert!(
+            hinted <= unhinted,
+            "hinting the size must never cost ratio: {hinted} hinted vs {unhinted} unhinted"
+        );
+        assert!(
+            hinted < unhinted,
+            "on {} MiB the hint should buy a real win, got {hinted} against {unhinted}",
+            corpus.len() >> 20
+        );
     }
 }

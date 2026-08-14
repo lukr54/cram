@@ -82,6 +82,16 @@ pub struct CreateOptions {
     pub solid: bool,
     /// Worker threads; `None` = derive from [`hw::derive_plan`](crate::hw).
     pub threads: Option<usize>,
+    /// Total uncompressed bytes about to be written, when the caller has already counted them.
+    ///
+    /// A hint, not a contract: it is allowed to be absent, stale or wrong, and no backend may depend
+    /// on it for correctness. It exists because **brotli picks its hash table from this number and
+    /// nothing else**. `CompressorWriter::new` leaves `size_hint` at 0, and brotli's `ChooseHasher`
+    /// only reaches H6 (15 bucket bits, 5-byte hash) when the hint exceeds 4 MiB — below that a
+    /// quality-6 stream gets H5 with **14** bucket bits. A 16K-bucket table saturates on a large
+    /// input, so a `.tar.br` came out 16.1% larger than `brotli -q 6` on 203 MiB and 23.55% larger on
+    /// 2.1 GB. The `brotli` CLI sets the hint from the file size; we had no way to.
+    pub total_bytes: Option<u64>,
     /// Losslessly recompress JPEGs when writing `.cram` (**on by default**).
     ///
     /// A JPEG's entropy coding is redone with a stronger coder and the original file is reconstructed
@@ -100,6 +110,7 @@ impl Default for CreateOptions {
             codec: None,
             solid: true,
             threads: None,
+            total_bytes: None,
             recompress_images: true,
         }
     }
