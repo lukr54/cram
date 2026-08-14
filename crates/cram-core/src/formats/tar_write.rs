@@ -42,7 +42,6 @@ use bzip2::write::BzEncoder;
 use flate2::{Compress, Compression, Crc, FlushCompress};
 use lz4_flex::frame::FrameEncoder;
 use lzma_rust2::{XzOptions, XzWriter};
-use rayon::prelude::*;
 #[cfg(not(feature = "zstd-c"))]
 use ruzstd::encoding::{compress_to_vec, CompressionLevel};
 use tar::{Builder, EntryType, Header};
@@ -97,32 +96,20 @@ enum TarSink {
     Plain(BufWriter<File>),
     /// gzip, written the way pigz writes it. The tar stream is cut into [`GZ_CHUNK`] pieces, each
     /// deflated by its own compressor and ended with a sync flush so it stops on a byte boundary;
-    /// the pieces are then concatenated. A window of `window_max` of them is deflated in parallel
-    /// and written **in order**, because the concatenation *is* the DEFLATE stream.
+    /// the pieces are then concatenated, because the concatenation *is* the DEFLATE stream.
     ///
     /// Nothing about the result is unusual to a reader: one gzip header, one DEFLATE stream, one
     /// trailer, so `gzip -d`, `zcat` and `tar -xzf` see an ordinary `.gz`. What makes the pieces
     /// separable is that each compressor starts empty, so no back-reference can point outside its
     /// own piece. That also costs a little ratio (each seam throws away up to 32 KiB of dictionary),
     /// which is why the chunk is 1 MiB rather than pigz's 128 KiB.
-    Gz {
-        /// Tar bytes not yet a whole chunk.
-        buf: Vec<u8>,
-        /// Whole chunks waiting for the window to fill.
-        window: Vec<Vec<u8>>,
-        /// How the work is cut: bytes per chunk, and chunks per parallel window. Fields rather than
-        /// constants because the tests need a cut small enough to reach the multi-window path
-        /// without deflating megabytes — dependencies are unoptimised in a debug test build, and
-        /// miniz_oxide there runs about a hundred times slower than in the shipped binary.
-        chunk: usize,
-        window_max: usize,
-        file: BufWriter<File>,
-        level: u32,
-        /// CRC32 and length of everything already compressed: the gzip trailer, accumulated a chunk
-        /// at a time via [`Crc::combine`] so the checksum is computed in parallel with the deflate
-        /// rather than as a second serial pass over the same bytes.
-        crc: Crc,
-    },
+    ///
+    /// The header is written before the sink is built and the trailer in `finish`; everything
+    /// between is [`ChunkedSink`], the same pool the other chunked codecs use. It had its own copy
+    /// of that machinery — a window, a parallel map, a serial write — until the pipeline replaced
+    /// the window, at which point keeping a second implementation of it only meant gzip would not
+    /// get the fix.
+    Gz(ChunkedSink),
     /// xz and bzip2 — the codecs whose *whole streams* concatenate and whose reader follows them.
     /// See [`ChunkedSink`] and [`ChunkCodec`].
     Chunked(ChunkedSink),
@@ -150,6 +137,12 @@ enum TarSink {
 /// then lz4 stays a single streaming frame, which is what it always was.
 #[derive(Clone, Copy)]
 enum ChunkCodec {
+    /// Not a whole stream like the others: a run of raw DEFLATE blocks ended with a sync flush, to
+    /// sit inside the single gzip member whose header and trailer [`TarSink`] writes around it. It
+    /// belongs here anyway — the pieces are independent and concatenate in order, which is the only
+    /// property the pipeline needs — and putting it here is what gets gzip the same pool as the rest
+    /// instead of a second copy of the same machinery.
+    Gzip,
     Xz,
     Bzip2,
     /// Only reachable without `zstd-c`; the C encoder streams and needs no help from here.
@@ -161,13 +154,14 @@ impl ChunkCodec {
     /// Bytes per chunk. Chosen per codec against its window: too small and every seam costs ratio,
     /// too large and the pool runs dry on a small archive. xz's dictionary is 8 MiB at preset 6, so
     /// 32 MiB keeps the loss to a quarter of the seam it would otherwise be; bzip2's block is
-    /// 900 KB and lz4's window 64 KB, so neither needs the room.
+    /// 900 KB and lz4's window 64 KB, so neither needs the room. gzip's is [`GZ_CHUNK`].
     ///
     /// Whatever the value, it also bounds memory. That matters historically: the first `.tar.zst`
     /// writer held the ENTIRE tar in RAM until `finish`, and archiving a 100 GiB tree OOM'd the
     /// process.
     fn chunk(self) -> usize {
         match self {
+            ChunkCodec::Gzip => GZ_CHUNK,
             ChunkCodec::Xz => 32 << 20,
             ChunkCodec::Bzip2 => 4 << 20,
             #[cfg(not(feature = "zstd-c"))]
@@ -175,21 +169,27 @@ impl ChunkCodec {
         }
     }
 
-    /// One chunk as a complete, standalone stream.
-    fn compress(self, data: &[u8], level: Level) -> io::Result<Vec<u8>> {
+    /// One chunk as a complete, standalone stream, plus whatever the container's trailer needs from
+    /// it. Only gzip needs anything: a CRC32 and a length, computed on the worker so the trailer
+    /// costs no second pass over the same bytes.
+    fn compress(self, data: &[u8], level: Level) -> io::Result<(Vec<u8>, Option<Crc>)> {
         match self {
+            ChunkCodec::Gzip => {
+                let (bytes, crc) = deflate_chunk(data, preset(level))?;
+                Ok((bytes, Some(crc)))
+            }
             ChunkCodec::Xz => {
                 let mut w = XzWriter::new(Vec::new(), XzOptions::with_preset(preset(level)))?;
                 w.write_all(data)?;
-                w.finish()
+                Ok((w.finish()?, None))
             }
             ChunkCodec::Bzip2 => {
                 let mut w = BzEncoder::new(Vec::new(), bzip2::Compression::new(bz_level(level)));
                 w.write_all(data)?;
-                w.finish()
+                Ok((w.finish()?, None))
             }
             #[cfg(not(feature = "zstd-c"))]
-            ChunkCodec::Zstd => Ok(compress_to_vec(data, CompressionLevel::Fastest)),
+            ChunkCodec::Zstd => Ok((compress_to_vec(data, CompressionLevel::Fastest), None)),
         }
     }
 }
@@ -252,11 +252,18 @@ fn take_err(slot: &ErrSlot) -> Option<io::Error> {
     slot.lock().unwrap_or_else(|x| x.into_inner()).take()
 }
 
+/// A compressed chunk on its way to the writer: the bytes, and the CRC gzip's trailer needs.
+type ChunkOut = (Vec<u8>, Option<Crc>);
+
+/// What the writer thread hands back once every chunk is on disk: the file, and the CRC gzip's
+/// trailer needs. Empty for every other codec.
+type WrittenOut = io::Result<(BufWriter<File>, Crc)>;
+
 /// Workers compressing chunks, and one thread writing them out in index order.
 struct Pipeline {
     tx: Option<SyncSender<(usize, Vec<u8>)>>,
     workers: Vec<JoinHandle<()>>,
-    writer: Option<JoinHandle<io::Result<BufWriter<File>>>>,
+    writer: Option<JoinHandle<WrittenOut>>,
     permits: Arc<Permits>,
     err: ErrSlot,
 }
@@ -264,7 +271,7 @@ struct Pipeline {
 impl Pipeline {
     fn start(file: BufWriter<File>, codec: ChunkCodec, level: Level, width: usize) -> Self {
         let (tx, rx) = sync_channel::<(usize, Vec<u8>)>(width);
-        let (done_tx, done_rx) = sync_channel::<(usize, io::Result<Vec<u8>>)>(width);
+        let (done_tx, done_rx) = sync_channel::<(usize, io::Result<ChunkOut>)>(width);
         let rx = Arc::new(Mutex::new(rx));
         let permits = Arc::new(Permits::new(width));
         let err: ErrSlot = Arc::new(Mutex::new(None));
@@ -324,7 +331,7 @@ impl Pipeline {
         Ok(())
     }
 
-    fn finish(mut self) -> io::Result<BufWriter<File>> {
+    fn finish(mut self) -> io::Result<(BufWriter<File>, Crc)> {
         // Closing the input ends the workers, which drops their senders, which ends the writer.
         self.tx = None;
         for w in self.workers.drain(..) {
@@ -341,16 +348,22 @@ impl Pipeline {
     }
 }
 
-/// Receive compressed chunks in whatever order they finish and write them in index order.
+/// Receive compressed chunks in whatever order they finish and write them in index order, folding
+/// each one's CRC into the running trailer as it goes.
+///
+/// The CRC has to be combined here rather than by the workers, and in this order: `Crc::combine` is
+/// associative but not commutative, so folding chunks as they *finished* would give a checksum that
+/// depended on scheduling and disagreed with the bytes actually written.
 fn writer_loop(
     mut file: BufWriter<File>,
-    rx: Receiver<(usize, io::Result<Vec<u8>>)>,
+    rx: Receiver<(usize, io::Result<ChunkOut>)>,
     permits: Arc<Permits>,
     err: ErrSlot,
-) -> io::Result<BufWriter<File>> {
-    let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+) -> WrittenOut {
+    let mut pending: BTreeMap<usize, ChunkOut> = BTreeMap::new();
     let mut next = 0usize;
     let mut failed = false;
+    let mut crc = Crc::new();
 
     for (idx, res) in rx {
         if failed {
@@ -369,12 +382,15 @@ fn writer_loop(
                 }
                 pending.clear();
             }
-            Ok(data) => {
-                pending.insert(idx, data);
-                while let Some(data) = pending.remove(&next) {
+            Ok(out) => {
+                pending.insert(idx, out);
+                while let Some((data, chunk_crc)) = pending.remove(&next) {
                     if let Err(e) = file.write_all(&data) {
                         set_err(&err, e);
                         failed = true;
+                    }
+                    if let Some(c) = chunk_crc {
+                        crc.combine(&c);
                     }
                     next += 1;
                     permits.release();
@@ -382,7 +398,7 @@ fn writer_loop(
             }
         }
     }
-    Ok(file)
+    Ok((file, crc))
 }
 
 /// Peak RSS per worker, MiB — **measured on the kernel tree**, not modelled, by running the same
@@ -397,11 +413,15 @@ fn writer_loop(
 /// | xz | 1646 MB | 2695 | 3912 | ~136 MiB |
 /// | bzip2 | 322 MB | 535 | 810 | ~34 MiB |
 ///
+/// gzip is not in that table because it never binds: a 1 MiB chunk and a deflate state under a
+/// megabyte means the core count decides long before the RAM does, on anything that can run cram.
+///
 /// `hw::codec_mem_per_thread_mib` is not reusable here: its 2400 MiB for LZMA is the **level 9**
 /// figure, and applying it at preset 6 would cap this machine at five workers — slower than the
 /// fixed bound it replaced.
 fn chunk_mem_per_worker_mib(codec: ChunkCodec) -> u64 {
     match codec {
+        ChunkCodec::Gzip => 2,
         ChunkCodec::Xz => 136,
         ChunkCodec::Bzip2 => 34,
         // Not measured: the pure-Rust fallback encoder is far simpler than either of the above, so
@@ -514,7 +534,9 @@ impl ChunkedSink {
         }
     }
 
-    fn finish(mut self) -> io::Result<BufWriter<File>> {
+    /// Returns the file and the accumulated CRC. Only gzip's trailer wants the latter; for every
+    /// other codec it is an empty `Crc` the caller drops.
+    fn finish(mut self) -> io::Result<(BufWriter<File>, Crc)> {
         let tail = std::mem::take(&mut self.buf);
         match self.pipe.take() {
             // The archive outgrew one chunk, so the pool is already running.
@@ -532,10 +554,15 @@ impl ChunkedSink {
                     .file
                     .take()
                     .ok_or_else(|| io::Error::other("chunked sink already finished"))?;
+                let mut crc = Crc::new();
                 if !tail.is_empty() {
-                    file.write_all(&self.codec.compress(&tail, self.level)?)?;
+                    let (bytes, chunk_crc) = self.codec.compress(&tail, self.level)?;
+                    file.write_all(&bytes)?;
+                    if let Some(c) = chunk_crc {
+                        crc.combine(&c);
+                    }
                 }
-                Ok(file)
+                Ok((file, crc))
             }
         }
     }
@@ -583,7 +610,8 @@ impl ZstdSink {
         self.0.flush()
     }
     fn finish(self) -> io::Result<BufWriter<File>> {
-        self.0.finish()
+        // The CRC rides along for gzip's benefit; zstd frames carry their own checksums.
+        Ok(self.0.finish()?.0)
     }
 }
 
@@ -663,50 +691,13 @@ fn deflate_chunk(data: &[u8], level: u32) -> io::Result<(Vec<u8>, Crc)> {
     Ok((out, crc))
 }
 
-/// Deflate a full window of chunks in parallel and write them out **in order**, folding each one's
-/// CRC into the running trailer as it goes.
-fn flush_gz_window(
-    window: &mut Vec<Vec<u8>>,
-    file: &mut BufWriter<File>,
-    level: u32,
-    crc: &mut Crc,
-) -> io::Result<()> {
-    // One chunk is every archive under GZ_CHUNK, so it skips rayon rather than spinning up the
-    // global pool to run a single closure on the calling thread anyway.
-    let done: Vec<io::Result<(Vec<u8>, Crc)>> = match window.len() {
-        0 => return Ok(()),
-        1 => vec![deflate_chunk(&window[0], level)],
-        _ => window
-            .par_iter()
-            .map(|chunk| deflate_chunk(chunk, level))
-            .collect(),
-    };
-    for item in done {
-        let (bytes, chunk_crc) = item?;
-        file.write_all(&bytes)?;
-        crc.combine(&chunk_crc);
-    }
-    window.clear();
-    Ok(())
-}
-
 impl TarSink {
     /// Flush/finalize the codec trailer and hand back the file (for the final-size measurement).
     fn finish(self) -> io::Result<File> {
         let buf = match self {
             TarSink::Plain(w) => w,
-            TarSink::Gz {
-                mut buf,
-                mut window,
-                mut file,
-                level,
-                mut crc,
-                ..
-            } => {
-                if !buf.is_empty() {
-                    window.push(std::mem::take(&mut buf));
-                }
-                flush_gz_window(&mut window, &mut file, level, &mut crc)?;
+            TarSink::Gz(c) => {
+                let (mut file, crc) = c.finish()?;
                 // A final empty fixed-Huffman block: BFINAL=1, BTYPE=01, then the 7-bit
                 // end-of-block code, LSB-first and zero-padded to a byte. Every chunk above ended
                 // on a byte boundary, so these two bytes land cleanly and close the stream.
@@ -716,7 +707,7 @@ impl TarSink {
                 file.write_all(&crc.amount().to_le_bytes())?;
                 file
             }
-            TarSink::Chunked(c) => c.finish()?,
+            TarSink::Chunked(c) => c.finish()?.0,
             TarSink::Lz4(e) => e.finish().map_err(io::Error::other)?,
             TarSink::Br(e) => e.into_inner(),
             TarSink::Zstd(z) => z.finish()?,
@@ -729,25 +720,7 @@ impl Write for TarSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             TarSink::Plain(w) => w.write(buf),
-            TarSink::Gz {
-                buf: pending,
-                window,
-                chunk,
-                window_max,
-                file,
-                level,
-                crc,
-            } => {
-                pending.extend_from_slice(buf);
-                while pending.len() >= *chunk {
-                    let tail = pending.split_off(*chunk);
-                    window.push(std::mem::replace(pending, tail));
-                    if window.len() >= *window_max {
-                        flush_gz_window(window, file, *level, crc)?;
-                    }
-                }
-                Ok(buf.len())
-            }
+            TarSink::Gz(c) => c.write(buf),
             TarSink::Chunked(c) => c.write(buf),
             TarSink::Lz4(w) => w.write(buf),
             TarSink::Br(w) => w.write(buf),
@@ -759,7 +732,7 @@ impl Write for TarSink {
             TarSink::Plain(w) => w.flush(),
             // Deliberately does NOT cut a chunk: a flush mid-archive would fragment the stream for
             // no gain. Only the file behind it is flushed.
-            TarSink::Gz { file, .. } => file.flush(),
+            TarSink::Gz(c) => c.flush(),
             TarSink::Chunked(c) => c.flush(),
             TarSink::Lz4(w) => w.flush(),
             TarSink::Br(w) => w.flush(),
@@ -859,15 +832,7 @@ impl TarArchiveWriter {
             Codec::None => TarSink::Plain(file),
             Codec::Gzip => {
                 file.write_all(&gzip_header(lvl))?;
-                TarSink::Gz {
-                    buf: Vec::with_capacity(GZ_CHUNK + 64 * 1024),
-                    window: Vec::new(),
-                    chunk: GZ_CHUNK,
-                    window_max: rayon::current_num_threads().max(1),
-                    file,
-                    level: lvl,
-                    crc: Crc::new(),
-                }
+                TarSink::Gz(ChunkedSink::new(file, ChunkCodec::Gzip, opts.level))
             }
             Codec::Xz => TarSink::Chunked(ChunkedSink::new(file, ChunkCodec::Xz, opts.level)),
             Codec::Bzip2 => TarSink::Chunked(ChunkedSink::new(file, ChunkCodec::Bzip2, opts.level)),
@@ -1088,15 +1053,13 @@ mod tests {
 
         let mut file = BufWriter::new(File::create(&path).unwrap());
         file.write_all(&gzip_header(1)).unwrap();
-        let mut sink = TarSink::Gz {
-            buf: Vec::new(),
-            window: Vec::new(),
-            chunk: TEST_CHUNK,
-            window_max: 2,
-            file,
-            level: 1,
-            crc: Crc::new(),
-        };
+        let mut inner = ChunkedSink::new(file, ChunkCodec::Gzip, Level::Fastest);
+        // A cut small enough to reach the multi-chunk path without deflating megabytes:
+        // dependencies are unoptimised in a debug test build, and miniz_oxide there runs about a
+        // hundred times slower than in the shipped binary.
+        inner.chunk = TEST_CHUNK;
+        inner.width = 2;
+        let mut sink = TarSink::Gz(inner);
 
         // Three whole chunks and a tail: one full window flushes mid-stream, then a chunk plus the
         // tail flush at finish. The chunk index is mixed into the bytes so that emitting the pieces
@@ -1165,7 +1128,7 @@ mod tests {
             for piece in data.chunks(4096) {
                 assert_eq!(sink.write(piece).unwrap(), piece.len());
             }
-            sink.finish().unwrap().into_inner().unwrap();
+            sink.finish().unwrap().0.into_inner().unwrap();
 
             let src: Box<dyn io::Read + Send> = Box::new(File::open(&path).unwrap());
             let mut out = Vec::new();
@@ -1299,6 +1262,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// gzip's trailer is a CRC32 of the whole stream, assembled from per-chunk CRCs by
+    /// [`Crc::combine`]. That is associative but **not** commutative, so folding chunks in the order
+    /// they happened to finish gives a checksum that depends on thread scheduling and disagrees with
+    /// the bytes on disk. `gunzip` verifies the trailer, so this catches it — and it must be checked
+    /// at more than one width, because at width 1 completion order and index order are the same and
+    /// a broken fold would pass.
+    #[test]
+    fn gz_trailer_does_not_depend_on_pool_width() {
+        const TEST_CHUNK: usize = 64 * 1024;
+
+        let dir = std::env::temp_dir().join(format!("cram-gzcrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Cheap and expensive chunks alternating, so completion order will not be index order.
+        let mut data = Vec::with_capacity(TEST_CHUNK * 7);
+        let mut seed = 0xDEAD_BEEF_CAFE_F00Du64;
+        for c in 0..7 {
+            if c % 2 == 0 {
+                data.resize(data.len() + TEST_CHUNK, 0u8);
+            } else {
+                for _ in 0..TEST_CHUNK {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    data.push(seed as u8);
+                }
+            }
+        }
+
+        let mut first: Option<Vec<u8>> = None;
+        for width in [1usize, 2, 4, 8] {
+            let path = dir.join(format!("g{width}.gz"));
+            let mut file = BufWriter::new(File::create(&path).unwrap());
+            file.write_all(&gzip_header(1)).unwrap();
+            let mut inner = ChunkedSink::new(file, ChunkCodec::Gzip, Level::Fastest);
+            inner.chunk = TEST_CHUNK;
+            inner.width = width;
+            let mut sink = TarSink::Gz(inner);
+            for piece in data.chunks(8192) {
+                sink.write_all(piece).unwrap();
+            }
+            sink.finish().unwrap();
+
+            // gunzip checks the CRC and the length, so this fails loudly on a mis-ordered fold.
+            assert_eq!(
+                gunzip(&path),
+                data,
+                "width {width}: the gzip trailer disagrees with the stream"
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            match &first {
+                None => first = Some(bytes),
+                Some(f) => assert_eq!(&bytes, f, "width {width} produced a different .gz"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The pipeline writes chunks in index order, not completion order, so the archive must not
     /// depend on how many workers happened to be running. Chunks finish at genuinely different times
     /// — an xz chunk of zeros is far quicker than one of noise — so with a wide pool the writer is
@@ -1343,7 +1365,7 @@ mod tests {
             for piece in data.chunks(4096) {
                 sink.write(piece).unwrap();
             }
-            sink.finish().unwrap().into_inner().unwrap();
+            sink.finish().unwrap().0.into_inner().unwrap();
             std::fs::read(&path).unwrap()
         };
 
