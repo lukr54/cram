@@ -117,12 +117,156 @@ enum TarSink {
         /// rather than as a second serial pass over the same bytes.
         crc: Crc,
     },
-    Xz(Box<XzWriter<BufWriter<File>>>),
-    Bz2(Box<BzEncoder<BufWriter<File>>>),
+    /// xz and bzip2 — the codecs whose *whole streams* concatenate and whose reader follows them.
+    /// See [`ChunkedSink`] and [`ChunkCodec`].
+    Chunked(ChunkedSink),
     Lz4(Box<FrameEncoder<BufWriter<File>>>),
+    /// brotli is the one codec that cannot be chunked: it has no multi-stream concept, so two
+    /// brotli streams laid end to end are not a brotli stream. It stays a plain streaming writer.
     Br(Box<CompressorWriter<BufWriter<File>>>),
     /// zstd, whose implementation depends on the `zstd-c` feature. See [`ZstdSink`].
     Zstd(ZstdSink),
+}
+
+/// A codec whose complete streams concatenate into a valid stream of the same kind. `cat a.xz b.xz`
+/// is a `.xz` that `xz -d` reads whole, and the same holds for bzip2 and lz4 — our own reader
+/// already relies on it (`XzReader` with `allow_multiple_streams`, `MultiBzDecoder`, lz4's
+/// `FrameDecoder`), and so do pbzip2, lbzip2 and `xz -T0`.
+///
+/// That makes parallel create nearly free: compress N chunks independently and write them in order.
+/// It is the same trade R4 took for gzip — each chunk starts with an empty dictionary, so the
+/// archive grows slightly — and it is what `xz -T0` itself does, which is why its output is *larger*
+/// than a single-threaded `xz` too.
+/// **lz4 is deliberately not here.** Its frames concatenate in the format, but our reader does not
+/// follow them: `lz4_flex`'s `FrameDecoder` stops at the first frame, so a chunked `.tar.lz4` would
+/// be written correctly and read back truncated. Measured while adding this — 49,152 of 197,385
+/// bytes, exactly one chunk. That is a reader bug in its own right and is fixed separately; until
+/// then lz4 stays a single streaming frame, which is what it always was.
+#[derive(Clone, Copy)]
+enum ChunkCodec {
+    Xz,
+    Bzip2,
+    /// Only reachable without `zstd-c`; the C encoder streams and needs no help from here.
+    #[cfg(not(feature = "zstd-c"))]
+    Zstd,
+}
+
+impl ChunkCodec {
+    /// Bytes per chunk. Chosen per codec against its window: too small and every seam costs ratio,
+    /// too large and the pool runs dry on a small archive. xz's dictionary is 8 MiB at preset 6, so
+    /// 32 MiB keeps the loss to a quarter of the seam it would otherwise be; bzip2's block is
+    /// 900 KB and lz4's window 64 KB, so neither needs the room.
+    ///
+    /// Whatever the value, it also bounds memory. That matters historically: the first `.tar.zst`
+    /// writer held the ENTIRE tar in RAM until `finish`, and archiving a 100 GiB tree OOM'd the
+    /// process.
+    fn chunk(self) -> usize {
+        match self {
+            ChunkCodec::Xz => 32 << 20,
+            ChunkCodec::Bzip2 => 4 << 20,
+            #[cfg(not(feature = "zstd-c"))]
+            ChunkCodec::Zstd => 8 << 20,
+        }
+    }
+
+    /// One chunk as a complete, standalone stream.
+    fn compress(self, data: &[u8], level: Level) -> io::Result<Vec<u8>> {
+        match self {
+            ChunkCodec::Xz => {
+                let mut w = XzWriter::new(Vec::new(), XzOptions::with_preset(preset(level)))?;
+                w.write_all(data)?;
+                w.finish()
+            }
+            ChunkCodec::Bzip2 => {
+                let mut w = BzEncoder::new(Vec::new(), bzip2::Compression::new(bz_level(level)));
+                w.write_all(data)?;
+                w.finish()
+            }
+            #[cfg(not(feature = "zstd-c"))]
+            ChunkCodec::Zstd => Ok(compress_to_vec(data, CompressionLevel::Fastest)),
+        }
+    }
+}
+
+/// Total chunk bytes allowed in flight. Bounds the pool rather than letting the core count do it:
+/// 24 workers each holding a 32 MiB xz chunk plus its output is most of a gigabyte on a machine that
+/// may not have one to spare, and `xz -T0` reaching 3.2 GB on this corpus is the behaviour being
+/// avoided rather than copied.
+const CHUNK_BUDGET: usize = 512 << 20;
+
+/// Cut the tar into independent chunks, compress a window of them in parallel, write them in order.
+struct ChunkedSink {
+    buf: Vec<u8>,
+    window: Vec<Vec<u8>>,
+    chunk: usize,
+    window_max: usize,
+    file: BufWriter<File>,
+    codec: ChunkCodec,
+    level: Level,
+}
+
+impl ChunkedSink {
+    fn new(file: BufWriter<File>, codec: ChunkCodec, level: Level) -> Self {
+        let chunk = codec.chunk();
+        Self {
+            buf: Vec::new(),
+            window: Vec::new(),
+            chunk,
+            window_max: rayon::current_num_threads()
+                .min(CHUNK_BUDGET / chunk)
+                .max(1),
+            file,
+            codec,
+            level,
+        }
+    }
+
+    /// Compress a window in parallel and write it **in order** — the concatenation is the stream.
+    fn flush_window(&mut self) -> io::Result<()> {
+        let (codec, level) = (self.codec, self.level);
+        let done: Vec<io::Result<Vec<u8>>> = match self.window.len() {
+            0 => return Ok(()),
+            // One chunk is every archive below the chunk size, so it skips rayon rather than
+            // starting the global pool to run a single closure on the calling thread anyway.
+            1 => vec![codec.compress(&self.window[0], level)],
+            _ => self
+                .window
+                .par_iter()
+                .map(|c| codec.compress(c, level))
+                .collect(),
+        };
+        for item in done {
+            self.file.write_all(&item?)?;
+        }
+        self.window.clear();
+        Ok(())
+    }
+
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        while self.buf.len() >= self.chunk {
+            let tail = self.buf.split_off(self.chunk);
+            self.window.push(std::mem::replace(&mut self.buf, tail));
+            if self.window.len() >= self.window_max {
+                self.flush_window()?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    /// Deliberately does not cut a chunk: a flush mid-archive would fragment the stream for nothing.
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+
+    fn finish(mut self) -> io::Result<BufWriter<File>> {
+        if !self.buf.is_empty() {
+            let tail = std::mem::take(&mut self.buf);
+            self.window.push(tail);
+        }
+        self.flush_window()?;
+        Ok(self.file)
+    }
 }
 
 /// The zstd sink. One type, two implementations, so the feature split lives here rather than in
@@ -149,46 +293,25 @@ impl ZstdSink {
     }
 }
 
-/// Pure-Rust fallback: `ruzstd` has no `Write` sink, so the tar is cut into bounded chunks and each
-/// is emitted as its own zstd *frame*. Concatenated frames are what `cat` and `pzstd` produce, so
-/// every reader handles them; the cost is ratio, and ruzstd's single `Fastest` level costs more.
+/// Pure-Rust fallback: `ruzstd` has no `Write` sink, so the tar is cut into bounded independent
+/// *frames*, which is exactly the shape [`ChunkedSink`] exists for — so it gets parallel create too,
+/// rather than compressing those frames one after another as it used to.
 #[cfg(not(feature = "zstd-c"))]
-struct ZstdSink {
-    buf: Vec<u8>,
-    file: BufWriter<File>,
-    level: CompressionLevel,
-}
+struct ZstdSink(ChunkedSink);
 
 #[cfg(not(feature = "zstd-c"))]
 impl ZstdSink {
-    fn new(file: BufWriter<File>, _level: Level) -> io::Result<Self> {
-        Ok(Self {
-            buf: Vec::new(),
-            file,
-            level: CompressionLevel::Fastest,
-        })
+    fn new(file: BufWriter<File>, level: Level) -> io::Result<Self> {
+        Ok(Self(ChunkedSink::new(file, ChunkCodec::Zstd, level)))
     }
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        // A full chunk becomes one independent zstd frame, so memory stays ≤ ~1 chunk.
-        if self.buf.len() >= ZSTD_FRAME_CHUNK {
-            let frame = compress_to_vec(&self.buf[..], self.level);
-            self.file.write_all(&frame)?;
-            self.buf.clear();
-        }
-        Ok(buf.len())
+        self.0.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.0.flush()
     }
-    fn finish(mut self) -> io::Result<BufWriter<File>> {
-        // The final partial chunk becomes the last frame (built in memory then written; ruzstd's
-        // streaming `compress` swallows target write errors).
-        if !self.buf.is_empty() {
-            let frame = compress_to_vec(&self.buf[..], self.level);
-            self.file.write_all(&frame)?;
-        }
-        Ok(self.file)
+    fn finish(self) -> io::Result<BufWriter<File>> {
+        self.0.finish()
     }
 }
 
@@ -204,12 +327,6 @@ fn zstd_level(level: Level) -> i32 {
         Level::Explicit(n) => (n as i32 * 2).clamp(1, 19),
     }
 }
-
-/// Bytes of tar accumulated before being compressed out as one independent zstd frame. Bounds the
-/// pure-Rust `.tar.zst` writer's memory (the old design held the ENTIRE tar in RAM until `finish`,
-/// and archiving a 100 GiB tree OOM'd the process). Unused with `zstd-c`, which streams.
-#[cfg(not(feature = "zstd-c"))]
-const ZSTD_FRAME_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Bytes of tar per independently-deflated gzip chunk (see [`TarSink::Gz`]). pigz uses 128 KiB;
 /// 1 MiB throws away eight times less dictionary at the seams for the same parallelism, and is still
@@ -327,8 +444,7 @@ impl TarSink {
                 file.write_all(&crc.amount().to_le_bytes())?;
                 file
             }
-            TarSink::Xz(e) => e.finish()?,
-            TarSink::Bz2(e) => e.finish()?,
+            TarSink::Chunked(c) => c.finish()?,
             TarSink::Lz4(e) => e.finish().map_err(io::Error::other)?,
             TarSink::Br(e) => e.into_inner(),
             TarSink::Zstd(z) => z.finish()?,
@@ -360,8 +476,7 @@ impl Write for TarSink {
                 }
                 Ok(buf.len())
             }
-            TarSink::Xz(w) => w.write(buf),
-            TarSink::Bz2(w) => w.write(buf),
+            TarSink::Chunked(c) => c.write(buf),
             TarSink::Lz4(w) => w.write(buf),
             TarSink::Br(w) => w.write(buf),
             TarSink::Zstd(z) => z.write(buf),
@@ -373,8 +488,7 @@ impl Write for TarSink {
             // Deliberately does NOT cut a chunk: a flush mid-archive would fragment the stream for
             // no gain. Only the file behind it is flushed.
             TarSink::Gz { file, .. } => file.flush(),
-            TarSink::Xz(w) => w.flush(),
-            TarSink::Bz2(w) => w.flush(),
+            TarSink::Chunked(c) => c.flush(),
             TarSink::Lz4(w) => w.flush(),
             TarSink::Br(w) => w.flush(),
             TarSink::Zstd(z) => z.flush(),
@@ -442,11 +556,9 @@ impl TarArchiveWriter {
                     crc: Crc::new(),
                 }
             }
-            Codec::Xz => TarSink::Xz(Box::new(XzWriter::new(file, XzOptions::with_preset(lvl))?)),
-            Codec::Bzip2 => TarSink::Bz2(Box::new(BzEncoder::new(
-                file,
-                bzip2::Compression::new(bz_level(opts.level)),
-            ))),
+            Codec::Xz => TarSink::Chunked(ChunkedSink::new(file, ChunkCodec::Xz, opts.level)),
+            Codec::Bzip2 => TarSink::Chunked(ChunkedSink::new(file, ChunkCodec::Bzip2, opts.level)),
+            // lz4 stays a single streaming frame; see [`ChunkCodec`] for why it is not chunked.
             Codec::Lz4 => TarSink::Lz4(Box::new(FrameEncoder::new(file))),
             Codec::Brotli => TarSink::Br(Box::new(CompressorWriter::new(
                 file,
@@ -692,6 +804,77 @@ mod tests {
             data,
             "concatenated deflate chunks must inflate to the original, in order"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The premise of [`ChunkedSink`] is that complete streams of these codecs concatenate into one
+    /// valid stream. That is a claim about each format, and it is asserted here per codec rather
+    /// than assumed: several chunks in, one continuous byte sequence out.
+    ///
+    /// The chunk is set small by hand — the shipped ones are 4 to 32 MiB, which no test should
+    /// deflate in a debug build where dependencies are unoptimised.
+    #[test]
+    fn chunked_codecs_concatenate_into_one_stream() {
+        use crate::codec::decode_stream;
+
+        const TEST_CHUNK: usize = 48 * 1024;
+
+        let dir = std::env::temp_dir().join(format!("cram-chunkcat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Four whole chunks and a tail, with the chunk index mixed into the bytes so that emitting
+        // the pieces out of order changes the output rather than round-tripping regardless.
+        let data: Vec<u8> = (0..TEST_CHUNK * 4 + 777)
+            .map(|i| ((i / 61) as u8).wrapping_add(((i / TEST_CHUNK) as u8).wrapping_mul(53)))
+            .collect();
+
+        // lz4 is absent on purpose: its frames concatenate but our reader stops at the first one,
+        // so it is not chunked. See [`ChunkCodec`].
+        let cases: [(ChunkCodec, Codec, &str); 2] = [
+            (ChunkCodec::Xz, Codec::Xz, "xz"),
+            (ChunkCodec::Bzip2, Codec::Bzip2, "bz2"),
+        ];
+
+        for (chunk_codec, stream_codec, name) in cases {
+            let path = dir.join(format!("c.{name}"));
+            let mut sink = ChunkedSink::new(
+                BufWriter::new(File::create(&path).unwrap()),
+                chunk_codec,
+                Level::Fastest,
+            );
+            // Narrow the cut so a test-sized input still crosses several windows.
+            sink.chunk = TEST_CHUNK;
+            sink.window_max = 2;
+            // `write` here is the sink's own, not the `Write` trait: it always takes the whole
+            // slice, since it only appends to the pending buffer.
+            for piece in data.chunks(4096) {
+                assert_eq!(sink.write(piece).unwrap(), piece.len());
+            }
+            sink.finish().unwrap().into_inner().unwrap();
+
+            let src: Box<dyn io::Read + Send> = Box::new(File::open(&path).unwrap());
+            let mut out = Vec::new();
+            decode_stream(stream_codec, src)
+                .unwrap()
+                .read_to_end(&mut out)
+                .unwrap();
+            // Length first: a truncation at the first stream boundary is the failure this is
+            // looking for, and comparing megabytes of bytes to say so prints a megabyte.
+            assert_eq!(
+                out.len(),
+                data.len(),
+                "{name}: decoded {} of {} bytes — a concatenated stream was truncated, \
+                 probably at the first boundary ({} = one chunk)",
+                out.len(),
+                data.len(),
+                TEST_CHUNK
+            );
+            assert!(
+                out == data,
+                "{name}: concatenated streams decoded to the right length but the wrong bytes"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
