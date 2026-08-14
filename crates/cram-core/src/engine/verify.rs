@@ -331,7 +331,12 @@ fn verify_random_access(
         }
     }
     // Heaviest first, so the pool drains evenly instead of ending on one straggler.
-    let groups = order_groups(groups, entries, |i| ra.locality_key(i));
+    let groups = order_groups(
+        groups,
+        entries,
+        |i| ra.locality_key(i),
+        ra.coalesce_locality(),
+    );
 
     let acc = Mutex::new(Acc::default());
     let pool = ThreadPoolBuilder::new()

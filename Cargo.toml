@@ -23,3 +23,14 @@ publish = true
 [profile.release]
 opt-level = 3
 codegen-units = 1
+
+# EXPERIMENT, NOT SHIPPABLE. sevenz-rust2 compresses a pack straight into the output stream, so packs
+# cannot overlap and every thread must come from LZMA2 chunking within a single pack -- capped at
+# pack size / dictionary, and costing ratio because a match cannot cross a chunk boundary. A local
+# fork adds `prepare_pack` / `push_prepared_pack`, splitting that so a pack can be compressed on a
+# worker and appended later, in order.
+#
+# A published crate cannot depend on a patch, so this has to land upstream (or be published as a fork
+# under its own name) before it can ship.
+[patch.crates-io]
+sevenz-rust2 = { path = "../sevenz-rust2-cram" }
