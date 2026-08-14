@@ -445,6 +445,32 @@ struct SegmentCandidate {
     widest: u64,
 }
 
+/// Which segment to start decoding at to serve `[off, off + len)` of an entry lying at `entry_off`
+/// in its block, with the range's absolute offset in the decoded block and the clamped length.
+///
+/// Split out from [`SevenZRandomAccess::locate_range`] so it can be tested without an archive: this
+/// is the arithmetic that has to be exactly right. One segment too far along and the decode starts
+/// after the bytes that were asked for, which is not an error anyone would notice — it silently
+/// serves the wrong content.
+///
+/// `None` when there is no segment at or before the range, including an empty list; the caller then
+/// falls back to decoding the block.
+fn segment_for_range(
+    segs: &[lzma2seg::Segment],
+    entry_off: u64,
+    size: u64,
+    off: u64,
+    len: u64,
+) -> Option<(usize, u64, u64)> {
+    let start = off.min(size);
+    let target = entry_off + start;
+    // The walk yields segments in stream order, so the one to start at is a plain partition point.
+    let si = segs
+        .partition_point(|s| s.unpacked_start <= target)
+        .checked_sub(1)?;
+    Some((si, target, len.min(size - start)))
+}
+
 /// One unit of parallel work: a segment of a segmented block.
 #[derive(Clone, Copy)]
 struct SegUnit {
@@ -818,7 +844,11 @@ impl SevenZRandomAccess {
     /// same bytes either way; the difference is peak memory.
     ///
     /// `skip` bytes are discarded first and at most `limit` are copied, so this serves a range as
-    /// well as a whole entry. Decoding still starts at the block, because 7z has no way in.
+    /// well as a whole entry. Decoding starts at the block, because for an arbitrary 7z stream there
+    /// is no way further in — where the block *is* segmented, [`read_segment_range`] has one and
+    /// `read_range` prefers it.
+    ///
+    /// [`read_segment_range`]: Self::read_segment_range
     fn stream_entry(
         &self,
         block: usize,
@@ -861,6 +891,83 @@ impl SevenZRandomAccess {
             )));
         }
         Ok(written)
+    }
+
+    /// Where a range of an entry sits in its block's segmented stream: the group, the segment to
+    /// start decoding at, the range's absolute offset within the decoded block, and how many bytes
+    /// to serve after clamping to the entry.
+    ///
+    /// `None` means the entry's block was not segmented, which is the caller's signal to fall back
+    /// to [`stream_entry`](Self::stream_entry).
+    fn locate_range(
+        &self,
+        index: usize,
+        off: u64,
+        len: u64,
+    ) -> Option<(&BlockSegments, &lzma2seg::Segment, u64, u64)> {
+        let (block, file_idx, _) = self.placement(index)?;
+        let g = self.segmented.iter().find(|g| g.block == block)?;
+        let &(_, entry_off, size) = g.layout.iter().find(|&&(fi, _, _)| fi == file_idx)?;
+        let (si, target, want) = segment_for_range(&g.segs, entry_off, size, off, len)?;
+        Some((g, g.segs.get(si)?, target, want))
+    }
+
+    /// Serve a range by starting the decode at the LZMA2 segment holding it, rather than at the
+    /// start of the block.
+    ///
+    /// This is the piece a lazy mount of a large solid `.7z` was missing. Through
+    /// [`stream_entry`](Self::stream_entry) every ranged read costs a decode from the block's first
+    /// byte, so on the benchmark corpus reading one byte of one file costs 2.8 GB; from the nearest
+    /// segment it costs the distance from that segment's start, bounded by the segment — 128 MiB at
+    /// 7-Zip's stock settings, and usually much less, since a range is rarely at a segment's end.
+    ///
+    /// **Nothing is held.** The reader streams forward and only the LZMA2 dictionary window stays
+    /// resident, so a segment far too large to buffer still costs its window rather than its length.
+    ///
+    /// Reading the pack stream directly, without a coder chain, is sound because only single-coder
+    /// LZMA2 blocks are ever segmented — [`segment_blocks`](Self::segment_blocks) refuses everything
+    /// else, so there is no filter or cipher between these bytes and the entry's.
+    fn read_segment_range(
+        &self,
+        g: &BlockSegments,
+        seg: &lzma2seg::Segment,
+        target: u64,
+        want: u64,
+        sink: &mut dyn io::Write,
+    ) -> Result<u64> {
+        if want == 0 {
+            return Ok(0);
+        }
+        // How far past this segment the range reaches, which the dictionary must also cover.
+        let spill = (target + want).saturating_sub(seg.unpacked_start + seg.unpacked);
+
+        let mut file = std::fs::File::open(&self.path)
+            .map_err(|e| ArchiveError::Backend(format!("{}: {e}", self.path.display())))?;
+        file.seek(std::io::SeekFrom::Start(seg.comp_off))
+            .map_err(|e| ArchiveError::Backend(format!("{}: {e}", self.path.display())))?;
+        // The rest of the block, not just this segment: a range running past the boundary is served
+        // by reading on into the next one, exactly as `stream_segment` does for a straddling entry.
+        let src = file.take(g.pack_end.saturating_sub(seg.comp_off));
+        let mut r =
+            lzma_rust2::Lzma2Reader::new(src, lzma2seg::dict_window(seg, spill, g.dict), None);
+
+        // Reads after a decode error can hang; see [`FuseOnError`].
+        let mut r = FuseOnError::new(&mut r);
+
+        // Decoding forward to the range is the cost this method exists to bound: from the segment's
+        // start rather than the block's.
+        let skip = target - seg.unpacked_start;
+        if skip > 0 {
+            io::copy(&mut (&mut r).take(skip), &mut io::sink())?;
+        }
+        let n = io::copy(&mut (&mut r).take(want), sink)?;
+        if let Some(why) = r.broken() {
+            return Err(ArchiveError::Corrupt(format!(
+                "7z: decode failed inside a segment of block {}: {why}",
+                g.block
+            )));
+        }
+        Ok(n)
     }
 
     /// Resolve a flattened unit index back to its group and segment.
@@ -998,12 +1105,28 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
 
     /// The mount primitive, called repeatedly with small ranges of one entry, so here the cache is
     /// worth having even for a block of one — streaming would decode the block again per range.
-    /// Only a block too large to hold is streamed, and the gate guarantees it holds one entry.
+    ///
+    /// A block that fits the budget is cached, and every later range of it is then free, so
+    /// segmentation is deliberately not used there: it would trade one decode amortised over every
+    /// read for a segment decode on each of them.
+    ///
+    /// A block too large to cache has no such amortisation, and that is where starting at a segment
+    /// changes the shape of the problem rather than the constant —
+    /// [`read_segment_range`](Self::read_segment_range) bounds a read by the segment holding it
+    /// instead of by the whole block, which is what makes mounting a large solid `.7z` feasible at
+    /// all. Where the block was not segmented there is still no way in, and it streams as before.
     fn read_range(&self, index: usize, off: u64, len: u64) -> Result<Vec<u8>> {
         match self.placement(index) {
             Some((block, file_idx, plan)) if !plan.fits => {
                 let mut buf = Vec::new();
-                self.stream_entry(block, file_idx, off, len, &mut buf)?;
+                match self.locate_range(index, off, len) {
+                    Some((g, seg, target, want)) => {
+                        self.read_segment_range(g, seg, target, want, &mut buf)?;
+                    }
+                    None => {
+                        self.stream_entry(block, file_idx, off, len, &mut buf)?;
+                    }
+                }
                 Ok(buf)
             }
             _ => self.with_entry_bytes(index, |bytes| {
@@ -1297,6 +1420,72 @@ mod mtime_guard_tests {
         // The presence flag is honored.
         e.has_last_modified_date = false;
         assert!(seven_z_mtime(&e).is_none());
+    }
+}
+
+/// Picking the segment a ranged read starts from. Wrong by one segment and the decode begins past
+/// the bytes that were asked for, which raises no error at all — it serves the wrong content — so
+/// the boundaries are asserted rather than assumed.
+#[cfg(test)]
+mod segment_range_tests {
+    use super::*;
+
+    /// Three 100-byte segments, the shape a walk produces.
+    fn segs() -> Vec<lzma2seg::Segment> {
+        (0..3)
+            .map(|i| lzma2seg::Segment {
+                comp_off: 1000 + i * 50,
+                unpacked_start: i * 100,
+                unpacked: 100,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn starts_at_the_segment_holding_the_range() {
+        let s = segs();
+        // An entry at block offset 150, 120 bytes long, so it spans segments 1 and 2.
+        let at = |off, len| segment_for_range(&s, 150, 120, off, len).unwrap();
+
+        // Its first byte is in segment 1, and the range is the entry's own offset plus the entry's.
+        assert_eq!(at(0, 10), (1, 150, 10));
+        // Still segment 1 right up to the boundary at 200...
+        assert_eq!(at(49, 1), (1, 199, 1));
+        // ...and segment 2 from there on, which is the whole point: reading the tail of this entry
+        // must not decode from 150 when it can start at 200.
+        assert_eq!(at(50, 1), (2, 200, 1));
+        assert_eq!(at(119, 1), (2, 269, 1));
+    }
+
+    #[test]
+    fn clamps_the_length_to_the_entry() {
+        let s = segs();
+        // A read running off the end is served short, not into the next entry's bytes.
+        assert_eq!(
+            segment_for_range(&s, 150, 120, 100, 500),
+            Some((2, 250, 20))
+        );
+        // `u64::MAX` is how a caller asks for "the rest".
+        assert_eq!(
+            segment_for_range(&s, 150, 120, 0, u64::MAX),
+            Some((1, 150, 120))
+        );
+        // Starting at or past the end yields nothing to serve, and must not underflow.
+        assert_eq!(segment_for_range(&s, 150, 120, 120, 10), Some((2, 270, 0)));
+        assert_eq!(segment_for_range(&s, 150, 120, 999, 10), Some((2, 270, 0)));
+    }
+
+    #[test]
+    fn an_entry_at_the_block_start_uses_the_first_segment() {
+        let s = segs();
+        assert_eq!(segment_for_range(&s, 0, 50, 0, 50), Some((0, 0, 50)));
+    }
+
+    #[test]
+    fn no_segments_means_no_way_in() {
+        // An unsegmented block falls back to decoding from the block, so the caller must get `None`
+        // rather than a segment index it would then index into.
+        assert_eq!(segment_for_range(&[], 0, 50, 0, 50), None);
     }
 }
 
