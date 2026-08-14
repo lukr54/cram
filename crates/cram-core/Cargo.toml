@@ -81,7 +81,10 @@ getrandom = "0.2"    # OS CSPRNG for salts + nonces (BCryptGenRandom on Windows)
 
 # --- opt-in C backends (feature-gated; default OFF, pure-Rust build stays the norm) ---
 # zstd (C) as a fast `.cram` pack codec, ruzstd only encodes at Fastest; the C lib gives full levels.
-zstd = { version = "0.13", optional = true }
+# `zstdmt` builds libzstd with its own worker threads, which is what lets a `.tar.zst` use more than
+# one core. Unlike chunking it costs no ratio: the workers share one context and one window, so the
+# output is the same stream a single-threaded run would produce, only sooner.
+zstd = { version = "0.13", optional = true, features = ["zstdmt"] }
 # Image decoding for `cram dedup --similar` (perceptual hashing). Pure Rust and mingw-clean; the codec
 # list is explicit so the default build doesn't drag in the whole format zoo. HEIC/HEIF and camera RAW
 # are absent because decoding them needs a C library, those files are still covered by exact-duplicate

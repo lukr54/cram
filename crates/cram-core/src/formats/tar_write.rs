@@ -576,10 +576,12 @@ struct ZstdSink(Box<zstd::stream::write::Encoder<'static, BufWriter<File>>>);
 #[cfg(feature = "zstd-c")]
 impl ZstdSink {
     fn new(file: BufWriter<File>, level: Level) -> io::Result<Self> {
-        Ok(Self(Box::new(zstd::stream::write::Encoder::new(
-            file,
-            zstd_level(level),
-        )?)))
+        let mut enc = zstd::stream::write::Encoder::new(file, zstd_level(level))?;
+        // libzstd's own workers, which is the whole reason this arm exists. They share one context
+        // and one window, so unlike [`ChunkedSink`] the output is the stream a single-threaded run
+        // would have produced — no seams, no ratio given away — and `zstd -T0` works the same way.
+        enc.multithread(zstd_workers() as u32)?;
+        Ok(Self(Box::new(enc)))
     }
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
@@ -613,6 +615,21 @@ impl ZstdSink {
         // The CRC rides along for gzip's benefit; zstd frames carry their own checksums.
         Ok(self.0.finish()?.0)
     }
+}
+
+/// Workers for libzstd's own thread pool.
+///
+/// Not routed through [`chunk_width`]: that bounds a pool of *independent* encoders each holding its
+/// own chunk and dictionary, and libzstd's workers share one context, so the memory shape is a
+/// different thing entirely — `zstd -T0` peaks at 275 MB on the kernel tree where our 16 xz encoders
+/// take 2.7 GB. `CRAM_WORKERS` still forces it, as it does everywhere else.
+#[cfg(feature = "zstd-c")]
+fn zstd_workers() -> usize {
+    std::env::var("CRAM_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| rayon::current_num_threads().max(1))
 }
 
 /// Map the abstract [`Level`] onto zstd's 1–22 scale. `--auto` is zstd's own default, so a
