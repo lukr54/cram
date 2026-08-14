@@ -139,6 +139,16 @@ crafted `.7z` could hang `cram t` forever.
   units, measured decode rate and write wall — so "why did this run on two threads" is one line
   rather than an afternoon of bisecting.
 
+- **`--no-solid`** (7z) writes one independently-decodable pack per entry instead of packing members
+  together: a much larger archive, and cheaper to read one member out of. Solid remains the default
+  and `--solid` states it explicitly. It was previously reachable only through an environment
+  variable, while `CreateOptions::solid` said `false` and the writer ignored it and made every
+  archive solid regardless.
+
+- **mimalloc**, behind a feature and on in the shipped binary. Worth **1.22× on extraction** for 13%
+  more memory. Not worth what the note claimed: on zip create it is 1.08× for 2.7× the memory, and
+  on `.cram` create it is nothing at all.
+
 - `CRAM_WORKERS=n` forces the pool width, so a benchmark can ask what the plan is worth. There was
   no way to: `taskset` narrows which CPUs the process may use without narrowing the core count the
   planner sees, so it still asks for every worker and simply gets them descheduled, which measures
