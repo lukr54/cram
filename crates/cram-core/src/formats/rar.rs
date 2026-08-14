@@ -218,6 +218,16 @@ pub struct RarReader {
     secret: Option<Secret>,
     /// How many headers have been consumed. This is the cursor position to restore to.
     pos: usize,
+    /// [`inmem_ceiling`], resolved **once**.
+    ///
+    /// It used to be called per entry, and it calls `HwProfile::detect`, which re-reads the CPU
+    /// topology and `/proc/meminfo` and probes the work drive through `/sys/block` (an `IOCTL` on
+    /// Windows). That is ~1.25 ms of syscalls to answer a question whose answer cannot change
+    /// usefully between two entries of the same archive, and it was the whole of the RAR
+    /// many-small-files pathology: `cram t` on the 94,778-file kernel tree took 119.05 s against
+    /// unrar's 4.28, at 796 files/s and 1.0 cores, while being level with unrar on Silesia's twelve
+    /// files. 94,778 × 1.25 ms is the missing two minutes.
+    inmem_ceiling: u64,
 }
 
 impl RarReader {
@@ -330,6 +340,7 @@ impl RarReader {
             path: path.to_path_buf(),
             secret,
             pos: 0,
+            inmem_ceiling: inmem_ceiling(),
         })
     }
 }
@@ -407,7 +418,7 @@ impl ArchiveReader for RarReader {
             // that size extracted every other file, reported a single failure, and left an install
             // that did not run; 7-Zip, WinRAR and Bandizip all extract it, because none of them
             // routes the bytes through memory.
-            if size > inmem_ceiling() {
+            if size > self.inmem_ceiling {
                 let scratch = match self.scratch_path() {
                     Some(p) => p,
                     None => {
