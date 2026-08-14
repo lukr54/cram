@@ -486,7 +486,7 @@ zstd.
 machine and method as the Decode table: destination `/dev/shm`, warm-up discarded, median of 3 with
 the order rotated, cram at its default level against stock `tar -czf` (gzip 1.12).
 
-| | cram | `tar czf` | | cram bytes | `tar czf` bytes |
+| | cram | `tar czf` | speed-up | cram bytes | `tar czf` bytes |
 |---|---|---|---|---|---|
 | Silesia 203 MiB | **0.72 s** | 5.72 s | 7.9× | 68,283,059 | 68,227,507 |
 | enwik9 954 MiB | **3.07 s** | 29.43 s | 9.6× | 324,378,802 | 323,741,701 |
