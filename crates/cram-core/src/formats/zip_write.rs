@@ -92,13 +92,13 @@ fn file_options(
     // `new_buffered` uses `ZOPFLI_MASTER_BLOCK_SIZE`, 1,000,000, and its docs say large chunks are
     // "necessary for decent performance and good compression ratio".
     //
-    // **Measured as a no-op today, and kept anyway.** Silesia came out byte-identical at 32 KiB and
-    // at 1 MB, because the buffer never fills: `compress_one` hands the encoder a whole entry in one
-    // `write_all`, and a `BufWriter` passes a write larger than its capacity straight through. So
-    // zopfli already sees each entry entire, which is the case the buffer exists to approximate.
-    // This matters the moment anything writes an entry in pieces — the streaming path for entries
-    // over `PARALLEL_ENTRY_MAX` is one — and it is the difference between that path quietly losing
-    // ratio and not.
+    // **This governs the streaming path only, and that is not a defect.** A `BufWriter` passes any
+    // write at least as large as its capacity straight through, so a caller that hands over a whole
+    // entry bypasses the buffer entirely — which is what `compress_one` does, and why setting this
+    // once measured byte-identical at 32 KiB and at 1 MB. Both settings were being bypassed. The
+    // block size that path actually gets is chosen in `write_body`, deliberately; here it is what
+    // the streaming path for entries over `PARALLEL_ENTRY_MAX` gets, where `io::copy` writes 8 KiB
+    // at a time and the buffer does fill.
     if matches!(level, Some(n) if n >= ZOPFLI_MIN_LEVEL) {
         opts = opts.with_zopfli_buffer(Some(ZOPFLI_BLOCK));
     }
@@ -473,7 +473,7 @@ fn compress_one(
     let opts = file_options(entry_method, level, pw.as_deref(), false, modified);
     let mut inner = ZipCrateWriter::new(Cursor::new(Vec::with_capacity(data.len() / 2 + 512)));
     inner.start_file(name, opts).map_err(map_zip_write)?;
-    io::Write::write_all(&mut inner, &data)?;
+    write_body(&mut inner, &data, entry_method, level, ZOPFLI_BLOCK)?;
     let cursor = inner.finish().map_err(map_zip_write)?;
     wprof::ZIP_NANOS.fetch_add(t_zip.elapsed().as_nanos() as u64, Relaxed);
     Ok(DoneEntry {
@@ -481,6 +481,48 @@ fn compress_one(
         in_bytes: data.len() as u64,
         stored: adaptive_store,
     })
+}
+
+/// Hand an entry's bytes to the zip encoder in the piece size that encoder actually wants.
+///
+/// For everything but zopfli this is one `write_all` and the piece size does not matter: flate2
+/// buffers internally and picks its own block boundaries.
+///
+/// **Zopfli is different, and it cost 663,064 bytes on a single silesia entry.** Its
+/// `DeflateEncoder` treats *each `write` call as one master block* — `write(buf)` takes the whole
+/// slice as the chunk and compresses it as a unit — and `Options::maximum_block_splits` caps a
+/// master block at 15 smart splits. So a 51 MB entry handed over in one `write_all` buys **16
+/// Huffman trees for 51 MB**, while the reference zopfli CLI feeds 1,000,000 bytes at a time and
+/// gets 15 splits per megabyte. On heterogeneous data that is the whole difference; on homogeneous
+/// text it barely registers, which is the exact shape silesia showed — `mozilla` 3.64% behind
+/// 7-Zip while prose and XML were already ahead of it.
+///
+/// **The zopfli buffer `file_options` asks for does not do this**, which is why setting it
+/// measured as a no-op: `BufWriter` passes any write at least as large as its capacity straight
+/// through to the inner writer, so the buffer is bypassed by precisely the writes that needed it.
+/// Both settings under test were being bypassed, so neither was ever actually under test.
+///
+/// The streaming path for entries over [`PARALLEL_ENTRY_MAX`] never had this problem: `io::copy`
+/// feeds it in 8 KiB pieces, so the buffer fills and flushes per megabyte the way it should.
+/// `block` is the master-block size; production passes [`ZOPFLI_BLOCK`]. It is a parameter so the
+/// regression test can demonstrate the effect on a buffer small enough to compress in a second.
+fn write_body<W: io::Write>(
+    zw: &mut W,
+    data: &[u8],
+    method: CompressionMethod,
+    level: Option<i64>,
+    block: usize,
+) -> Result<()> {
+    let zopfli =
+        method != CompressionMethod::Stored && matches!(level, Some(n) if n >= ZOPFLI_MIN_LEVEL);
+    if zopfli {
+        for piece in data.chunks(block) {
+            io::Write::write_all(zw, piece)?;
+        }
+    } else {
+        io::Write::write_all(zw, data)?;
+    }
+    Ok(())
 }
 
 /// Map the abstract [`Level`] onto DEFLATE's 0–9 scale (`None` = the crate default, 6).
@@ -904,5 +946,63 @@ mod mtime_guard_tests {
         assert_eq!(got, body, "the zopfli archive must decode to the original");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The master-block regression, pinned.
+    ///
+    /// Zopfli compresses one master block per `write` call and splits each into at most 15 blocks,
+    /// so handing it a whole large entry costs Huffman trees the reference CLI would have spent.
+    /// It is invisible on homogeneous input and expensive on mixed input, which is why silesia's
+    /// prose entries looked fine while `mozilla` was 3.64% behind 7-Zip.
+    ///
+    /// **What this asserts is the piece size, not a ratio**, and that is deliberate. The ratio win
+    /// only appears once 15 splits is genuinely too few for the data, which takes megabytes and a
+    /// minute of CPU; it is measured on silesia and recorded in `FINDINGS-b1b-tiny-vs-zopfli.md`
+    /// rather than asserted here. Two earlier versions of this test tried to assert bytes and both
+    /// were worthless: at 256 KiB the splitter has budget to spare, so forcing boundaries every
+    /// 32 KiB measured 190 bytes *worse* than one block. Chunking is not good in itself — it is
+    /// good exactly when the cap binds, and a unit test cannot afford to reach that point.
+    ///
+    /// So: one write per master block when zopfli is the encoder, one write otherwise.
+    #[test]
+    fn zopfli_gets_the_entry_in_master_blocks() {
+        /// Records the size of every `write` it is handed.
+        struct Sizes(Vec<usize>);
+        impl io::Write for Sizes {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.push(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let body = vec![0u8; 2 * ZOPFLI_BLOCK + 12_345];
+        let sizes = |method, level| {
+            let mut w = Sizes(Vec::new());
+            write_body(&mut w, &body, method, level, ZOPFLI_BLOCK).unwrap();
+            w.0
+        };
+
+        assert_eq!(
+            sizes(CompressionMethod::Deflated, Some(ZOPFLI_LEVEL)),
+            vec![ZOPFLI_BLOCK, ZOPFLI_BLOCK, 12_345],
+            "zopfli must see one master block per write, or a large entry becomes one block with \
+             15 splits and the Huffman trees it needed are never built"
+        );
+
+        // Every other encoder buffers internally and picks its own boundaries; splitting the write
+        // would buy nothing and is not done.
+        assert_eq!(
+            sizes(CompressionMethod::Deflated, Some(9)),
+            vec![body.len()],
+            "flate2 levels must not be chunked"
+        );
+        assert_eq!(
+            sizes(CompressionMethod::Stored, Some(ZOPFLI_LEVEL)),
+            vec![body.len()],
+            "a stored entry has no encoder to feed in blocks"
+        );
     }
 }
