@@ -32,6 +32,18 @@ use crate::secret::PasswordProvider;
 /// than buffered whole in RAM. Reused each read; only ~1 chunk is in flight (bounded channel).
 const STREAM_CHUNK: usize = 1024 * 1024;
 
+/// Messages the decode worker may run ahead by.
+///
+/// **It was 1**, described as "~1–2 entries in flight", and that is a ping-pong rather than a
+/// pipeline: the producer fills one slot, blocks, the consumer takes it, and neither ever overlaps
+/// the other. On a 94,778-entry archive that is ~95,000 round-trip handoffs, and it showed up as a
+/// run at ~100% CPU whose two threads each accounted for only a fraction of the wall clock.
+///
+/// Still bounded, because the point of the bound is real — bodies stream, and an unbounded channel
+/// would let the producer buffer a whole archive. The ceiling is `STREAM_DEPTH × STREAM_CHUNK`,
+/// so 16 MiB.
+const STREAM_DEPTH: usize = 16;
+
 /// Cap on the cumulative entry-metadata the header pass buffers into the listing `Vec`. A compressed
 /// tar (`.tar.gz`/`.tar.xz`) can expand a few MB into a header stream describing tens of millions of
 /// members; without a bound, `scan` grows the `Vec` until it OOMs before the caller sees a single
@@ -138,6 +150,11 @@ fn scan_with_cap(path: &Path, fmt: Format, cap: u64) -> Result<Vec<Entry>> {
 /// The extraction pass: iterate the archive and stream each entry's body over `tx` in bounded chunks.
 fn worker(reader: Box<dyn Read + Send>, tx: SyncSender<TarMsg>) {
     let mut archive = tar::Archive::new(reader);
+    // **One buffer for the whole archive.** This was `vec![0u8; STREAM_CHUNK]` inside the per-entry
+    // loop, so a 94,778-entry kernel tree allocated — and zeroed — 94,778 buffers of a megabyte each
+    // to carry files averaging 20 KB. About 94 GB of `memset`, which is what a profile of `cram t`
+    // was showing as 44.75% in `__memset_avx2_unaligned_erms` under mimalloc's `alloc_zeroed`.
+    let mut buf = vec![0u8; STREAM_CHUNK];
     let entries = match archive.entries() {
         Ok(e) => e,
         Err(e) => {
@@ -176,7 +193,6 @@ fn worker(reader: Box<dyn Read + Send>, tx: SyncSender<TarMsg>) {
         }
         // Stream the body in bounded chunks, the entry reader is capped to the (untrusted) header
         // size, so buffering it whole would let a crafted size / bomb OOM the process.
-        let mut buf = vec![0u8; STREAM_CHUNK];
         loop {
             match entry.read(&mut buf) {
                 Ok(0) => break,
@@ -283,7 +299,7 @@ impl TarReader {
             return Ok(());
         }
         self.started = true;
-        let (tx, rx) = sync_channel::<TarMsg>(1); // bounded → backpressure, ~1–2 entries in flight
+        let (tx, rx) = sync_channel::<TarMsg>(STREAM_DEPTH);
         let reader = open_decoded(&self.path, self.fmt)?;
         thread::spawn(move || worker(reader, tx));
         self.rx = Some(rx);
