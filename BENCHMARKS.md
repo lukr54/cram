@@ -569,6 +569,14 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
   data. That is the pure-Rust bzip2 backend rather than cram's machinery, and the same machinery on
   `gz` costs 4.7 CPU-seconds against `gzip -dc`'s 5.74. More workers cannot fix it.
 
+  **The `xz` and `bz2` rows depend on the archive being a run of streams, and say so.** Those two
+  decode on every core by splitting at the seams cram's own writer leaves; `pbzip2`, `lbzip2` and
+  `cat a.xz b.xz` leave the same ones. An archive that is a **single** stream — what plain `bzip2`
+  or `xz` produces — has nothing to split, and cram reads it at one-core speed like everyone else:
+  the same kernel tree through a single-stream `.tar.bz2` from stock `bzip2 -9` takes **62.4 s**, not
+  7.46. Detecting that costs nothing measurable (62.4 s against 62.5 s with the scan disabled
+  outright), but the speed is not there to be had.
+
   For scale: the same tree out of a `.cram` extracts in 1.84 s.
 - **Creating a `.tar.bz2` and a `.tar.xz`**, against the threaded specialists: bz2 7.85 s against
   lbzip2's 4.99, xz 41.35 s against `xz -T0`'s 34.45. Both write a smaller or equal archive
