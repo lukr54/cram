@@ -127,6 +127,12 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        // `cram help <verb>`, which is the other way round people try it. Before the bare `help`
+        // arm below, which would otherwise swallow it.
+        Some("help") if args.len() > 2 => {
+            println!("{}", verb_help(&args[2]));
+            ExitCode::SUCCESS
+        }
         // Asked for by name, so the usage block is the answer rather than context for an error:
         // stdout, and a success code, so `cram --help | less` works.
         Some("--help") | Some("-h") | Some("help") => {
@@ -139,6 +145,17 @@ fn main() -> ExitCode {
         Some("rec") | Some("recovery") => cram_recovery::cli::main(&args[2..]),
         Some("sign") | Some("verify") | Some("keygen") => cram_sign::cli::main(&args[1..]),
         Some("make-sfx") => make_sfx(&args),
+        // **`--help` after a verb is a request for help, not a file name.** `x`, `t` and `l` take an
+        // archive as their first positional and took `--help` as one, so `cram x --help` failed with
+        // "No such file or directory" — the first thing a new user is likely to type.
+        //
+        // Deliberately *after* the sub-crate dispatches above: `mount`, `rec`, `sign` and the rest
+        // parse their own arguments and already answer `--help` themselves, and second-guessing them
+        // here would replace better help with worse.
+        Some(verb) if wants_verb_help(&args[2..]) => {
+            println!("{}", verb_help(verb));
+            ExitCode::SUCCESS
+        }
         // Archive verbs return `Result` and share one error rendering + exit code.
         _ => match run(&args) {
             Some(Ok(())) => {
@@ -328,6 +345,10 @@ const USAGE: &str = "\
 usage: cram <command> …
   l  <archive>                        list entries
   x  <archive> [-o <dir>] [-p <pw>]   extract [--skip]
+       without -o the destination is the archive's own name beside it: foo.zip extracts
+       to ./foo/, and foo.tar.gz to ./foo/ rather than ./foo.tar/
+       existing files are replaced. --skip keeps them instead, and skips the decode as
+       well when what is already on disk matches by size and checksum
   a  <archive> <input...> [-p <pw>]   create [--fast|--auto|--small|--tiny|--store]
        [--encrypt-names] [--solid|--no-solid]
        --fast is the quickest and still compresses; --auto (the default) balances; --small
@@ -382,6 +403,80 @@ usage: cram <command> …
 /// was asked for by name, `main` prints it to stdout instead.
 fn usage() {
     eprintln!("{USAGE}");
+}
+
+/// Options that take a value, so the token after them is data and not a flag.
+///
+/// Without this, a password or a path that happens to be `-h` would be read as a request for help
+/// and the command would print usage instead of running. `cram x a.zip -p -h` is a legitimate thing
+/// to type.
+const VALUE_OPTS: &[&str] = &[
+    "-o",
+    "-p",
+    "-k",
+    "-n",
+    "--key",
+    "--encrypt",
+    "--chunk",
+    "--sha256",
+    "--keep",
+    "--min-size",
+    "--quarantine",
+    "--extract",
+];
+
+/// Did the user ask for help somewhere in a verb's arguments?
+fn wants_verb_help(rest: &[String]) -> bool {
+    let mut skip = false;
+    for a in rest {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if VALUE_OPTS.contains(&a.as_str()) {
+            skip = true;
+            continue;
+        }
+        if a == "--help" || a == "-h" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Help for one verb: that verb's own section of [`USAGE`], and a pointer to the rest.
+///
+/// **Extracted from `USAGE` rather than written out again**, so the two cannot drift apart. The
+/// block is already sectioned: a section opens with a line indented exactly two spaces whose first
+/// token is the verb, and runs until the next such line. An unrecognised verb falls back to the
+/// whole block, which is the right answer for a typo.
+fn verb_help(verb: &str) -> String {
+    let mut out = String::new();
+    let mut in_section = false;
+    for line in USAGE.lines() {
+        let opens = line.starts_with("  ") && !line.starts_with("   ");
+        if opens {
+            // One line can document several verbs, separated by `|` — `sign … | verify … | keygen
+            // …`. Split there and compare each part's first token, so every name on the line finds
+            // it.
+            in_section = line
+                .split('|')
+                .filter_map(|part| part.split_whitespace().next())
+                .any(|first| first == verb);
+        }
+        if in_section {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return USAGE.to_string();
+    }
+    out.push_str(
+        "\n--diag-report works on this command too, and writes a report about the run.\n\
+         `cram --help` lists every command.",
+    );
+    out
 }
 
 /// Is `flag` present anywhere in `args`?
@@ -1858,6 +1953,50 @@ mod tests {
         // A newline forges a whole listing row; it must not reach the terminal.
         assert_eq!(printable("a.txt\nfake"), "a.txt\\u{000a}fake");
         assert_eq!(printable("héllo.txt"), "héllo.txt");
+    }
+
+    /// `cram x --help` used to fail with "No such file or directory", because the read verbs take
+    /// an archive as their first positional and `--help` looked like one. It is the first thing a
+    /// new user types.
+    #[test]
+    fn every_verb_answers_help_with_its_own_section() {
+        for verb in ["l", "x", "a", "t", "conv", "dedup", "update", "diag"] {
+            let h = verb_help(verb);
+            assert!(
+                h.lines().count() < USAGE.lines().count(),
+                "{verb} fell back to the whole usage block instead of finding its section"
+            );
+            let opening = h.lines().next().unwrap_or("");
+            assert_eq!(
+                opening.split_whitespace().next(),
+                Some(verb),
+                "{verb}'s help must start with {verb}'s own line, got {opening:?}"
+            );
+        }
+        // Several verbs share one line; each name on it has to find that line.
+        for verb in ["sign", "verify", "keygen"] {
+            assert!(
+                verb_help(verb).contains("Reed-Solomon") || verb_help(verb).starts_with("  sign"),
+                "{verb} must resolve to the line that documents it"
+            );
+        }
+        // A typo gets everything rather than nothing.
+        assert_eq!(verb_help("exract").lines().count(), USAGE.lines().count());
+    }
+
+    #[test]
+    fn a_value_that_looks_like_a_flag_is_not_a_request_for_help() {
+        let a = |s: &str| -> Vec<String> { s.split(' ').map(String::from).collect() };
+        assert!(wants_verb_help(&a("archive.zip --help")));
+        assert!(wants_verb_help(&a("archive.zip -h")));
+        assert!(wants_verb_help(&a("-o out --help")));
+        // A password or a path is allowed to be exactly `-h`; it belongs to the option before it.
+        assert!(!wants_verb_help(&a("archive.zip -p -h")));
+        assert!(!wants_verb_help(&a("archive.zip -o -h")));
+        assert!(!wants_verb_help(&a("archive.zip -p --help")));
+        // ...but a real request after one still counts.
+        assert!(wants_verb_help(&a("archive.zip -p -h --help")));
+        assert!(!wants_verb_help(&a("archive.zip -o out")));
     }
 
     #[test]
