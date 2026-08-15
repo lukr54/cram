@@ -65,10 +65,11 @@ the three cram loses, in [Decode](#decode).
 **On a real disk none of that shows.** Extraction is write-bound: the same four tools land within
 23% of each other, and the choice barely matters if you are writing to a spinning or SATA disk.
 
-**Writing a `.tar.gz` is 5.9× to 9.6× faster than `tar czf`**, for archives within 0.2% of gzip's
-own on two corpora and 1.40% smaller on the kernel tree. Create only — a standard `.gz` cannot be
-extracted in parallel by anybody, and cram does not pretend otherwise. Numbers, and what the
-chunking costs, in [Writing `.tar.gz`](#writing-targz).
+**Writing a `.tar.gz` is faster than `pigz`, by 1.08×, in a 1.38% smaller archive.** pigz is the
+right comparison and `tar czf` is not: `tar czf` pipes through one thread, so beating it says nothing
+except that we use the machine. Create only — a standard `.gz` cannot be extracted in parallel by
+anybody, and cram does not pretend otherwise. Numbers, and what the chunking costs, in
+[Writing `.tar.gz`](#writing-targz).
 
 **One corpus exposed a real weakness, and it is mostly closed.** enwik9 is a single 1 GB file, and
 extraction fanned out per entry — one entry, one thread, whatever the machine. Cutting the entry at
@@ -89,7 +90,9 @@ on a later build than the tables below, and stated with its conditions because t
 
 Every one of those is measured in that section, including the ones where cram loses.
 
-**Memory is where cram is unambiguously cheaper than 7-Zip**, and the qualifier is doing real work.
+**Memory is where cram is cheaper than 7-Zip**, and the qualifier is doing real work — it means
+7-Zip and it does not generalise. Against the threaded tar tools cram is *dearer*, and writing a
+`.tar.xz` it now peaks at 3960 MB against `xz -T0`'s 3196.
 Creating the Cram corpus, default against default, is 2.4 GB against 7-Zip's 7.1 GB; at maximum
 7-Zip needs **17.4 GB**, does not fit on a 16 GB machine, and given all 24 threads exceeds 20 GB and
 is killed. Decoding that corpus is 1310 MB against 4877 MB. Against RAR and the pipe-based tools it
@@ -482,21 +485,31 @@ zstd.
 
 ## Writing `.tar.gz`
 
-`.tar.gz` is its own comparison because the competitor is not an archiver, it is `tar czf`. Same
-machine and method as the Decode table: destination `/dev/shm`, warm-up discarded, median of 3 with
-the order rotated, cram at its default level against stock `tar -czf` (gzip 1.12).
+`.tar.gz` is its own comparison because the competitor is not an archiver. **The competitor is
+`pigz`** — parallel gzip, by Mark Adler, who co-authored zlib and the gzip format, packaged in every
+distro since 2007. Same machine and method as the Decode table: destination `/dev/shm`, warm-up
+discarded, median of 3 with the order rotated, every tool given all 24 threads.
 
-| | cram | `tar czf` | speed-up | cram bytes | `tar czf` bytes |
-|---|---|---|---|---|---|
-| Silesia 203 MiB | **0.72 s** | 5.72 s | 7.9× | 68,283,059 | 68,227,507 |
-| enwik9 954 MiB | **3.07 s** | 29.43 s | 9.6× | 324,378,802 | 323,741,701 |
-| kernel tree 2.1 GB | **5.43 s** | 32.29 s | 5.9× | 558,362,143 | 566,298,666 |
+| kernel tree, 2.1 GB | wall | bytes |
+|---|---|---|
+| **cram**, default | **3.19 s** | **558,402,429** |
+| `pigz -6 -p 24` | 3.46 s | 566,208,712 |
+| `gzip -6` (one thread) | 30.75 s | 566,354,268 |
 
-The archives are within 0.2% of gzip's on the first two and **1.40% smaller** on the kernel tree.
+**1.08× faster than pigz, in a 1.38% smaller archive.** The `gzip` row is there for scale, not as a
+comparison: an earlier version of this section reported 5.9–9.6× against `tar czf` and that was
+true, uninteresting and quietly misleading, because `tar czf` compresses on one thread. Anyone
+qualified to read this table knows pigz exists.
 
-**Create only.** A standard `.gz` cannot be extracted in parallel by anyone, cram included: a
-decoder cannot find the block boundaries without inflating everything before them. Nothing here says
-`cram x` on a `.tar.gz` is faster than `tar xzf`, and it is not.
+The archive is smaller than both because the chunk is 1 MiB where pigz's is 128 KiB, so cram throws
+away eight times less dictionary at the seams.
+
+**Create only, and extraction is the other way round.** A standard `.gz` cannot be extracted in
+parallel by anyone, cram included: a decoder cannot find the block boundaries without inflating
+everything before them. **`cram x` on a `.tar.gz` is 2.2× slower than `gzip -d | tar`** on the kernel
+tree — and pigz decompresses in the same time as gzip, because gzip decompression cannot be
+parallelised, so that is a loss against a single-threaded reader. It is the same weakness in every
+tar codec; see [Where cram loses](#where-cram-loses).
 
 **What it costs.** The stream is cut into 1 MiB chunks compressed independently, so each starts with
 an empty dictionary and the archive grows by 0.19–0.34% against a single-stream gzip. Peak memory is
@@ -510,6 +523,27 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
 
 ## Where cram loses
 
+- **Extracting a `.tar.*`, every codec, against single-threaded readers.** This is the largest
+  remaining weakness and the one that shows up most often, because `.tar.gz` is the commonest archive
+  on the planet. Kernel tree, `/dev/shm`, each competitor at its default:
+
+  | codec | cram | native | |
+  |---|---|---|---|
+  | `gz` | 13.78 s | 6.21 s | 2.22× slower |
+  | `bz2` | 69.28 s | 35.21 s (lbzip2) | 1.97× |
+  | `xz` | 29.39 s | 8.84 s | 3.33× |
+  | `zst` | 11.91 s | 2.13 s | 5.59× |
+  | `lz4` | 10.51 s | 3.24 s (`lz4 -dc \| tar`) | 3.24× |
+  | `br` | 15.35 s | 4.90 s (`brotli -dc \| tar`) | 3.13× |
+
+  None of those opponents is using extra cores — pigz decompresses in 6.22 s against gzip's 6.21,
+  because gzip decompression cannot be parallelised — so "they have more threads" is not available as
+  an explanation. The cause is that tar has no random-access boundary, so the parallel extraction
+  engine does not apply and a single thread does the work. The same tree out of a `.cram` extracts in
+  1.84 s.
+- **Creating a `.tar.bz2` and a `.tar.xz`**, against the threaded specialists: bz2 7.85 s against
+  lbzip2's 4.99, xz 41.35 s against `xz -T0`'s 34.45. Both write a smaller or equal archive
+  (0.88% smaller on xz), and both improved substantially on 2026-08-15, but neither wins.
 - **Maximum ratio on large corpora.** 7-Zip `-mx=9` is 1.84% smaller on the kernel tree and
   5.09% smaller on enwik9. On the kernel tree cram `--small` is dominated outright: bigger and
   slower. Use `--auto` there and take the speed.
