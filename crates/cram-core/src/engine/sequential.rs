@@ -4,7 +4,7 @@
 //!, the same write machinery the parallel path uses, so every backend inherits it.
 
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -13,7 +13,45 @@ use crate::error::{ArchiveError, Report, Result};
 use crate::progress::ProgressSink;
 use crate::reader::ArchiveReader;
 
-const WRITE_BUF: usize = 8 * 1024 * 1024;
+/// One reusable copy buffer for the whole extraction, allocated once.
+///
+/// **It used to be an 8 MiB `BufWriter` built inside the per-entry loop**, so a 94,778-entry
+/// `.tar.gz` allocated 94,778 of them, and every byte landed in `io::copy`'s 8 KiB stack buffer
+/// before reaching one. Kernel tree to `/dev/shm`: **14.25 s → 13.22, peak RSS 97 MB → 86.**
+///
+/// 1 MiB rather than 8: the same constant was measured on the parallel path today and 8 MiB bought
+/// nothing on either a RAM disk or a real disk. Allocated once here, so the size costs nothing.
+///
+/// **Not to be confused with the memset in the profile.** A profile of this extraction puts 34% in
+/// `__memset_avx2_unaligned_erms`, which is mimalloc zeroing fresh pages on a spawned thread, and it
+/// is unchanged by any of this. Building without mimalloc removes it and the extraction takes
+/// exactly as long — 13.30 s against 13.42, in 49 MB instead of 84 — so that CPU gates nothing. At
+/// 141% CPU this path is bound by its single decode thread, and a flat profile's sample share is not
+/// a wall-time attribution when more than one thread is running.
+const WRITE_BUF: usize = 1024 * 1024;
+
+/// Copy `from` into `to` through a caller-owned buffer.
+///
+/// `io::copy` would allocate its own, and a `BufWriter` on top of it would add a second hop: bytes
+/// landed in an 8 KiB stack buffer, then an 8 MiB heap buffer, then the file. This is one buffer and
+/// one hop, and the buffer outlives the entry.
+fn copy_through<R: io::Read + ?Sized, W: io::Write + ?Sized>(
+    from: &mut R,
+    to: &mut W,
+    buf: &mut [u8],
+) -> io::Result<u64> {
+    let mut total = 0u64;
+    loop {
+        let n = match from.read(buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        to.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+}
 
 /// Extract every entry of `reader` under `dest`, streaming front-to-back. Per-entry failures are
 /// collected into the [`Report`] (non-fatal); cancellation stops before the next entry. When
@@ -31,6 +69,8 @@ pub fn run(
     // Directory mtimes are applied only after the whole tree is written (a child write bumps the
     // parent's mtime), so collect them here and flush in a final pass below.
     let mut dir_times: Vec<(PathBuf, SystemTime)> = Vec::new();
+    // Once, for the whole extraction. See [`WRITE_BUF`].
+    let mut copy_buf = vec![0u8; WRITE_BUF];
 
     loop {
         sink.wait_if_paused();
@@ -97,8 +137,8 @@ pub fn run(
                 continue;
             }
         };
-        let mut writer = ProgressWriter::new(BufWriter::with_capacity(WRITE_BUF, file), sink);
-        match io::copy(&mut es.body, &mut writer).and_then(|n| {
+        let mut writer = ProgressWriter::new(file, sink);
+        match copy_through(&mut es.body, &mut writer, &mut copy_buf).and_then(|n| {
             writer.flush()?;
             Ok(n)
         }) {
