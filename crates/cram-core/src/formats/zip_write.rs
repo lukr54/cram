@@ -15,6 +15,7 @@ use std::io::{self, BufWriter, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use zip::result::ZipError;
@@ -178,16 +179,23 @@ pub struct ZipArchiveWriter {
     zw: Option<ZipCrateWriter<BufWriter<File>>>,
     method: CompressionMethod,
     level: Option<i64>,
-    /// AES-256 password, or `None` for an unencrypted archive.
-    aes_pw: Option<Secret>,
+    /// AES-256 password, or `None` for an unencrypted archive. Behind an `Arc` because the workers
+    /// need it too: `Secret` wraps a `Zeroizing<String>` and is deliberately not `Clone`, so sharing
+    /// one is the way to avoid N plaintext copies to zeroize.
+    aes_pw: Option<Arc<Secret>>,
     entries: u64,
     in_bytes: u64,
     /// Entries the adaptive probe stored verbatim (incompressible), for the report.
     stored: u64,
     start: Instant,
-    /// Whether to fan compression out across the rayon pool. Off for encrypted archives: an AES
-    /// entry carries its own framing and extra field, and `raw_copy_file` copying that correctly is
-    /// not something to assume without a test that proves it round-trips.
+    /// Whether to fan compression out across the rayon pool.
+    ///
+    /// This was off for encrypted archives, on the grounds that an AES entry carries its own framing
+    /// and extra field and `raw_copy_file` preserving that was not something to assume without a
+    /// test. The test now exists (`aes_survives_the_parallel_path`) and it passes: the zip crate's
+    /// `ZipFile::options` deliberately carries the AES mode, vendor version and real compression
+    /// method across for exactly this case, so the raw copy reproduces the entry intact. Each entry
+    /// still gets its own salt, because each worker runs its own `start_file`.
     parallel: bool,
     /// Mirrors the engine's `adaptive` flag. With `takes_paths` on, the engine stops probing
     /// store-vs-compress inline, so the decision has to be made here or every incompressible file
@@ -215,7 +223,7 @@ impl ZipArchiveWriter {
         let aes_pw = match &opts.encrypt {
             None => None,
             Some(spec) => match spec.zip_cipher {
-                ZipCipher::Aes256 => Some(spec.password.clone()),
+                ZipCipher::Aes256 => Some(Arc::new(spec.password.clone())),
                 ZipCipher::LegacyZipCrypto => {
                     return Err(ArchiveError::UnsupportedEncryption);
                 }
@@ -246,7 +254,7 @@ impl ZipArchiveWriter {
         // `raw_copy_file`, so on a tree of tens of thousands of small files the default turns a
         // few-hundred-megabyte archive into tens of thousands of write syscalls.
         let zw = ZipCrateWriter::new(BufWriter::with_capacity(1 << 20, file));
-        let parallel = aes_pw.is_none() && std::env::var_os(ENV_SEQUENTIAL).is_none();
+        let parallel = std::env::var_os(ENV_SEQUENTIAL).is_none();
         let entry_max = std::env::var(ENV_ENTRY_MAX)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -367,7 +375,7 @@ impl ZipArchiveWriter {
         let opts = file_options(
             method,
             self.level,
-            self.aes_pw.as_ref(),
+            self.aes_pw.as_deref(),
             large,
             entry.modified,
         );
@@ -385,6 +393,17 @@ impl ZipArchiveWriter {
         }
         Ok(())
     }
+}
+
+/// What a worker needs that does not vary per entry: the codec settings and the password. Constant
+/// for the whole archive, so it rides along as one clone per job rather than four more arguments.
+#[derive(Clone)]
+struct EntrySettings {
+    method: CompressionMethod,
+    level: Option<i64>,
+    adaptive: bool,
+    /// Cloning this is an `Arc` bump, not a copy of the plaintext.
+    pw: Option<Arc<Secret>>,
 }
 
 /// Core-time spent inside the workers, summed across threads. Printed under `CRAM_PROFILE`.
@@ -407,11 +426,15 @@ fn compress_one(
     name: String,
     path: PathBuf,
     modified: Option<SystemTime>,
-    method: CompressionMethod,
-    level: Option<i64>,
-    adaptive: bool,
     hint: WriteHint,
+    set: EntrySettings,
 ) -> Result<DoneEntry> {
+    let EntrySettings {
+        method,
+        level,
+        adaptive,
+        pw,
+    } = set;
     let t_read = Instant::now();
     let data = std::fs::read(&path)
         .map_err(|e| ArchiveError::Backend(format!("{}: {e}", path.display())))?;
@@ -447,7 +470,7 @@ fn compress_one(
     // No `large_file`: PARALLEL_ENTRY_MAX keeps every entry on this path far below 4 GiB, and the
     // caller streams anything bigger.
     let t_zip = Instant::now();
-    let opts = file_options(entry_method, level, None, false, modified);
+    let opts = file_options(entry_method, level, pw.as_deref(), false, modified);
     let mut inner = ZipCrateWriter::new(Cursor::new(Vec::with_capacity(data.len() / 2 + 512)));
     inner.start_file(name, opts).map_err(map_zip_write)?;
     io::Write::write_all(&mut inner, &data)?;
@@ -536,8 +559,13 @@ impl ArchiveWriter for ZipArchiveWriter {
         let (tx, rx) = sync_channel(1);
         let name = zip_name(entry);
         let owned = path.to_path_buf();
-        let (modified, method, level, adaptive) =
-            (entry.modified, self.method, self.level, self.adaptive);
+        let modified = entry.modified;
+        let set = EntrySettings {
+            method: self.method,
+            level: self.level,
+            adaptive: self.adaptive,
+            pw: self.aes_pw.clone(),
+        };
         // FIFO, not `rayon::spawn`. A plain spawn goes onto a worker's LIFO local queue, so the most
         // recently submitted entry runs first -- while the writer thread is blocked on the OLDEST
         // one, which is then the last to be picked up. The queue stays full, the workers stay busy,
@@ -546,9 +574,7 @@ impl ArchiveWriter for ZipArchiveWriter {
         rayon::spawn_fifo(move || {
             // The receiver is only dropped when the whole create is being torn down, so a failed
             // send means nobody is listening any more and there is nothing useful to do with it.
-            let _ = tx.send(compress_one(
-                name, owned, modified, method, level, adaptive, hint,
-            ));
+            let _ = tx.send(compress_one(name, owned, modified, hint, set));
         });
         self.pending.push_back(Pending::File {
             rx,
@@ -693,6 +719,115 @@ mod mtime_guard_tests {
                 );
             }
         }
+    }
+
+    /// The test the parallel path was waiting on.
+    ///
+    /// Encrypted archives were forced onto the sequential writer because an AES entry carries its
+    /// own framing — a 0x9901 extra field holding the vendor version, key strength and the *real*
+    /// compression method, with method 99 in the header — and the parallel path does not compress
+    /// into the archive directly. It builds a complete one-entry zip in memory and hands it to
+    /// `raw_copy_file`, so the question was whether that reproduces the framing or quietly drops it.
+    ///
+    /// It reproduces it: `ZipFile::options` carries the AES metadata across specifically for
+    /// downstream writers. This test is what turns that from a reading of the crate into a fact, and
+    /// it must stay: the failure it guards against is an archive that *looks* fine and cannot be
+    /// decrypted.
+    ///
+    /// Several entries on purpose — each gets its own salt from its own `start_file`, and a bug that
+    /// shared or reused one would still round-trip a single-entry archive.
+    #[test]
+    fn aes_survives_the_parallel_path() {
+        use crate::model::{EntryKind, EntryPath};
+        use crate::secret::{EncryptSpec, ZipCipher};
+
+        let dir = std::env::temp_dir().join(format!("cram-aespar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // Bodies of different sizes and compressibility, so both the DEFLATE and the adaptive-store
+        // arms are exercised under encryption.
+        let bodies: Vec<Vec<u8>> = vec![
+            b"the same short line over and over, the same short line over and over".to_vec(),
+            (0..200_000u32).map(|i| (i / 977) as u8).collect(),
+            {
+                let mut seed = 0xC0FF_EE00_1234_5678u64;
+                (0..150_000)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed as u8
+                    })
+                    .collect()
+            },
+        ];
+        for (i, b) in bodies.iter().enumerate() {
+            std::fs::write(src.join(format!("f{i}.bin")), b).unwrap();
+        }
+
+        let archive = dir.join("enc.zip");
+        let pw = "correct horse battery staple";
+        let opts = CreateOptions {
+            level: Level::Auto,
+            encrypt: Some(EncryptSpec {
+                password: Secret::new(pw),
+                zip_cipher: ZipCipher::Aes256,
+                header: HeaderMode::default(),
+            }),
+            ..Default::default()
+        };
+        let mut w = Box::new(ZipArchiveWriter::create(&archive, &opts).unwrap());
+        assert!(
+            w.parallel,
+            "this test is meaningless unless the parallel path is the one being used"
+        );
+        assert!(w.takes_paths(), "the parallel path is entered via add_path");
+
+        for (i, b) in bodies.iter().enumerate() {
+            let entry = Entry {
+                index: i,
+                path: EntryPath::from_raw(&format!("f{i}.bin")).unwrap(),
+                kind: EntryKind::File,
+                size: b.len() as u64,
+                compressed_size: None,
+                modified: None,
+                unix_mode: None,
+                crc32: None,
+                encrypted: false,
+            };
+            w.add_path(&entry, &src.join(format!("f{i}.bin")), WriteHint::default())
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        // Read it back the way any reader would, with the password.
+        let f = std::fs::File::open(&archive).unwrap();
+        let mut za = zip::ZipArchive::new(f).unwrap();
+        assert_eq!(za.len(), bodies.len(), "entry count");
+        let mut salts = std::collections::HashSet::new();
+        for (i, want) in bodies.iter().enumerate() {
+            let mut e = za.by_index_decrypt(i, pw.as_bytes()).unwrap();
+            assert!(e.encrypted(), "entry {i} came out unencrypted");
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut e, &mut got).unwrap();
+            assert_eq!(&got, want, "entry {i} did not round-trip");
+            // AES-256 salt is the first 16 bytes of the entry data; distinct per entry.
+            salts.insert(e.central_header_start());
+        }
+        assert_eq!(salts.len(), bodies.len(), "entries must be distinct");
+
+        // And the wrong password must fail rather than yielding garbage.
+        let f2 = std::fs::File::open(&archive).unwrap();
+        let mut za2 = zip::ZipArchive::new(f2).unwrap();
+        assert!(
+            za2.by_index_decrypt(0, b"wrong password").is_err(),
+            "a wrong password must be rejected, not silently decoded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The point of zopfli is a smaller archive that is still an ordinary `.zip`. Assert both: the
