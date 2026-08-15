@@ -40,7 +40,7 @@ use brotli::enc::BrotliEncoderParams;
 use brotli::CompressorWriter;
 use bzip2::write::BzEncoder;
 use flate2::{Compress, Compression, Crc, FlushCompress};
-use lz4_flex::frame::FrameEncoder;
+use lz4_flex::frame::{BlockSize, FrameEncoder, FrameInfo};
 use lzma_rust2::{XzOptions, XzWriter};
 #[cfg(not(feature = "zstd-c"))]
 use ruzstd::encoding::{compress_to_vec, CompressionLevel};
@@ -130,11 +130,27 @@ enum TarSink {
 /// It is the same trade R4 took for gzip — each chunk starts with an empty dictionary, so the
 /// archive grows slightly — and it is what `xz -T0` itself does, which is why its output is *larger*
 /// than a single-threaded `xz` too.
-/// **lz4 is deliberately not here.** Its frames concatenate in the format, but our reader does not
-/// follow them: `lz4_flex`'s `FrameDecoder` stops at the first frame, so a chunked `.tar.lz4` would
-/// be written correctly and read back truncated. Measured while adding this — 49,152 of 197,385
-/// bytes, exactly one chunk. That is a reader bug in its own right and is fixed separately; until
-/// then lz4 stays a single streaming frame, which is what it always was.
+///
+/// **lz4 is deliberately not here, and the reason changed on 2026-08-15.** It used to be that our
+/// *reader* stopped at the first frame; that was fixed (`codec::frames::MultiFrameLz4`) and the
+/// exclusion outlived it, so chunked lz4 create was built and measured. It is a **loss**, and the
+/// numbers are worth keeping so nobody builds it a third time. Kernel tree, tmpfs, one binary
+/// reading both archives back to back:
+///
+/// | | one frame | 239 frames |
+/// |---|---|---|
+/// | `cram a` | 3.72 s, 100% CPU | **2.06 s**, 252% |
+/// | `cram x` | **3.73 s** | 4.34 s |
+/// | `lz4 -dc \| tar` | **2.09 s** | 2.59 s |
+///
+/// Chunking buys 1.7 s of create and costs 0.6 s of our extraction and **0.5 s of everyone else's**
+/// — a penalty on every third-party tool that reads what we write, for a codec chosen because it is
+/// fast to read.
+///
+/// It also *looked* like it gained 3% of ratio, which is impossible for chunking and was the clue
+/// worth following: the gain belonged to the block size, arriving by accident because a worker's
+/// first write is a whole 8 MiB chunk rather than a 512-byte tar header. That is [`LZ4_BLOCK`], and
+/// measured on its own it is the wrong trade too.
 #[derive(Clone, Copy)]
 enum ChunkCodec {
     /// Not a whole stream like the others: a run of raw DEFLATE blocks ended with a sync flush, to
@@ -813,6 +829,30 @@ fn br_quality(level: Level) -> u32 {
 /// Output staging buffer for the brotli encoder. Purely an I/O granularity knob — the encoder holds
 /// its own input ring buffer sized by `lgwin` — so it costs nothing but syscalls, and 4 KiB against a
 /// 4 MiB window was a lot of syscalls.
+/// The lz4 frame's block size. **Set to the value we already had, so the output does not change** —
+/// the point is that we had it by accident.
+///
+/// `lz4_flex`'s default is `BlockSize::Auto`, documented as detecting the size **from the first
+/// write call**. A tar's first write is a 512-byte header, so every `.tar.lz4` cram has ever written
+/// used 64 KB blocks without anyone choosing that. It would move on its own if the crate retuned
+/// `Auto`, or if anything upstream ever buffered the first write.
+///
+/// **4 MB, which is what the `lz4` CLI uses, is 3.03% smaller and the wrong trade.** Measured on the
+/// kernel tree, one binary, three alternating rounds:
+///
+/// | | 64 KB | 4 MB |
+/// |---|---|---|
+/// | archive | 763,711,608 | **740,584,433** |
+/// | `cram x` | **3.72 s** | 4.16 s |
+/// | `cram t` (decode only) | 1.51 s | 1.48 s |
+/// | `lz4 -dc \| tar` | **2.07 s** | 2.59 s |
+///
+/// Decode is *not* what gets slower — `cram t` is flat, so the cost lands in extraction, and in the
+/// pipe for anyone using the native tool. Paying 12% of our read speed and 24% of theirs to save 3%
+/// is backwards for the one codec chosen because it is fast to read; a caller who wants 3% has zstd
+/// beside it at 30% smaller. Recorded here so the 3.03% is not rediscovered and taken.
+const LZ4_BLOCK: BlockSize = BlockSize::Max64KB;
+
 const BR_BUF: usize = 256 << 10;
 
 /// The window brotli's own CLI uses by default, and what we have always asked for.
@@ -880,8 +920,12 @@ impl TarArchiveWriter {
             }
             Codec::Xz => TarSink::Chunked(ChunkedSink::new(file, ChunkCodec::Xz, opts.level)),
             Codec::Bzip2 => TarSink::Chunked(ChunkedSink::new(file, ChunkCodec::Bzip2, opts.level)),
-            // lz4 stays a single streaming frame; see [`ChunkCodec`] for why it is not chunked.
-            Codec::Lz4 => TarSink::Lz4(Box::new(FrameEncoder::new(file))),
+            // lz4 stays a single streaming frame; see [`ChunkCodec`] for why it is not chunked, and
+            // [`LZ4_BLOCK`] for why the frame info is set rather than left to default.
+            Codec::Lz4 => TarSink::Lz4(Box::new(FrameEncoder::with_frame_info(
+                FrameInfo::new().block_size(LZ4_BLOCK),
+                file,
+            ))),
             Codec::Brotli => TarSink::Br(Box::new(CompressorWriter::with_params(
                 file,
                 BR_BUF,

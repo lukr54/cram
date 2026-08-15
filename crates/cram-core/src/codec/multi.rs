@@ -52,6 +52,16 @@ const LOOKBACK: usize = 20;
 /// Bytes read per scan window.
 const SCAN_WIN: usize = 4 << 20;
 
+/// How far to read before giving up on a file that shows no second stream.
+///
+/// Without this the scan reads the **whole file** to discover it cannot be split, and that is a
+/// straight loss on every single-stream archive — measured at 0.47 s on a 763 MB `.tar.lz4`, which
+/// is a 13% regression on an extraction that gains nothing in return. Our own chunks compress to at
+/// most ~8 MB (xz's 32 MiB), and `pbzip2`/`lbzip2` are far finer, so a second boundary inside 64 MiB
+/// is a very safe bet. A foreign archive with streams larger than that reads sequentially, which is
+/// what it did before this module existed.
+const PROBE: u64 = 64 << 20;
+
 /// Decoded bytes per message. Matches the tar backend's own chunk, and bounds nothing on its own —
 /// the slot count and the piece window do that. See [`shape`].
 const CHUNK: usize = 1024 * 1024;
@@ -288,6 +298,11 @@ fn boundaries<R: Read>(mut src: R, kind: Separable) -> io::Result<Vec<u64>> {
             }
         }
         if eof {
+            return Ok(out);
+        }
+        // Nothing but the file's own start in the first [`PROBE`] bytes → not a run of streams.
+        // Stopping here is what keeps a single-stream archive from paying for a whole extra read.
+        if out.len() < 2 && base + have as u64 >= PROBE {
             return Ok(out);
         }
         // Carry enough that neither a header nor the lookback before it straddles two reads, and
@@ -678,6 +693,35 @@ mod tests {
         let b = boundaries(io::Cursor::new(&file), Separable::Bzip2).unwrap();
         assert_eq!(b, vec![0]);
         assert_eq!(merge(&b, file.len() as u64, MIN_PIECE).len(), 1);
+    }
+
+    /// A file whose second stream is beyond [`PROBE`] must be given up on rather than read whole:
+    /// scanning a single-stream archive to its end is a straight loss, since there is nothing to
+    /// find and the sequential decoder is about to read every byte again.
+    #[test]
+    fn a_file_with_no_second_stream_is_abandoned_early() {
+        // Only the scan is under test and it decodes nothing, so the body is filler rather than a
+        // real stream — compressing 96 MB of noise to prove a `find` returns None is 90 seconds of
+        // CI for no extra coverage. A byte that is not `B` cannot begin a bzip2 candidate.
+        let mut file = Vec::with_capacity(PROBE as usize + 2 * SCAN_WIN);
+        file.extend_from_slice(b"BZh9");
+        file.extend_from_slice(&BZ_BLOCK_MAGIC);
+        file.resize(PROBE as usize + 2 * SCAN_WIN, 0x5A);
+        assert!(file.len() as u64 > PROBE, "fixture must exceed the probe");
+        // A reader that refuses to serve past the probe plus one window: if the scan read further,
+        // it errors instead of quietly succeeding.
+        struct Capped(io::Cursor<Vec<u8>>, u64);
+        impl Read for Capped {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                if self.0.position() >= self.1 {
+                    return Err(io::Error::other("scan read past the probe"));
+                }
+                self.0.read(b)
+            }
+        }
+        let cap = PROBE + SCAN_WIN as u64;
+        let got = boundaries(Capped(io::Cursor::new(file), cap), Separable::Bzip2).unwrap();
+        assert_eq!(got, vec![0], "a lone stream must yield only its own start");
     }
 
     /// Anything that does not begin with a stream header is not this layout at all.
