@@ -415,6 +415,11 @@ pub struct SevenZRandomAccess {
     /// cram entry index → index into [`segmented`]'s flattened unit list. `None` for an entry whose
     /// block was not split.
     unit_of: Vec<Option<usize>>,
+    /// One worker's share of the block-cache budget, kept from `build_within` so
+    /// [`SevenZRandomAccess::entry_splits`] can apply the same test to a segment that
+    /// [`BlockPlan::fits`] applies to a block. Splitting an entry costs one segment resident per
+    /// worker and there is no way to make it cost less, so this decides whether to split at all.
+    per_thread: u64,
 }
 
 /// One block's LZMA2 segments, plus where its entries sit in the decoded stream.
@@ -469,6 +474,65 @@ fn segment_for_range(
         .partition_point(|s| s.unpacked_start <= target)
         .checked_sub(1)?;
     Some((si, target, len.min(size - start)))
+}
+
+/// Below this an entry is not worth splitting: the decode is short enough that scheduling
+/// dominates. Same floor `.cram` uses.
+const SPLIT_MIN: u64 = 32 << 20;
+
+/// The ranges an entry can be cut into, entry-relative, or `None` to leave it whole.
+///
+/// Split out from [`SevenZRandomAccess::entry_splits`] so the arithmetic can be tested without a
+/// segmented archive — cram writes many blocks, so nothing it produces is segmented, and building a
+/// fixture would mean writing a multi-threaded LZMA2 stream by hand. Same reason
+/// [`segment_for_range`] is a free function.
+///
+/// `per_thread` is one worker's share of the cache budget. Every worker holds one range at once, so
+/// the widest range is the thing that has to fit.
+fn splits_for_entry(
+    segs: &[lzma2seg::Segment],
+    entry_off: u64,
+    size: u64,
+    per_thread: u64,
+) -> Option<Vec<(u64, u64)>> {
+    if size < SPLIT_MIN {
+        return None;
+    }
+
+    // Segment starts falling strictly inside the entry, in entry-relative coordinates. A boundary at
+    // or before the entry's first byte is not a cut, and neither is one at or past its last.
+    let mut cuts: Vec<u64> = segs
+        .iter()
+        .map(|s| s.unpacked_start)
+        .filter(|&b| b > entry_off && b < entry_off + size)
+        .map(|b| b - entry_off)
+        .collect();
+    cuts.dedup();
+    if cuts.is_empty() {
+        return None;
+    }
+
+    let widest = cuts
+        .iter()
+        .chain(std::iter::once(&size))
+        .scan(0u64, |prev, &at| {
+            let len = at - *prev;
+            *prev = at;
+            Some(len)
+        })
+        .max()?;
+    if widest > per_thread {
+        return None;
+    }
+
+    let mut ranges = Vec::with_capacity(cuts.len() + 1);
+    let mut at = 0u64;
+    for cut in cuts {
+        ranges.push((at, cut - at));
+        at = cut;
+    }
+    ranges.push((at, size - at));
+    (ranges.len() > 1).then_some(ranges)
 }
 
 /// One unit of parallel work: a segment of a segmented block.
@@ -684,6 +748,7 @@ impl SevenZRandomAccess {
             blocks,
             segmented,
             unit_of,
+            per_thread,
         })
     }
 
@@ -1137,6 +1202,35 @@ impl crate::reader::RandomAccessReader for SevenZRandomAccess {
         }
     }
 
+    /// Cut a large entry at the LZMA2 segment boundaries inside it, so one file in a solid `.7z`
+    /// decodes on many cores instead of one.
+    ///
+    /// R7 is what made this possible. Before it, a ranged read decoded from the start of the block,
+    /// so cutting an entry into N pieces cost N block decodes — strictly worse than doing it once.
+    /// With the read bounded by the segment holding it, the pieces cost what they should.
+    ///
+    /// **The cut points are not negotiable.** A range must begin at a segment boundary, because that
+    /// is the only place a decoder can start cold; a range starting mid-segment would decode from
+    /// that segment's start and throw the lead-in away, so two neighbouring workers would decode the
+    /// same bytes. That also means a range can never be smaller than a segment — which is what makes
+    /// the memory test below a go/no-go rather than a tuning knob.
+    ///
+    /// **Memory, and why this refuses more often than `.cram`'s version does.** The engine's
+    /// `fill_split` decodes a window of ranges concurrently and each arrives as a `Vec`, so the
+    /// peak is one
+    /// segment resident per worker. A `.cram` pack is a few MiB; a 7z segment is 128 MiB at 7-Zip's
+    /// stock settings. Merging segments to reach a size target — which is what `.cram` does — makes
+    /// each range *larger*, so it cannot help here. The only thing left to decide is whether to
+    /// split at all, and the test is the one [`BlockPlan::fits`] already applies to a block: does
+    /// one of these fit one worker's share of the cache budget. Where it does not, this returns
+    /// `None` and extraction behaves exactly as it did.
+    fn entry_splits(&self, index: usize) -> Option<Vec<(u64, u64)>> {
+        let (block, file_idx, _) = self.placement(index)?;
+        let g = self.segmented.iter().find(|g| g.block == block)?;
+        let &(_, entry_off, size) = g.layout.iter().find(|&&(fi, _, _)| fi == file_idx)?;
+        splits_for_entry(&g.segs, entry_off, size, self.per_thread)
+    }
+
     /// The decode unit, so the engine keeps its entries on one worker and decodes it about once:
     /// the LZMA2 segment where the block was splittable, the block itself where it was not.
     ///
@@ -1439,6 +1533,82 @@ mod segment_range_tests {
                 unpacked: 100,
             })
             .collect()
+    }
+
+    /// `n` segments of `each` bytes, for the split tests, which need sizes above `SPLIT_MIN`.
+    fn big_segs(n: u64, each: u64) -> Vec<lzma2seg::Segment> {
+        (0..n)
+            .map(|i| lzma2seg::Segment {
+                comp_off: i * each / 2,
+                unpacked_start: i * each,
+                unpacked: each,
+            })
+            .collect()
+    }
+
+    /// The ranges must tile the entry exactly — contiguous, in order, every byte once. A gap loses
+    /// data and an overlap writes it twice, and an extraction size check would catch neither if they
+    /// happened to cancel.
+    #[test]
+    fn splits_tile_the_entry_and_cut_only_at_segment_boundaries() {
+        let each = 40 << 20;
+        let s = big_segs(4, each);
+        // An entry filling the whole of segments 1..4, so it has three interior boundaries.
+        let size = each * 3;
+        let r = splits_for_entry(&s, each, size, u64::MAX).expect("this entry is splittable");
+
+        assert_eq!(r.len(), 3, "one range per segment the entry covers");
+        let mut at = 0u64;
+        for (off, len) in &r {
+            assert_eq!(*off, at, "ranges must be contiguous and in order");
+            assert!(*len > 0, "an empty range is not a piece of work");
+            at += len;
+        }
+        assert_eq!(at, size, "the ranges must cover the entry exactly");
+        // Every cut lands on a boundary, which is the whole point: elsewhere two workers would
+        // decode the same segment.
+        for (off, _) in &r {
+            assert_eq!(
+                (each + off) % each,
+                0,
+                "cut at {off} is not a segment start"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_inside_one_segment_is_not_split() {
+        let s = big_segs(4, 40 << 20);
+        // Wholly inside segment 1: no interior boundary, so there is nothing to cut at.
+        assert!(splits_for_entry(&s, 40 << 20, 33 << 20, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn a_small_entry_is_left_whole_however_many_boundaries_it_spans() {
+        let s = big_segs(8, 1 << 20);
+        assert!(
+            splits_for_entry(&s, 0, (SPLIT_MIN) - 1, u64::MAX).is_none(),
+            "below the floor the scheduling costs more than the decode saves"
+        );
+    }
+
+    /// The memory gate. A 7z segment is 128 MiB at 7-Zip's stock settings and every worker holds
+    /// one, so where that does not fit this must decline and let the entry extract as it did.
+    #[test]
+    fn a_segment_too_large_for_one_worker_declines_to_split() {
+        let each = 128 << 20;
+        let s = big_segs(4, each);
+        let size = each * 3;
+
+        assert!(
+            splits_for_entry(&s, each, size, each).is_some(),
+            "a segment that exactly fits the budget is allowed"
+        );
+        assert!(
+            splits_for_entry(&s, each, size, each - 1).is_none(),
+            "one byte over the budget and the split is refused, not shrunk — merging ranges would \
+             only make them bigger"
+        );
     }
 
     #[test]

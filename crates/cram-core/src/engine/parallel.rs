@@ -258,6 +258,30 @@ pub fn run(
             // entries stream out as they decode instead of being held. See
             // `RandomAccessReader::copy_unit`.
             if ra.streams_units() {
+                // **Unless the group is one entry, and the backend can name seams inside it.**
+                // `extract_unit` amortises a decode across the entries sharing it, and a group of
+                // one has nothing to amortise — it streams the whole unit on a single thread, which
+                // is exactly the 7z single-entry loss (enwik9 from a solid `.7z`: 6.97 s at 100%
+                // CPU against 7-Zip's 1.63 at 445%). Where `entry_splits` answers, the seams are
+                // real and each piece decodes from its own LZMA2 segment, so the per-entry path is
+                // the better one here despite the backend streaming units in general.
+                //
+                // Asking twice — once here, once inside `extract_one` — is deliberate: falling into
+                // `extract_one` without splits would use `copy_entry`, and for a solid backend that
+                // decodes the block and *holds* it, which is the thing `extract_unit` exists to
+                // avoid. The question is cheap; the wrong answer costs gigabytes.
+                if split_entries && group.len() == 1 && ra.entry_splits(group[0]).is_some() {
+                    let i = group[0];
+                    sink.wait_if_paused();
+                    if sink.is_cancelled() {
+                        return;
+                    }
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        extract_one(ra, dest, i, &entries[i], skip_existing, sink, created, true)
+                    }));
+                    record(i, outcome);
+                    return;
+                }
                 extract_unit(
                     ra,
                     dest,
