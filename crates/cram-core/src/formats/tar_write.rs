@@ -640,7 +640,7 @@ fn zstd_level(level: Level) -> i32 {
     match level {
         Level::Auto | Level::Balanced => 3,
         Level::Fastest => 1,
-        Level::Best | Level::Cold => 19,
+        Level::Best | Level::Cold | Level::Tiny => 19,
         Level::Explicit(n) => (n as i32 * 2).clamp(1, 19),
     }
 }
@@ -763,7 +763,9 @@ fn preset(level: Level) -> u32 {
     match level {
         Level::Auto | Level::Balanced => 6,
         Level::Fastest => 1,
-        Level::Best | Level::Cold => 9,
+        // No slower DEFLATE/xz encoder to reach for here: zopfli is wired into the zip writer, and a
+        // `.tar.gz` is chunked, which zopfli's whole-stream search does not fit.
+        Level::Best | Level::Cold | Level::Tiny => 9,
         Level::Explicit(n) => n.clamp(0, 9),
     }
 }
@@ -778,7 +780,7 @@ fn br_quality(level: Level) -> u32 {
     match level {
         Level::Fastest => 2,
         Level::Auto | Level::Balanced => 6,
-        Level::Best | Level::Cold => 11,
+        Level::Best | Level::Cold | Level::Tiny => 11,
         Level::Explicit(n) => n.clamp(0, 11),
     }
 }

@@ -87,6 +87,20 @@ fn file_options(
     if method != CompressionMethod::Stored {
         opts = opts.compression_level(level);
     }
+    // Feed zopfli in blocks the size it asks for. The zip crate defaults this to 32 KiB; zopfli's own
+    // `new_buffered` uses `ZOPFLI_MASTER_BLOCK_SIZE`, 1,000,000, and its docs say large chunks are
+    // "necessary for decent performance and good compression ratio".
+    //
+    // **Measured as a no-op today, and kept anyway.** Silesia came out byte-identical at 32 KiB and
+    // at 1 MB, because the buffer never fills: `compress_one` hands the encoder a whole entry in one
+    // `write_all`, and a `BufWriter` passes a write larger than its capacity straight through. So
+    // zopfli already sees each entry entire, which is the case the buffer exists to approximate.
+    // This matters the moment anything writes an entry in pieces — the streaming path for entries
+    // over `PARALLEL_ENTRY_MAX` is one — and it is the difference between that path quietly losing
+    // ratio and not.
+    if matches!(level, Some(n) if n >= ZOPFLI_MIN_LEVEL) {
+        opts = opts.with_zopfli_buffer(Some(ZOPFLI_BLOCK));
+    }
     if large {
         opts = opts.large_file(true);
     }
@@ -447,14 +461,31 @@ fn compress_one(
 }
 
 /// Map the abstract [`Level`] onto DEFLATE's 0–9 scale (`None` = the crate default, 6).
+///
+/// **Above 9 the zip crate switches encoder**, which is how [`Level::Tiny`] reaches zopfli: 0–9 go to
+/// flate2, 10–264 to zopfli with `level - 9` iterations. 24 is therefore 15 iterations, which is both
+/// the zip crate's own default when zopfli is the only encoder and the reference zopfli CLI's
+/// default. The output is ordinary DEFLATE — every unzip reads it — just searched for much harder.
 fn deflate_level(level: Level) -> Option<i64> {
     match level {
         Level::Auto | Level::Balanced => None,
         Level::Fastest => Some(1),
         Level::Best | Level::Cold => Some(9),
+        Level::Tiny => Some(ZOPFLI_LEVEL),
         Level::Explicit(n) => Some((n as i64).clamp(0, 9)),
     }
 }
+
+/// 15 zopfli iterations. See [`deflate_level`].
+const ZOPFLI_LEVEL: i64 = 24;
+
+/// The level at or above which the zip crate switches to zopfli.
+const ZOPFLI_MIN_LEVEL: i64 = 10;
+
+/// `zopfli::util::ZOPFLI_MASTER_BLOCK_SIZE`, which is what zopfli's own `new_buffered` uses and what
+/// its docs call necessary for a good ratio. Not re-exported by the zip crate, so it is repeated
+/// here; if it ever diverges the cost is ratio, not correctness.
+const ZOPFLI_BLOCK: usize = 1_000_000;
 
 impl ArchiveWriter for ZipArchiveWriter {
     fn takes_paths(&self) -> bool {
@@ -635,5 +666,108 @@ mod mtime_guard_tests {
         // A real 2020 timestamp converts.
         let real = UNIX_EPOCH + Duration::from_secs(1_577_934_246);
         assert!(zip_datetime(Some(real)).is_some());
+    }
+
+    /// `--tiny` has to clear the zip crate's encoder switch, which is a plain numeric threshold:
+    /// 0–9 go to flate2, 10 and above to zopfli with `level - 9` iterations. Getting this wrong
+    /// does not fail — it silently writes an ordinary level-9 archive and the flag does nothing.
+    /// A level too low to reach zopfli fails the **build**, not a test somebody might not run.
+    /// Getting it wrong is silent otherwise: `--tiny` would write an ordinary level-9 archive.
+    const _TINY_REACHES_ZOPFLI: () = assert!(ZOPFLI_LEVEL >= ZOPFLI_MIN_LEVEL);
+
+    #[test]
+    fn tiny_asks_for_a_level_that_reaches_zopfli() {
+        assert_eq!(deflate_level(Level::Tiny), Some(ZOPFLI_LEVEL));
+        // Every other rung must stay on the fast encoder, or --small would silently become --tiny.
+        for lvl in [
+            Level::Auto,
+            Level::Balanced,
+            Level::Fastest,
+            Level::Best,
+            Level::Cold,
+        ] {
+            if let Some(n) = deflate_level(lvl) {
+                assert!(
+                    n < ZOPFLI_MIN_LEVEL,
+                    "{lvl:?} maps to {n}, which would reach zopfli"
+                );
+            }
+        }
+    }
+
+    /// The point of zopfli is a smaller archive that is still an ordinary `.zip`. Assert both: the
+    /// bytes shrink against `--small`, and the result round-trips through the normal reader.
+    #[test]
+    fn tiny_writes_a_smaller_zip_that_still_reads_back() {
+        use crate::model::{EntryKind, EntryPath};
+
+        let dir = std::env::temp_dir().join(format!("cram-tiny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Compressible but not trivially so, and big enough that the extra search has something to
+        // find: a few hundred KiB of pseudo-English from a modest vocabulary.
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let vocab: Vec<String> = (0..600)
+            .map(|_| {
+                let n = 3 + (rng() % 8) as usize;
+                (0..n)
+                    .map(|_| (b'a' + (rng() % 26) as u8) as char)
+                    .collect()
+            })
+            .collect();
+        let mut body = Vec::with_capacity(400 << 10);
+        while body.len() < (400 << 10) {
+            body.extend_from_slice(vocab[(rng() % vocab.len() as u64) as usize].as_bytes());
+            body.push(b' ');
+        }
+
+        let write = |level: Level, name: &str| -> u64 {
+            let path = dir.join(name);
+            let mut opts = CreateOptions {
+                level,
+                ..Default::default()
+            };
+            opts.total_bytes = Some(body.len() as u64);
+            let mut w = Box::new(ZipArchiveWriter::create(&path, &opts).unwrap());
+            let entry = Entry {
+                index: 0,
+                path: EntryPath::from_raw("doc.txt").unwrap(),
+                kind: EntryKind::File,
+                size: body.len() as u64,
+                compressed_size: None,
+                modified: None,
+                unix_mode: None,
+                crc32: None,
+                encrypted: false,
+            };
+            w.add_file(&entry, &mut &body[..], WriteHint::default())
+                .unwrap();
+            w.finish().unwrap();
+            std::fs::metadata(&path).unwrap().len()
+        };
+
+        let small = write(Level::Cold, "small.zip");
+        let tiny = write(Level::Tiny, "tiny.zip");
+        assert!(
+            tiny < small,
+            "zopfli must beat level 9, got {tiny} against {small} — if they are equal the level \
+             never reached the zopfli encoder"
+        );
+
+        // Still an ordinary zip: read it back through the normal reader and compare the bytes.
+        let f = std::fs::File::open(dir.join("tiny.zip")).unwrap();
+        let mut zr = zip::ZipArchive::new(f).unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut zr.by_index(0).unwrap(), &mut got).unwrap();
+        assert_eq!(got, body, "the zopfli archive must decode to the original");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

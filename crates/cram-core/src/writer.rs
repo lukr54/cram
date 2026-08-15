@@ -55,6 +55,20 @@ pub enum Level {
     ///
     /// Only `.cram` distinguishes this from `Best`; every other container treats the two alike.
     Cold,
+    /// Smaller than [`Cold`](Self::Cold) where a slower encoder exists for the same format, at a cost
+    /// in time that is not proportionate and is not meant to be.
+    ///
+    /// Today that means exactly one thing: `.zip` is written with **zopfli** instead of the ordinary
+    /// DEFLATE encoder. Zopfli emits a bit-identical-format DEFLATE stream that every unzip on earth
+    /// already reads — it simply searches much harder for it, so nothing about the archive is
+    /// unusual except that it is smaller.
+    ///
+    /// It is a **separate rung rather than part of `Cold`** because the trade is different in kind.
+    /// `Cold` is slower for a better answer; this is slower for a *slightly* better answer, and the
+    /// multiple is large enough that folding it into `--small` would make that flag mean something
+    /// people would stop using. Every container without a slower encoder to reach for treats this
+    /// exactly as `Cold`.
+    Tiny,
     /// Raw codec level (meaning is codec-specific); clamped to the codec's valid range.
     Explicit(u32),
 }

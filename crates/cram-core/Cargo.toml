@@ -34,7 +34,15 @@ time = "0.3"                                                            # ZIP DO
 # that meta pulls `deflate-flate2-zlib-rs`, and zlib-rs 0.6.6 has an integer-overflow panic in inflate
 # that crashes on real-world DEFLATE streams (e.g. large game-repack .zip payloads). miniz_oxide is the
 # heavily-fuzzed pure-Rust inflate and decodes them correctly.
-zip = { version = "8", default-features = false, features = ["deflate-flate2", "aes-crypto", "time"] }
+# `deflate-zopfli` is what `--tiny` reaches for. It adds ONLY the pure-Rust `zopfli` crate -- it does
+# not touch flate2 or its backend -- so the zlib-rs rule above is unaffected. The zip crate switches
+# on the level: 0-9 go to flate2, 10-264 to zopfli with `level - 9` iterations.
+zip = { version = "8", default-features = false, features = [
+    "deflate-flate2",
+    "deflate-zopfli",
+    "aes-crypto",
+    "time",
+] }
 # RAR read-only via the official UnRAR C++ engine (creating RAR is legally forbidden). Needs the
 # mingw link flags in ../../.cargo/config.toml.
 unrar = "0.5"

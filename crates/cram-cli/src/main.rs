@@ -3,7 +3,7 @@
 //! ```text
 //! cram l  <archive>                            list entries
 //! cram x  <archive> [-o <dir>] [-p <pw>]       extract (parallel per-entry for ZIP) [--skip]
-//! cram a  <archive> <input...> [-p <pw>]       create [--fast|--auto|--small|--store] [--encrypt-names]
+//! cram a  <archive> <input...> [-p <pw>]       create [--fast|--auto|--small|--tiny|--store] [--encrypt-names]
 //!                                              [--overwrite] to replace an existing <archive>
 //! cram t  <archive> [-p <pw>]                  test integrity (decode + checksums, no extract)
 //! cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format
@@ -328,25 +328,28 @@ const USAGE: &str = "\
 usage: cram <command> …
   l  <archive>                        list entries
   x  <archive> [-o <dir>] [-p <pw>]   extract [--skip]
-  a  <archive> <input...> [-p <pw>]   create [--fast|--auto|--small|--store] [--encrypt-names]
-       [--solid|--no-solid]
+  a  <archive> <input...> [-p <pw>]   create [--fast|--auto|--small|--tiny|--store]
+       [--encrypt-names] [--solid|--no-solid]
        --fast is the quickest and still compresses; --auto (the default) balances; --small
        is as small as cram goes -- the widest window the format allows, LZMA's extreme
        match search, and a per-pack search over pre-filters and coder parameters, for a
        few times the time of --auto
+       --tiny is --small plus, for a .zip only, zopfli in place of the usual DEFLATE
+       encoder. Same format -- every unzip reads it -- searched much harder, for a few
+       percent off at many times the time. Other formats treat it exactly as --small
        --store writes the bytes uncompressed (dedup still runs). It is NOT the fast option:
        it ties --fast on create and extracts slower, because it moves several times the
        bytes. Use it when something will read parts of the archive without decompressing
        --recompress losslessly recompresses JPEGs, ~23% off each one with the exact
        originals restored on extract. It is slow -- roughly 4x the create time -- so it
-       is on only with --small or when asked for by name; --no-recompress overrides both
+       is on only with --small/--tiny or when asked for by name; --no-recompress overrides
        --no-solid (7z) writes one independently-decodable pack per entry instead of
        packing members together. Much larger archive, and cheaper to read one member out
        of. Solid is the default and --solid says so explicitly
        --overwrite (-y) replaces an existing <archive>; without it cram refuses, because
        `a` creates a new archive rather than adding to one
   t  <archive> [-p <pw>]              test integrity (decode + checksums, no extract)
-  conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--fast|--auto|--small|--store]
+  conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--fast|--auto|--small|--tiny|--store]
        also refuses an existing <out> unless --overwrite
   dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]
        several urls = mirrors of one file · --discover finds mirrors · --auto ramps
@@ -1398,7 +1401,11 @@ fn thousands(n: u64) -> String {
 /// of an archive without decompressing anything, which is a mount property, so it stays a flag
 /// rather than a rung.
 fn level_for(args: &[String]) -> Level {
-    if has(args, "--small") || has(args, "--best") || has(args, "--cold") {
+    // `--tiny` is checked first so `--small --tiny` means the smaller of the two rather than
+    // whichever happens to be tested earlier.
+    if has(args, "--tiny") {
+        Level::Tiny
+    } else if has(args, "--small") || has(args, "--best") || has(args, "--cold") {
         Level::Cold
     } else if has(args, "--fast") {
         Level::Fastest
@@ -1411,12 +1418,13 @@ fn recompress_choice(args: &[String]) -> bool {
     if has(args, "--no-recompress") {
         return false;
     }
-    has(args, "--recompress") || matches!(level_for(args), Level::Cold)
+    has(args, "--recompress") || matches!(level_for(args), Level::Cold | Level::Tiny)
 }
 
 fn create_inputs(args: &[String]) -> Vec<PathBuf> {
     const CREATE_FLAGS: &[&str] = &[
         "--small",
+        "--tiny",
         "--auto",
         "--fast",
         "--store",
@@ -1583,6 +1591,7 @@ fn convert_cmd(args: &[String]) -> Result<()> {
         2,
         &[
             "--small",
+            "--tiny",
             "--auto",
             "--fast",
             "--store",

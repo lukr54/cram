@@ -236,7 +236,9 @@ fn pack_target_for(level: Level) -> usize {
         // As large as the format permits. A pack is the window every match has to be found inside,
         // and 32 -> 64 MiB measured 0.7% on Silesia; the ceiling is what a reader is obliged to
         // accept ([`MAX_PACK_RAW`]), less the one chunk a pack may overshoot its target by.
-        Level::Cold => MAX_PACK_RAW - CHUNK_MAX as usize,
+        // `Tiny` buys its extra only where a slower encoder exists, and `.cram` has none beyond
+        // `Cold`. Same pack size, same everything.
+        Level::Cold | Level::Tiny => MAX_PACK_RAW - CHUNK_MAX as usize,
     }
 }
 
@@ -454,7 +456,7 @@ fn preset(level: Level) -> u32 {
     match level {
         Level::Auto | Level::Balanced => 6,
         Level::Fastest => 1,
-        Level::Best | Level::Cold => 9,
+        Level::Best | Level::Cold | Level::Tiny => 9,
         Level::Explicit(n) => n.clamp(0, 9),
     }
 }
