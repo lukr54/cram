@@ -17,6 +17,11 @@ use crate::format::Codec as StreamCodec;
 
 pub mod plan;
 
+/// Decoding a run of concatenated streams on a pool instead of one at a time. Sits beside
+/// [`decode_stream`] rather than inside it because it needs the *file*, not a reader: the seams are
+/// found by scanning, and each span is decoded from its own handle.
+pub(crate) mod multi;
+
 /// Frame walking for the codecs whose streams concatenate in the format but whose crate decodes
 /// only the first frame. Both zstd and lz4 need it and both use the same skippable-frame layout, so
 /// the machinery is shared and the codec-specific parts sit inside.

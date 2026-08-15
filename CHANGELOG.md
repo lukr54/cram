@@ -11,14 +11,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Things that ran on one thread, and one that could not run at all.
 
-**Reading a `.tar.*` was the largest weakness in the project and is now, on `.tar.gz`, faster than
-the tool everyone already has.** Every codec improved by the same two-line change: the tar worker
-allocated and zeroed a megabyte for **every entry** — 94,778 of them on the Linux kernel tree, to
-carry files averaging 20 KB — and passed the results over a one-slot channel, so the decoder could
-never get more than one message ahead of whoever was writing the files. Kernel tree: `.tar.gz` 13.99 s
-→ **5.53 s**, against `gzip -dc | tar`'s 6.18; `.tar.zst` 11.94 → 3.89; `.tar.lz4` 10.95 → 3.73;
-`.tar.br` 15.77 → 6.08; `.tar.xz` 29.49 → 20.55; `.tar.bz2` 70.53 → 60.93. Writing the 94,778 files
-was never the cost — that is 0.32 s — and neither was inflate.
+**Reading a `.tar.*` was the largest weakness in the project and is now, on `.tar.gz` and `.tar.xz`,
+faster than the tools everyone already has.** Every codec improved by the same two-line change: the
+tar worker allocated and zeroed a megabyte for **every entry** — 94,778 of them on the Linux kernel
+tree, to carry files averaging 20 KB — and passed the results over a one-slot channel, so the decoder
+could never get more than one message ahead of whoever was writing the files. Kernel tree:
+`.tar.gz` 13.99 s → **5.58 s** against `gzip -dc | tar`'s 6.17; `.tar.zst` 11.94 → 3.93;
+`.tar.lz4` 10.95 → 3.66; `.tar.br` 15.77 → 6.05. Writing the 94,778 files was never the cost — that
+is 0.32 s — and neither was inflate.
+
+**A `.tar.bz2` or `.tar.xz` now decodes on every core.** Compressing on every core means cutting the
+tar into chunks and writing each as a complete standalone stream, and we had been writing those
+seams for months and then reading them back one at a time. They are findable: a bzip2 stream begins
+with a header the previous stream's end-of-stream magic sits in front of, and an xz stream with a
+header whose CRC checks out behind a `YZ` footer. Cram scans for them, decodes the spans between
+them on a pool, and yields the bytes in order. `.tar.xz` 20.79 s → **6.61 s**, which passes
+`xz -dc | tar` at 8.89; `.tar.bz2` 62.08 → **7.46**, against `bunzip2 -c | tar`'s 34.81.
+
+This works on any archive that is a run of concatenated streams, not only cram's own — `pbzip2` and
+`lbzip2` output, Wikipedia multistream dumps, `cat a.xz b.xz` — and a single-stream archive falls
+back to the sequential decoder unchanged. Nothing about what cram *writes* changed. A false seam
+cannot corrupt an extraction silently, since the spans either side of it fail to decode. Bare `.xz`
+and `.bz2` files take the same path. `CRAM_PARALLEL_DECODE=0` turns it off.
 
 **One big file into a `.7z` used one core**, because solid mode asks for one uninterrupted LZMA2
 stream per pack and an archive of a single file is a single pack. enwik9 went from 375 s at 99% CPU

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::codec::decode_stream;
+use crate::codec::{decode_stream, multi};
 use crate::error::{ArchiveError, Result};
 use crate::format::Format;
 use crate::model::{Entry, EntryKind, EntryPath};
@@ -61,7 +61,20 @@ enum TarMsg {
     Err(String),
 }
 
-fn open_decoded(path: &Path, fmt: Format) -> Result<Box<dyn Read + Send>> {
+/// The decoded byte stream, in parallel where the file allows it.
+///
+/// Both passes come through here — the header-only pass and the extraction pass — and both decode
+/// every byte, so both are worth parallelising. `plan` is computed once by [`TarReader::open`] and
+/// handed to each, because scanning for the seams costs a read of the file and doing it twice would
+/// give a quarter of it back.
+fn open_decoded(
+    path: &Path,
+    fmt: Format,
+    plan: Option<&Arc<multi::Plan>>,
+) -> Result<Box<dyn Read + Send>> {
+    if let Some(p) = plan {
+        return Ok(multi::open(p));
+    }
     let file: Box<dyn Read + Send> = Box::new(File::open(path)?);
     decode_stream(fmt.codec, file)
 }
@@ -109,15 +122,20 @@ fn materializable(et: tar::EntryType) -> bool {
 }
 
 /// Header-only pass → the entry list (data is skipped by the iterator). Also validates the archive.
-fn scan(path: &Path, fmt: Format) -> Result<Vec<Entry>> {
-    scan_with_cap(path, fmt, MAX_SCAN_META)
+fn scan(path: &Path, fmt: Format, plan: Option<&Arc<multi::Plan>>) -> Result<Vec<Entry>> {
+    scan_with_cap(path, fmt, plan, MAX_SCAN_META)
 }
 
 /// [`scan`] with an explicit metadata budget (see [`MAX_SCAN_META`]); split out so the bound is
 /// testable without synthesizing a multi-GB archive.
-fn scan_with_cap(path: &Path, fmt: Format, cap: u64) -> Result<Vec<Entry>> {
+fn scan_with_cap(
+    path: &Path,
+    fmt: Format,
+    plan: Option<&Arc<multi::Plan>>,
+    cap: u64,
+) -> Result<Vec<Entry>> {
     const PER_ENTRY_OVERHEAD: u64 = 256;
-    let mut archive = tar::Archive::new(open_decoded(path, fmt)?);
+    let mut archive = tar::Archive::new(open_decoded(path, fmt, plan)?);
     let mut out = Vec::new();
     let mut meta: u64 = 0;
     for item in archive.entries()? {
@@ -279,17 +297,22 @@ pub struct TarReader {
     entries: Vec<Entry>,
     rx: Option<Receiver<TarMsg>>,
     started: bool,
+    /// Where the archive's independent streams begin, when it has more than one. `None` means the
+    /// sequential decoder: a codec written as a single stream, a foreign archive, or the override.
+    plan: Option<Arc<multi::Plan>>,
 }
 
 impl TarReader {
     pub fn open(path: &Path, fmt: Format, _pw: Arc<dyn PasswordProvider>) -> Result<Self> {
-        let entries = scan(path, fmt)?;
+        let plan = multi::plan(path, fmt.codec);
+        let entries = scan(path, fmt, plan.as_ref())?;
         Ok(Self {
             path: path.to_path_buf(),
             fmt,
             entries,
             rx: None,
             started: false,
+            plan,
         })
     }
 
@@ -300,7 +323,7 @@ impl TarReader {
         }
         self.started = true;
         let (tx, rx) = sync_channel::<TarMsg>(STREAM_DEPTH);
-        let reader = open_decoded(&self.path, self.fmt)?;
+        let reader = open_decoded(&self.path, self.fmt, self.plan.as_ref())?;
         thread::spawn(move || worker(reader, tx));
         self.rx = Some(rx);
         Ok(())
@@ -463,11 +486,11 @@ mod scan_cap_tests {
         let fmt = Format::tar(Codec::None);
         // A tiny budget (smaller than 64 names + overhead) must trip the guard.
         assert!(
-            scan_with_cap(&tar, fmt, 256).is_err(),
+            scan_with_cap(&tar, fmt, None, 256).is_err(),
             "a metadata flood must be refused before the Vec grows unbounded"
         );
         // The production budget lists every member (64 files + their parent dir).
-        assert!(scan_with_cap(&tar, fmt, MAX_SCAN_META).unwrap().len() >= 64);
+        assert!(scan_with_cap(&tar, fmt, None, MAX_SCAN_META).unwrap().len() >= 64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

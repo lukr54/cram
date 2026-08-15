@@ -857,13 +857,55 @@ stops a producer buffering a whole archive.
 **`bz2` deserves its own sentence.** `lbzip2` reads that archive at **1373% CPU**, because cram's
 chunked writer hands it concatenated independent streams. We write those seams for five of the six
 codecs and still walk them serially, which is where the remaining gaps live. The competitor is
-parallel on our own output and we are not.
+parallel on our own output and we are not. Finding 23 is that sentence being acted on.
 
 **Lesson worth more than the fix:** three hypotheses were formed by reading code and profiles, and the
 thing that settled it was decomposing the measurement — `cram t` against `cram x` against the native
 tool — which took one command and could have been the first step.
 
 ---
+
+## 23. The seams were already in the file, and the buffer mattered more than the pool
+
+Finding 22 ended by observing that cram writes concatenated independent streams for five of six
+codecs and then reads them one at a time. A ten-minute kill-test priced that: split a cram-written
+kernel-tree `.tar.bz2` at its 477 stream boundaries and run 24 stock `bunzip2` at once, and 33.35 s
+of serial decode becomes **2.15 s**. Every one of the 477 decoded, which validates the boundary scan
+against real data — a false boundary produces a decode error rather than silence.
+
+Building it is a scanner, a bounded pool, and a `Read` that yields in order — `codec/multi.rs`. The
+part worth recording is what happened next.
+
+**The first working version moved bzip2 6.96× and xz 1.16×, off the same pool at the same width.**
+Same code, same twenty-four workers; one codec transformed, the other barely touched. The cause was
+not the pool. A worker may buffer `slots × CHUNK` of its piece and then blocks, so the rest of that
+piece reaches the consumer at **one-worker speed** when its turn comes:
+
+| codec | writer's chunk | buffer at 4 slots | predicted ceiling | measured |
+|---|---|---|---|---|
+| bzip2 | 4 MiB | 4 MiB | none — it fits | 6.96× |
+| xz | 32 MiB | 4 MiB | 32/4 = 1.14× | **1.16×** |
+
+Sizing the buffer against the piece first, and letting the width take what is left of a fixed
+budget, is what `shape()` does. xz then runs five workers each able to hold a whole 32 MiB piece,
+and bzip2 twenty-four:
+
+| kernel tree, `/dev/shm` | before | after | native | |
+|---|---|---|---|---|
+| `.tar.xz` | 20.79 s | **6.61 s** | `xz -dc \| tar` 8.89 s | **1.35× faster** |
+| `.tar.bz2` | 62.08 s | **7.46 s** | `lbzip2 \| tar` 3.25 s | 2.30× |
+
+**Where the rest of `bz2` lives, decomposed rather than guessed.** `cram t` decodes without writing:
+5.43 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57. So the pool works, and what remains is
+CPU per byte — **90 CPU-seconds against `bunzip2`'s 33** for the same data. That is not cram's
+machinery: on `gz` the identical pipeline costs 4.7 CPU-seconds against `gzip -dc`'s 5.74, which is
+*cheaper* than the reference. It is the pure-Rust bzip2 backend, and at 1662% CPU on a 24-thread
+machine no amount of extra width can close a 3.25× gap.
+
+**Two lessons.** A pool at 149% CPU with workers to spare is a buffer problem, not a scheduling
+problem — measure the per-item buffer against the item before touching the worker count. And the
+codec whose numbers look worst is not always the one with the defect: xz and bzip2 shared a pool and
+only one of them was being served by it.
 
 ## Fixed since this document was written
 

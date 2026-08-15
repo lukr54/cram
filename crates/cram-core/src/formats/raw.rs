@@ -5,10 +5,10 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::codec::decode_stream;
+use crate::codec::{decode_stream, multi};
 use crate::error::Result;
 use crate::format::Format;
 use crate::model::{Entry, EntryKind, EntryPath};
@@ -17,10 +17,14 @@ use crate::secret::PasswordProvider;
 
 /// A `foo.gz` / `foo.xz` opened as a one-entry stream.
 pub struct RawReader {
+    path: PathBuf,
     fmt: Format,
     entries: Vec<Entry>,
-    /// The decoded stream, taken on the first `next_entry`.
-    body: Option<Box<dyn Read + Send>>,
+    /// Whether the one entry has been handed out yet. The decoder is built on demand rather than at
+    /// open: a multi-stream file is scanned for its seams so it can decode on a pool
+    /// ([`multi`]), and that costs a read of the file — which `cram l` should not pay to list a
+    /// single entry it already knows the name of.
+    taken: bool,
 }
 
 impl RawReader {
@@ -44,13 +48,25 @@ impl RawReader {
             crc32: None,
             encrypted: false,
         };
-        let file: Box<dyn Read + Send> = Box::new(File::open(path)?);
-        let body = decode_stream(fmt.codec, file)?;
+        // Opened and dropped, so an unreadable file is still reported here rather than at the first
+        // read, which is where callers expect it.
+        File::open(path)?;
         Ok(Self {
+            path: path.to_path_buf(),
             fmt,
             entries: vec![entry],
-            body: Some(body),
+            taken: false,
         })
+    }
+
+    /// The decoded stream, on a pool if the file is a run of independent streams — `pbzip2` output,
+    /// a Wikipedia multistream dump, `cat a.xz b.xz`, or anything we wrote ourselves.
+    fn body(&self) -> Result<Box<dyn Read + Send>> {
+        if let Some(plan) = multi::plan(&self.path, self.fmt.codec) {
+            return Ok(multi::open(&plan));
+        }
+        let file: Box<dyn Read + Send> = Box::new(File::open(&self.path)?);
+        decode_stream(self.fmt.codec, file)
     }
 }
 
@@ -64,13 +80,14 @@ impl ArchiveReader for RawReader {
     }
 
     fn next_entry(&mut self) -> Result<Option<EntryStream<'_>>> {
-        match self.body.take() {
-            Some(body) => Ok(Some(EntryStream {
-                entry: self.entries[0].clone(),
-                body,
-                meta_final: false,
-            })),
-            None => Ok(None),
+        if self.taken {
+            return Ok(None);
         }
+        self.taken = true;
+        Ok(Some(EntryStream {
+            entry: self.entries[0].clone(),
+            body: self.body()?,
+            meta_final: false,
+        }))
     }
 }

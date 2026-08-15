@@ -321,6 +321,34 @@ compressed files, and `.cram`. Write: ZIP, 7z, tar, `.cram`.
 `Format::is_writable` returns false for it and `formats::create` rejects it before any backend is
 constructed.
 
+### Decoding a run of concatenated streams
+
+A whole-stream codec normally decodes through `codec::decode_stream`, which takes a reader and hands
+back a reader. `codec::multi` sits beside it rather than inside it, because splitting a file needs
+the **file**: the seams are found by scanning and each span is decoded from its own handle.
+
+Three things about it are not obvious from the code:
+
+- **The buffer decides the speedup, not the width.** A worker holds `slots × CHUNK` of its piece and
+  then blocks, so whatever does not fit reaches the consumer at one-worker speed. With a fixed
+  four-chunk buffer, bzip2's 4 MiB pieces gave 6.96× and xz's 32 MiB pieces gave 1.16× — `32/4`.
+  `shape()` therefore sizes the buffer against the piece first and spends what is left of the budget
+  on width. Changing one without the other is how this gets silently undone.
+- **The window is released by the consumer, not by a worker finishing.** A worker that completed a
+  piece and moved on leaves that piece's decoded bytes sitting in its channel, so bounding the
+  workers bounds nothing. Claims are handed out in increasing order, which is also what makes the
+  window deadlock-free: the piece the consumer waits on was claimed before any piece ahead of it, so
+  it is always inside the window.
+- **A missed seam and a false seam are not symmetric.** A missed one costs parallelism. A false one
+  cannot corrupt an extraction quietly, because the span before it is a truncated stream and the
+  span after it starts mid-data, so both fail to decode. That asymmetry is why a scan is acceptable
+  here at all, and it is why each candidate is checked against the *previous* stream's ending as
+  well as its own header.
+
+`Drop` must both stop the gate and drop the receivers: the first releases workers waiting on the
+window, the second makes a blocked `send` fail, and a worker part-way through a piece needs the
+second to learn it should quit.
+
 ---
 
 ## 6. The `.cram` format
