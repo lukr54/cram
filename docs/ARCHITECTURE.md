@@ -128,6 +128,17 @@ measured:
   the same pack; the engine decodes a window of pieces concurrently and writes them in order, which
   needs no positional writes and leaves every rule around the bytes where it was.
 
+  **7z implements it against LZMA2 dictionary resets**, which is what makes 7-Zip's one-folder default
+  divisible. Two things about it are not obvious. A range must *begin* on a segment boundary — that is
+  the only place a decoder starts cold — so a range can never be smaller than a segment, and merging
+  ranges to hit a size target (which is what `.cram` does) can only make them larger. Peak memory is
+  therefore one segment per worker whatever the policy, so the decision is go/no-go rather than a
+  tuning knob, and it uses the same test `BlockPlan::fits` applies to a block. And a `streams_units`
+  backend does not reach `entry_splits` by default: `extract_unit` exists to amortise one decode
+  across the entries sharing it, so a group holding a *single* entry has nothing to amortise and is
+  routed to the per-entry path instead. Without that routing the method is unreachable for 7z and
+  measures as a no-op.
+
 **A block that will not fit the cache is streamed, not refused.** Both the archive-level gate and the
 segment gate used to judge the wrong quantity, and between them a `.7z` written by a
 single-threaded encoder fell out of this path entirely and back onto the sequential reader. The

@@ -334,10 +334,10 @@ same way.
 ```
 cram l  <archive>                                 list entries
 cram x  <archive> [-o <dir>] [-p <pw>] [--skip]   extract
-cram a  <archive> <input...> [-p <pw>]            create [--fast|--auto|--small|--store]
+cram a  <archive> <input...> [-p <pw>]            create [--fast|--auto|--small|--tiny|--store]
            [--solid|--no-solid] [--overwrite]     [--overwrite] replaces an existing <archive>
 cram t  <archive> [-p <pw>]                       test integrity (decode + checksums, no extract)
-cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--fast|--auto|--small]
+cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--fast|--auto|--small|--tiny]
            [--overwrite]                          [--overwrite] replaces an existing <out>
 cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]
                                                   segmented download; several URLs are mirrors of

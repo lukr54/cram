@@ -11,6 +11,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Things that ran on one thread, and one that could not run at all.
 
+**Reading a `.tar.*` was the largest weakness in the project and is now, on `.tar.gz`, faster than
+the tool everyone already has.** Every codec improved by the same two-line change: the tar worker
+allocated and zeroed a megabyte for **every entry** — 94,778 of them on the Linux kernel tree, to
+carry files averaging 20 KB — and passed the results over a one-slot channel, so the decoder could
+never get more than one message ahead of whoever was writing the files. Kernel tree: `.tar.gz` 13.99 s
+→ **5.53 s**, against `gzip -dc | tar`'s 6.18; `.tar.zst` 11.94 → 3.89; `.tar.lz4` 10.95 → 3.73;
+`.tar.br` 15.77 → 6.08; `.tar.xz` 29.49 → 20.55; `.tar.bz2` 70.53 → 60.93. Writing the 94,778 files
+was never the cost — that is 0.32 s — and neither was inflate.
+
+**One big file into a `.7z` used one core**, because solid mode asks for one uninterrupted LZMA2
+stream per pack and an archive of a single file is a single pack. enwik9 went from 375 s at 99% CPU
+to **46.5 s**, which is 1.48× faster than 7-Zip, for half a percent of size. Archives of many files
+are byte-identical to before.
+
+**`--tiny` now beats 7-Zip.** zopfli takes one master block per `write` call and splits each at most
+fifteen ways, so handing it a 51 MB entry whole bought sixteen Huffman trees for the file. Fed in
+1 MiB blocks, silesia goes from 1.26% behind 7-Zip `-mx=9` to **0.02% ahead**, and peak memory falls
+from 2.3 GB to 712 MB.
+
+**Extraction stopped giving every file an 8 MiB buffer it could not use.** One is live per concurrent
+worker, so a 24-thread machine held 192 MB of buffer whatever the archive. Peak memory extracting a
+zip: silesia 125 MB → 36.6, kernel tree 214 → 146, both slightly faster.
+
+Also: `cram x --help` printed `No such file or directory` instead of help, because the read verbs took
+`--help` as the archive name; `--small` on a large corpus spent more time choosing a filter than
+compressing with it (336 s → 192 s for 0.0019% more bytes); and the README now says which crate to
+install, since `cargo install cram` fetches somebody else's.
+
 Extraction, from four directions. 7z ran on one thread whatever the archive or the machine — 25 s
 against 7-Zip's 3.7 s on the benchmark corpus — and is now level with it there and 2.4× faster on an
 archive cram wrote, in less memory either way. A single large file used one core because the unit of

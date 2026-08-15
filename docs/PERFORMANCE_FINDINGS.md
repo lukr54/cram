@@ -812,6 +812,59 @@ every later one is free, and a segment decode per read would be worse.
 
 ---
 
+## 22. Reading a `.tar.*` was 2–5× behind, and none of it was tar, the codecs or the filesystem
+
+Extraction of a `.tar.gz` sat at 2.26× behind `gzip -dc | tar`, across every codec, against readers
+using a single thread. Three separate diagnoses were written down and all three were wrong.
+
+**It was not the filesystem.** Writing the kernel tree's 94,778 files costs **0.32 s** for cram and
+0.41 s for GNU tar. The standing explanation — one thread opening, writing and closing 94,778 files,
+because tar has no random-access boundary — accounted for 2% of the time.
+
+**It was not inflate.** `cram t` decodes and checksums without writing anything, which isolates the
+decode: **13.83 s against `gzip -dc`'s 5.79.** In that run miniz_oxide's `decompress_fast` is about
+2.65 CPU-seconds, so our inflate is comfortably ahead of gzip's whole decode. The codec was never the
+problem.
+
+**It was not `memset` either, and that one nearly cost a day.** A profile put 34–45% in
+`__memset_avx2_unaligned_erms`. That is real, and it is mimalloc zeroing fresh pages on a spawned
+thread — building without mimalloc removes it and the extraction takes exactly as long (13.30 s
+against 13.42) in half the memory. A flat profile attributes CPU across every thread; this path is
+bound by one of them.
+
+**It was two lines in the tar worker.**
+
+- The body buffer was `vec![0u8; STREAM_CHUNK]` **inside the per-entry loop**, so the kernel tree
+  allocated and zeroed 94,778 buffers of a megabyte each to carry files averaging 20 KB. About 94 GB
+  of `memset` — which is what the profile above was reporting, one layer removed.
+- The worker handed results over `sync_channel(1)`, commented "~1–2 entries in flight". That is a
+  ping-pong and not a pipeline: the producer fills the single slot, blocks, the consumer takes it,
+  and the two never overlap. ~95,000 round trips.
+
+One buffer for the archive, and depth 16 — still bounded, because bodies stream and the bound is what
+stops a producer buffering a whole archive.
+
+| kernel tree, `/dev/shm` | before | after | native | |
+|---|---|---|---|---|
+| `.tar.gz` | 13.99 s | **5.53 s** | 6.18 s | **1.12× faster** |
+| `.tar.zst` | 11.94 s | 3.89 s | 2.13 s | 1.83× |
+| `.tar.lz4` | 10.95 s | 3.73 s | 2.01 s | 1.86× |
+| `.tar.br` | 15.77 s | 6.08 s | 3.74 s | 1.63× |
+| `.tar.xz` | 29.49 s | 20.55 s | 8.87 s | 2.32× |
+| `.tar.bz2` | 70.53 s | 60.93 s | 3.19 s | 19.1× |
+| `cram t` (decode only) | 13.82 s | **4.54 s** | 5.80 s | 1.28× faster |
+
+**`bz2` deserves its own sentence.** `lbzip2` reads that archive at **1373% CPU**, because cram's
+chunked writer hands it concatenated independent streams. We write those seams for five of the six
+codecs and still walk them serially, which is where the remaining gaps live. The competitor is
+parallel on our own output and we are not.
+
+**Lesson worth more than the fix:** three hypotheses were formed by reading code and profiles, and the
+thing that settled it was decomposing the measurement — `cram t` against `cram x` against the native
+tool — which took one command and could have been the first step.
+
+---
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for
