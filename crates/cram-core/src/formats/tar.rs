@@ -55,10 +55,29 @@ const READ_BUF: usize = 256 * 1024;
 /// hostile case. Charges each member's name length plus fixed `Entry`/`Vec` bookkeeping.
 const MAX_SCAN_META: u64 = 1024 * 1024 * 1024;
 
-/// One item streamed from the worker thread. A file is `FileStart` then N × `Chunk` then `FileEnd`,
-/// so the body never materializes as a single Vec; a directory is a lone `Dir`.
+/// Largest entry the worker will hand over in a single message.
+///
+/// A streamed file costs a `FileStart`, at least one `Chunk` and a `FileEnd` — three handoffs
+/// whatever its size — and the kernel tree averages **20 KB an entry** across 100,992 of them. That
+/// showed up as **591,555 `futex` calls, two thirds of the extraction's syscall time**, purely to
+/// pass small buffers between two threads.
+///
+/// This is a ceiling on what is read before the decision, not a promise about the entry: a header
+/// may declare any size it likes, and an entry that does not finish inside this many bytes falls
+/// back to streaming with what has been read already as its first chunk. So a compression bomb is
+/// bounded by this constant rather than by its own declaration, which is the property the streaming
+/// path was protecting.
+const WHOLE_MAX: usize = 256 * 1024;
+
+/// One item streamed from the worker thread.
+///
+/// A large file is `FileStart` then N × `Chunk` then `FileEnd`, so its body never materializes as a
+/// single Vec. A file that fits in [`WHOLE_MAX`] arrives as one `Whole` instead — same bytes, a
+/// third of the handoffs. A directory is a lone `Dir`.
 enum TarMsg {
     Dir(Entry),
+    /// A small file, complete. See [`WHOLE_MAX`].
+    Whole(Entry, Vec<u8>),
     FileStart(Entry),
     Chunk(Vec<u8>),
     FileEnd,
@@ -216,10 +235,36 @@ fn worker(reader: Box<dyn Read + Send>, tx: SyncSender<TarMsg>) {
             }
             continue;
         }
+        // Read up to [`WHOLE_MAX`] first. Most entries end inside it and go over as one message
+        // rather than three; anything longer carries on below with these bytes as its first chunk.
+        let mut head = 0usize;
+        loop {
+            match entry.read(&mut buf[head..WHOLE_MAX]) {
+                Ok(0) => break,
+                Ok(n) => head += n,
+                Err(e) => {
+                    let _ = tx.send(TarMsg::Err(e.to_string()));
+                    return;
+                }
+            }
+            if head == WHOLE_MAX {
+                break;
+            }
+        }
+        if head < WHOLE_MAX {
+            // Short read with room to spare = the entry ended.
+            if tx.send(TarMsg::Whole(cram, buf[..head].to_vec())).is_err() {
+                return;
+            }
+            continue;
+        }
         if tx.send(TarMsg::FileStart(cram)).is_err() {
             return;
         }
-        // Stream the body in bounded chunks, the entry reader is capped to the (untrusted) header
+        if tx.send(TarMsg::Chunk(buf[..head].to_vec())).is_err() {
+            return;
+        }
+        // Stream the rest in bounded chunks, the entry reader is capped to the (untrusted) header
         // size, so buffering it whole would let a crafted size / bomb OOM the process.
         loop {
             match entry.read(&mut buf) {
@@ -360,6 +405,11 @@ impl ArchiveReader for TarReader {
                     cur: io::Cursor::new(Vec::new()),
                     done: false,
                 }),
+                meta_final: true,
+            })),
+            Ok(TarMsg::Whole(entry, bytes)) => Ok(Some(EntryStream {
+                entry,
+                body: Box::new(io::Cursor::new(bytes)),
                 meta_final: true,
             })),
             Ok(TarMsg::Dir(entry)) => Ok(Some(EntryStream {
