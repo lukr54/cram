@@ -3,7 +3,7 @@
 //! as a stream, and the engine owns path resolution, directory creation, progress and cancellation
 //!, the same write machinery the parallel path uses, so every backend inherits it.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -99,8 +99,7 @@ pub fn run(
 
         let outpath = entry.path.join_under(dest);
         if entry.is_dir() {
-            created.note_dir(&outpath);
-            let _ = fs::create_dir_all(&outpath);
+            let _ = created.ensure_dir(&outpath);
             if let Some(t) = entry.modified {
                 dir_times.push((outpath, t));
             }
@@ -121,15 +120,13 @@ pub fn run(
         // failure and continues rather than aborting the whole job. Drain the (already-buffered)
         // body first so the reader stays in sync for the next entry.
         if let Some(parent) = outpath.parent() {
-            created.note_dir(parent);
-            if let Err(e) = fs::create_dir_all(parent) {
+            if let Err(e) = created.ensure_dir(parent) {
                 let _ = io::copy(&mut es.body, &mut io::sink());
                 report.push_failure(entry.name(), e);
                 continue;
             }
         }
-        created.note_file(&outpath);
-        let file = match File::create(&outpath) {
+        let file = match created.create_file(&outpath) {
             Ok(f) => f,
             Err(e) => {
                 let _ = io::copy(&mut es.body, &mut io::sink());
@@ -157,7 +154,8 @@ pub fn run(
                 );
             }
             Ok(n) => {
-                restore_mtime(&outpath, entry.modified);
+                // Stamped on the descriptor we still hold, not by reopening `outpath`.
+                super::restore_mtime_open(writer.get_ref(), entry.modified);
                 crate::diag::diag().entry(entry.name(), Some(n), "ok");
                 report.extracted += 1;
                 report.bytes += n;

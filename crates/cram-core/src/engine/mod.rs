@@ -78,6 +78,23 @@ pub(crate) fn restore_mtime(path: &Path, modified: Option<SystemTime>) {
     }
 }
 
+/// The same, for a file we are still holding open — which is every extracted file, at the moment we
+/// finish writing it.
+///
+/// [`restore_mtime`] stamps by *path*, and on Linux `filetime` implements that by opening the file
+/// again: an `openat` and a `close` per entry, on top of the ones we already paid. `set_modified`
+/// is `futimens` on the descriptor we have. Measured on the kernel tree, 94,778 files, so 94,778 of
+/// each — cram issued 195,910 `openat` against GNU tar's 94,803 and this was the whole difference.
+///
+/// Directories still go through [`restore_mtime`]: they are stamped in a later pass, after every
+/// child is written, and opening one on Windows needs `FILE_FLAG_BACKUP_SEMANTICS`, which std does
+/// not pass.
+pub(crate) fn restore_mtime_open(file: &std::fs::File, modified: Option<SystemTime>) {
+    if let Some(t) = modified {
+        let _ = file.set_modified(t);
+    }
+}
+
 /// Sibling staging path for an in-progress create/convert. Same directory → same volume, so the
 /// final `rename` over the destination is atomic. Writers `File::create` their target immediately,
 /// so building directly at the destination would destroy any PRE-EXISTING archive there the moment
@@ -289,6 +306,12 @@ pub(crate) struct ProgressWriter<'a, W: Write> {
 impl<'a, W: Write> ProgressWriter<'a, W> {
     pub(crate) fn new(inner: W, sink: &'a dyn ProgressSink) -> Self {
         Self { inner, sink }
+    }
+
+    /// The wrapped writer, so an entry's mtime can be stamped on the descriptor that is still open
+    /// rather than by reopening its path. See [`restore_mtime_open`]. Only valid after a flush.
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.inner
     }
 
     /// The cancellation sentinel. Deliberately NOT `ErrorKind::Interrupted`: `io::copy` writes

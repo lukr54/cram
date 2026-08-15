@@ -13,7 +13,7 @@
 //! only ~1 chunk is in flight.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -43,6 +43,10 @@ const STREAM_CHUNK: usize = 1024 * 1024;
 /// would let the producer buffer a whole archive. The ceiling is `STREAM_DEPTH × STREAM_CHUNK`,
 /// so 16 MiB.
 const STREAM_DEPTH: usize = 16;
+
+/// Read-ahead under the archive file itself. See [`open_decoded`] — without it a plain `.tar` costs
+/// one `read` per 512-byte header.
+const READ_BUF: usize = 256 * 1024;
 
 /// Cap on the cumulative entry-metadata the header pass buffers into the listing `Vec`. A compressed
 /// tar (`.tar.gz`/`.tar.xz`) can expand a few MB into a header stream describing tens of millions of
@@ -75,7 +79,13 @@ fn open_decoded(
     if let Some(p) = plan {
         return Ok(multi::open(p));
     }
-    let file: Box<dyn Read + Send> = Box::new(File::open(path)?);
+    // Buffered, which matters most for the codec that does no buffering of its own: a plain `.tar`
+    // handed the `tar` crate an unbuffered `File`, so every 512-byte header was its own `read`.
+    // Extracting the kernel tree cost **526,810** reads for 2 GB. std's `BufReader` passes any
+    // request at least as large as its capacity straight through, so an entry body still lands in
+    // one read and this costs no extra copy on the bytes that matter.
+    let file: Box<dyn Read + Send> =
+        Box::new(BufReader::with_capacity(READ_BUF, File::open(path)?));
     decode_stream(fmt.codec, file)
 }
 

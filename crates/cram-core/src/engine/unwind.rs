@@ -10,6 +10,7 @@
 //! with neither. A half-written file they can see and delete is a better outcome than an empty space
 //! where their file used to be.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -21,15 +22,64 @@ use std::sync::Mutex;
 pub struct CreatedLog {
     files: Mutex<Vec<PathBuf>>,
     dirs: Mutex<Vec<PathBuf>>,
+    /// Parents already made, so the second file in a directory does not pay to make it again. See
+    /// [`CreatedLog::ensure_dir`].
+    ensured: Mutex<HashSet<PathBuf>>,
 }
 
 impl CreatedLog {
+    /// Make an entry's parent directory, at most once per directory per run.
+    ///
+    /// Both engine paths used to call `note_dir` + `fs::create_dir_all` for **every file**, and
+    /// neither is cheap when the answer is "it is already there": `note_dir` stats the path, and
+    /// `create_dir_all` issues a `mkdir` that fails `EEXIST` and then stats it to confirm it is a
+    /// directory. Three syscalls per file to learn nothing.
+    ///
+    /// Measured extracting the kernel tree (100,992 members in 6,214 directories): **100,994 `mkdir`
+    /// calls of which 94,779 failed**, against GNU tar's 6,214. Remembering which parents exist
+    /// makes the count the number of directories rather than the number of files.
+    pub fn ensure_dir(&self, p: &Path) -> std::io::Result<()> {
+        if let Ok(seen) = self.ensured.lock() {
+            if seen.contains(p) {
+                return Ok(());
+            }
+        }
+        self.note_dir(p);
+        std::fs::create_dir_all(p)?;
+        if let Ok(mut seen) = self.ensured.lock() {
+            seen.insert(p.to_path_buf());
+        }
+        Ok(())
+    }
     /// Record a file as ours, if and only if nothing is there yet. Call this *before* creating it.
     pub fn note_file(&self, p: &Path) {
         if !p.exists() {
             if let Ok(mut v) = self.files.lock() {
                 v.push(p.to_path_buf());
             }
+        }
+    }
+
+    /// Create an entry's file, recording it as ours only if nothing was there.
+    ///
+    /// [`note_file`](Self::note_file) followed by `File::create` asks the filesystem the same
+    /// question twice: a `statx` to find out whether the path exists, then an `openat` that would
+    /// have said so. In a normal extraction the `statx` fails every time — 100,997 of 101,060 on the
+    /// kernel tree. `create_new` gets the answer from the `openat` we were going to issue anyway,
+    /// and as a bonus there is no longer a gap between the check and the create for anything else to
+    /// slip into.
+    pub fn create_file(&self, p: &Path) -> std::io::Result<std::fs::File> {
+        match std::fs::File::create_new(p) {
+            Ok(f) => {
+                if let Ok(mut v) = self.files.lock() {
+                    v.push(p.to_path_buf());
+                }
+                Ok(f)
+            }
+            // It was already there, so it is the user's and not ours to unwind — overwrite it
+            // without recording it, which is exactly what `note_file` decided by omission.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::File::create(p),
+            Err(e) => Err(e),
         }
     }
 

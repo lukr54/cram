@@ -8,7 +8,7 @@
 //! as its bytes go past. Same scheduling, same policy, no decoded block held anywhere.
 
 use std::cmp::Reverse;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
@@ -521,11 +521,9 @@ fn write_entry(
 
     sink.on_entry_start(entry);
     if let Some(parent) = outpath.parent() {
-        created.note_dir(parent);
-        fs::create_dir_all(parent)?;
+        created.ensure_dir(parent)?;
     }
-    created.note_file(&outpath);
-    let file = File::create(&outpath)?;
+    let file = created.create_file(&outpath)?;
     // Never a buffer larger than the file it is buffering. [`WRITE_BUF`] is sized for a stream that
     // can use it, and one is live per concurrent worker: on the kernel tree, which averages 20 KB an
     // entry, that was 8 MiB of buffer per 20 KB file and 192 MB resident on a 24-thread box, bought
@@ -557,7 +555,8 @@ fn write_entry(
             )))
         }
         Ok(n) => {
-            restore_mtime(&outpath, entry.modified);
+            // On the descriptor we still hold; the `BufWriter` above it has just been flushed.
+            super::restore_mtime_open(writer.get_ref().get_ref(), entry.modified);
             sink.on_file_done(entry);
             Ok(EntryOutcome::Wrote(n))
         }
