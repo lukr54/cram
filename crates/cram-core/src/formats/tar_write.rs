@@ -442,6 +442,31 @@ fn chunk_mem_per_worker_mib(codec: ChunkCodec) -> u64 {
 /// So take it from the RAM that is actually free, the same 60% fraction `hw::derive_plan` uses.
 /// `CRAM_WORKERS` forces it, as it does elsewhere in the engine — including past this bound, since an
 /// explicit override is the caller saying they know what their machine has.
+///
+/// **On any machine with headroom the RAM term is inert, and the core count is the whole answer.**
+/// Worth stating because it is easy to read the fraction as the thing setting the width: on the dev
+/// box, 60% of 21 GiB free against 136 MiB per xz worker permits **95**, so `threads` — 24 — is what
+/// binds. The fraction earns its place only on a small machine, which is what it was added for.
+///
+/// Measured 2026-08-15, kernel tree (2.1 GB) to `/dev/shm`, `.tar.xz`, median of two, peak RSS from
+/// `/usr/bin/time`:
+///
+/// | width | wall | peak RSS |
+/// |---|---|---|
+/// | 4 | 127.7 s | 1035 MB |
+/// | 8 | 72.7 s | 1739 MB |
+/// | 12 | 52.7 s | 2312 MB |
+/// | 16 | 49.0 s | 2797 MB |
+/// | 20 | 43.3 s | 3397 MB |
+/// | 24 | 40.8 s | 3940 MB |
+/// | `tar \| xz -T0` | 34.3 s | 3195 MB |
+///
+/// **The excess over `xz -T0` is the in-flight chunk budget, not the encoders.** Per worker the two
+/// are comparable; what cram holds on top is `width × chunk` = 24 × 32 MiB = 768 MB, against a
+/// measured gap of 745 MB. That budget is already at its floor — permits equal the width, and fewer
+/// would leave workers idle — so **there is no width at 24 that fits under `xz -T0`'s memory**. Going
+/// under it means dropping to about 16 workers and giving back 8 s of the 12 that A2 won. That is a
+/// real trade rather than a defect, and it is recorded here so it is not re-derived.
 fn chunk_width(codec: ChunkCodec) -> usize {
     if let Some(n) = std::env::var("CRAM_WORKERS")
         .ok()
