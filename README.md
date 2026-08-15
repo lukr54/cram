@@ -18,6 +18,7 @@ has a native format (`.cram`) that stores repeated data once and losslessly repa
 - [Install](#install)
   - [Windows](#windows)
   - [Linux and macOS](#linux-and-macos)
+  - [With cargo](#with-cargo)
   - [Building from source](#building-from-source)
 - [Using it](#using-it)
   - [Command reference](#command-reference)
@@ -237,6 +238,19 @@ The macOS binaries are **not signed or notarised**, so a download is quarantined
 entirely. Drive detection there goes through `diskutil`, which matters because it is what decides
 between one sequential reader and several parallel ones: getting it wrong on an external spinning
 disk (where a large collection usually lives) causes seek thrash rather than speed.
+
+### With cargo
+
+```sh
+cargo install cram-cli
+```
+
+**The crate is `cram-cli`.** `cargo install cram` installs an unrelated middleware library by another
+author, which has held that name on crates.io since before this project existed.
+
+That gives you the `cram` binary alone. `cram-extract`, which `cram make-sfx` shells out to, is a
+separate crate (`cargo install cram-extract`), and the Explorer right-click DLL is not published to
+crates.io at all — on Windows, take the zip above if you want all three.
 
 ### Building from source
 
