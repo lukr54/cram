@@ -907,6 +907,73 @@ problem — measure the per-item buffer against the item before touching the wor
 codec whose numbers look worst is not always the one with the defect: xz and bzip2 shared a pool and
 only one of them was being served by it.
 
+---
+
+## 24. Take the codec away and the gap is still there: 1.83M syscalls against GNU tar's 0.79M
+
+Findings 22 and 23 fixed decoding. The way to find out what was left was to remove the decoding
+entirely and extract a **plain `.tar`**: no codec, nothing to decompress, so anything slow is ours.
+
+| kernel tree, `/dev/shm` | cram | GNU tar |
+|---|---|---|
+| read the 2 GB (`cat`) | 0.19 s | — |
+| read + parse (`cram t`) | 1.00 s | — |
+| read + parse + write 94,778 files | **3.38 s** | **1.73 s** |
+
+1.95× behind with no compression involved at all. `strace -c` said why, and it was not writing:
+
+| syscall | cram | GNU tar |
+|---|---|---|
+| `futex` | 428,388 | 0 |
+| `statx` | 290,680 (100,997 fail) | 0 |
+| `read` | 526,938 | 195,043 |
+| `openat` | 195,910 | 94,803 |
+| `mkdir` | 100,994 (**94,779 fail**) | 6,214 |
+| `close` | 195,907 | 107,210 |
+| `utimensat` | 100,992 | 100,992 |
+
+Tracing one file showed the shape — six calls where two would do:
+
+```
+statx(parent) ok      note_dir asking whether the directory is there
+mkdir(parent) EEXIST  create_dir_all trying regardless
+statx(parent) ok      create_dir_all confirming it is a directory
+statx(file) ENOENT    note_file asking whether the file is there
+openat(file, O_CREAT) the one we wanted
+openat(file, O_RDONLY) filetime reopening it to set the mtime
+```
+
+**Four fixes, three of them in the shared engine so every format benefits:**
+
+- `CreatedLog::ensure_dir` remembers which parents it has made, so the cost is per *directory*
+  rather than per *file*. `mkdir` 100,994 → 6,216.
+- `CreatedLog::create_file` uses `create_new` and learns from the `openat` whether the file already
+  existed — which is what the `statx` was for. `statx` 290,680 → 6,282, and the check-then-create
+  gap is gone as a bonus.
+- `restore_mtime_open` stamps the descriptor already open instead of reopening the path.
+  `openat` and `close` each 195,910 → 101,068.
+- The tar backend buffers its source. A plain `.tar` was handed an unbuffered `File`, so the parser
+  read every 512-byte header with its own syscall. `read` 526,938 → 13,235.
+
+Then the worker channel: a file crossed it as `FileStart` + `Chunk` + `FileEnd` whatever its size,
+on a tree averaging 20 KB an entry. Handing a small entry over whole took `futex` 591,555 → 205,065.
+
+| codec | before the day | after | native | |
+|---|---|---|---|---|
+| plain `.tar` | 3.38 s | **2.26 s** | GNU tar 1.75 | 1.29× behind |
+| `xz` | 6.61 s | **5.67 s** | 8.71 s | **1.54× faster** |
+| `gz` | 5.58 s | **4.79 s** | 6.14 s | **1.28× faster** |
+| `lz4` | 3.66 s | **2.52 s** | 2.02 s | 1.25× |
+| `zst` | 3.93 s | **2.80 s** | 2.10 s | 1.33× |
+| `br` | 6.05 s | **5.38 s** | 3.67 s | 1.47× |
+| `bz2` | 7.46 s | **6.12 s** | 3.13 s | 1.96× |
+
+**Lessons.** *Remove the variable rather than profile around it* — a plain `.tar` isolated the
+engine from every codec in one command, and a CPU profile would have shown the cost smeared across
+`__libc_*` where it means nothing. And *`strace -c` time is not wall time either*: it put `futex` at
+60% of the syscall cost, and cutting `futex` by 65% moved the wall clock 4%. The **counts** are
+exact and were the useful part; the seconds column is inflated by the tracer on every call it counts.
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for

@@ -70,12 +70,13 @@ right comparison and `tar czf` is not: `tar czf` pipes through one thread, so be
 except that we use the machine. Numbers, and what the chunking costs, in
 [Writing `.tar.gz`](#writing-targz).
 
-**Reading one is now 1.12× faster than `gzip -dc | tar`** — 5.53 s against 6.18 on the kernel tree,
+**Reading one is now 1.28× faster than `gzip -dc | tar`** — 4.79 s against 6.14 on the kernel tree,
 both on a single decode thread, because a standard `.gz` cannot be parallelised by anybody. Until
-2026-08-15 this was 2.26× *slower*, and the cause was ours: a megabyte allocated and zeroed for every
-one of 94,778 entries, and a decoder that could never get more than one message ahead of its consumer.
-The other five tar codecs improved by the same change and four of them are still behind; see
-[Where cram loses](#where-cram-loses).
+2026-08-15 this was 2.26× *slower*, and every cause was ours: a megabyte allocated and zeroed for
+every one of 94,778 entries, a decoder that could never get more than one message ahead of its
+consumer, and an extraction path issuing 1.83 million syscalls where GNU tar issues 0.79 million.
+**All six tar codecs improved, `.tar.xz` overtook `xz -dc | tar`, and the four still behind are
+within 1.25–1.96× rather than 2.2–5.6×**; see [Where cram loses](#where-cram-loses).
 
 **One corpus exposed a real weakness, and it is mostly closed.** enwik9 is a single 1 GB file, and
 extraction fanned out per entry — one entry, one thread, whatever the machine. Cutting the entry at
@@ -99,14 +100,14 @@ Every one of those is measured in that section, including the ones where cram lo
 **Memory is where cram is cheaper than 7-Zip**, and the qualifier is doing real work — it means
 7-Zip and it does not generalise. Against the threaded tar tools cram is *dearer*, and writing a
 `.tar.xz` it now peaks at 3960 MB against `xz -T0`'s 3196. Against the pipe-based readers it is
-dearer by one to two orders of magnitude — extracting a `.tar.gz` costs 105 MB against `gzip -dc |
+dearer by one to two orders of magnitude — extracting a `.tar.gz` costs 113 MB against `gzip -dc |
 tar`'s 3.5 — because a pipe holds nothing and a pipeline holds its buffers. That is the price of the
 parallel paths and it is not going away.
 
-Where a `.tar.bz2` or `.tar.xz` decodes on a pool the price is explicit and bounded: 491 MB and
-301 MB against 94 and 118 sequential, held to a 256 MiB budget for the decoded bytes in flight plus
+Where a `.tar.bz2` or `.tar.xz` decodes on a pool the price is explicit and bounded: 473 MB and
+321 MB against 94 and 118 sequential, held to a 256 MiB budget for the decoded bytes in flight plus
 the decoders themselves. `CRAM_PARALLEL_DECODE=0` gives the memory back and takes the speed with it.
-For comparison `lbzip2` peaks at 551 MB on the same archive, so on `bz2` this is not the expensive
+For comparison `lbzip2` peaks at 546 MB on the same archive, so on `bz2` this is not the expensive
 option.
 Creating the Cram corpus, default against default, is 2.4 GB against 7-Zip's 7.1 GB; at maximum
 7-Zip needs **17.4 GB**, does not fit on a 16 GB machine, and given all 24 threads exceeds 20 GB and
@@ -522,13 +523,13 @@ away eight times less dictionary at the seams.
 **Extraction is still single-threaded, and is faster anyway.** A standard `.gz` cannot be extracted
 in parallel by anyone, cram included: a decoder cannot find the block boundaries without inflating
 everything before them, and pigz decompresses in the same time as gzip for that reason. **`cram x` on
-a `.tar.gz` is 5.58 s against `gzip -dc | tar`'s 6.17** on the kernel tree — 1.11× faster, on one
+a `.tar.gz` is 4.79 s against `gzip -dc | tar`'s 6.14** on the kernel tree — 1.28× faster, on one
 decode thread each. It was 2.26× *slower* until 2026-08-15; what changed was ours, not the format's.
 
 `.tar.xz` and `.tar.bz2` are the exception, and for a reason specific to how cram writes them: both
 are emitted as a run of complete standalone streams, and a run of streams **can** be split without
 inflating anything before the split. Those two decode on every core, which is why `.tar.xz` is
-1.35× faster than `xz -dc | tar` rather than 2.32× slower. The remaining tar codecs are in
+1.54× faster than `xz -dc | tar` rather than 2.32× slower. The remaining tar codecs are in
 [Where cram loses](#where-cram-loses).
 
 **What it costs.** The stream is cut into 1 MiB chunks compressed independently, so each starts with
@@ -549,22 +550,32 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
 
   | codec | cram | native | |
   |---|---|---|---|
-  | `xz` | **6.61 s** | 8.89 s | **1.35× faster** |
-  | `gz` | **5.58 s** | 6.17 s | **1.11× faster** |
-  | `br` | 6.05 s | 3.79 s (`brotli -dc \| tar`) | 1.60× slower |
-  | `lz4` | 3.66 s | 2.10 s (`lz4 -dc \| tar`) | 1.74× |
-  | `zst` | 3.93 s | 2.23 s | 1.76× |
-  | `bz2` | 7.46 s | 3.25 s (lbzip2) | 2.30× |
+  | `xz` | **5.67 s** | 8.71 s | **1.54× faster** |
+  | `gz` | **4.79 s** | 6.14 s | **1.28× faster** |
+  | `lz4` | 2.52 s | 2.02 s (`lz4 -dc \| tar`) | 1.25× slower |
+  | `zst` | 2.80 s | 2.10 s | 1.33× |
+  | `br` | 5.38 s | 3.67 s (`brotli -dc \| tar`) | 1.47× |
+  | `bz2` | 6.12 s | 3.13 s (lbzip2) | 1.96× |
 
-  This was 2.2–5.6× behind on every row a day earlier, and `bz2` was 19.1× behind. Two fixes, both
-  in how the archive is read rather than in any codec. The tar worker allocated and zeroed a 1 MiB
-  buffer for **every entry** — 94,778 of them on this tree, to carry files averaging 20 KB — and
-  passed results over a one-slot channel, which is a ping-pong rather than a pipeline. Then the
-  concatenated streams cram's chunked writer emits, which had been walked one at a time, started
-  being decoded on a pool: `bz2` 62.08 s → 7.46 and `xz` 20.79 → 6.61.
+  This was 2.2–5.6× behind on every row that morning, and `bz2` was 19.1× behind. Three fixes, none
+  of them in a codec. The tar worker allocated and zeroed a 1 MiB buffer for **every entry** — 94,778
+  of them on this tree, to carry files averaging 20 KB — and passed results over a one-slot channel,
+  which is a ping-pong rather than a pipeline. The concatenated streams cram's chunked writer emits,
+  which had been walked one at a time, started being decoded on a pool. And the extraction path was
+  asking the filesystem the same questions twice per file.
+
+  **That last one is the reason every row above moved, and it is worth being precise about.**
+  Extracting a plain `.tar` — no codec, nothing to decode — took 3.38 s against GNU tar's 1.73, so
+  the gap was entirely ours. `strace` counted **1.83 million syscalls against GNU tar's 0.79
+  million**: a `mkdir` per file that failed `EEXIST` 94,779 times where GNU tar issued 6,214 that
+  succeeded, two `statx` per file to ask about paths an `openat` was about to answer, a second
+  `openat` per file because the mtime was set by path rather than on the handle already open, and
+  526,938 `read` calls for 2 GB because a plain `.tar` was handed an unbuffered file. Remembering
+  which directories exist, creating with `create_new`, stamping the descriptor and buffering the
+  source took it to 2.26 s and every compressed codec down with it.
 
   **`bz2` remains the outlier, and `cram t` says where the rest of it lives.** Decoding without
-  writing anything, cram takes 5.43 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57 — so the
+  writing anything, cram takes 5.22 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57 — so the
   pool works, and what is left is CPU per byte: 90 CPU-seconds against `bunzip2`'s 33 for the same
   data. That is the pure-Rust bzip2 backend rather than cram's machinery, and the same machinery on
   `gz` costs 4.7 CPU-seconds against `gzip -dc`'s 5.74. More workers cannot fix it.
@@ -574,7 +585,7 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
   `cat a.xz b.xz` leave the same ones. An archive that is a **single** stream — what plain `bzip2`
   or `xz` produces — has nothing to split, and cram reads it at one-core speed like everyone else:
   the same kernel tree through a single-stream `.tar.bz2` from stock `bzip2 -9` takes **62.4 s**, not
-  7.46. Detecting that costs nothing measurable (62.4 s against 62.5 s with the scan disabled
+  6.12. Detecting that costs nothing measurable (62.4 s against 62.5 s with the scan disabled
   outright), but the speed is not there to be had.
 
   For scale: the same tree out of a `.cram` extracts in 1.84 s.

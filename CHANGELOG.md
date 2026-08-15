@@ -34,6 +34,20 @@ back to the sequential decoder unchanged. Nothing about what cram *writes* chang
 cannot corrupt an extraction silently, since the spans either side of it fail to decode. Bare `.xz`
 and `.bz2` files take the same path. `CRAM_PARALLEL_DECODE=0` turns it off.
 
+**Extraction stopped asking the filesystem the same question twice per file.** A plain `.tar` — no
+codec, nothing to decode — took 3.38 s where GNU tar took 1.73, so none of that gap was compression.
+`strace` counted **1.83 million syscalls against GNU tar's 0.79 million**, and most of the excess was
+work whose answer we already had: a `mkdir` for every *file* rather than every directory, which
+failed `EEXIST` 94,779 times on the Linux kernel tree; two `statx` per file asking about paths the
+following `openat` was about to answer; a second `openat` per file because the modification time was
+stamped by path instead of on the descriptor still open; and 526,938 `read` calls to move 2 GB,
+because a plain `.tar` was handed an unbuffered file and the tar parser reads 512-byte headers.
+
+Kernel tree, and every codec moved because the fix is in the shared engine: plain `.tar` 3.38 s →
+**2.26**, `.tar.gz` 5.58 → **4.79**, `.tar.zst` 3.93 → **2.80**, `.tar.lz4` 3.66 → **2.52**,
+`.tar.br` 6.05 → **5.38**, `.tar.xz` 6.61 → **5.67**, `.tar.bz2` 7.46 → **6.12**. Extracted trees are
+byte-identical and modification times unchanged.
+
 **One big file into a `.7z` used one core**, because solid mode asks for one uninterrupted LZMA2
 stream per pack and an archive of a single file is a single pack. enwik9 went from 375 s at 99% CPU
 to **46.5 s**, which is 1.48× faster than 7-Zip, for half a percent of size. Archives of many files
