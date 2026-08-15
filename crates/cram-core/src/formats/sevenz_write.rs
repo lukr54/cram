@@ -458,10 +458,12 @@ impl SevenZArchiveWriter {
         if self.block.is_empty() {
             return Ok(());
         }
+        // Before the block is taken: how many entries it holds decides whether LZMA2's own
+        // multi-threading is worth using inside it. See `content_methods`.
+        let methods =
+            Arc::new(self.content_methods(self.block_store, self.block_bytes, self.block.len()));
         let batch = std::mem::take(&mut self.block);
-        let block_bytes = self.block_bytes;
         self.block_bytes = 0;
-        let methods = Arc::new(self.content_methods(self.block_store, block_bytes));
 
         let mut entries = Vec::with_capacity(batch.len());
         let mut readers = Vec::with_capacity(batch.len());
@@ -545,7 +547,8 @@ impl SevenZArchiveWriter {
         store: bool,
         adaptive_store: bool,
     ) -> Result<()> {
-        let methods = self.content_methods(store, entry.size);
+        // The non-solid path is one entry per pack by definition.
+        let methods = self.content_methods(store, entry.size, 1);
         let sz_entry = ArchiveEntry::new_file(&arc_name(entry));
         let w = self.writer()?;
         w.set_content_methods(methods);
@@ -572,10 +575,46 @@ impl SevenZArchiveWriter {
     /// several hundred megabytes and all the setup to do work one thread would finish immediately.
     /// A 1,200-file / 245 KB fixture took **62.9s** in a debug build before this check, essentially
     /// all of it encoder setup across three tiny blocks.
-    fn content_methods(&self, store: bool, bytes: u64) -> Vec<EncoderConfiguration> {
+    fn content_methods(
+        &self,
+        store: bool,
+        bytes: u64,
+        entries: usize,
+    ) -> Vec<EncoderConfiguration> {
+        // **A block holding one entry has no other pack to be parallel with.** Solid mode gets its
+        // parallelism from compressing whole packs at once, which is why it asks for one
+        // uninterrupted stream per pack — but an archive of a single large file is one pack, and
+        // that reasoning leaves it on one core. Measured: enwik9 to a `.7z` took 381.28 s at 99%
+        // CPU against 7-Zip's 68.66 at 818%. Same shape as `extract_unit` amortising a decode
+        // across the entries sharing it, where a group of one has nothing to amortise.
+        //
+        // The usual objection to chunked MT is that it costs ratio, since a match cannot cross a
+        // chunk boundary. It does — and it is not what is keeping us behind here: 7-Zip pays the
+        // same cost and still wrote **224,618,387** bytes against our single-threaded 230,080,144.
+        // Restricted to a lone entry so a block of many small files keeps the cross-file matching
+        // that is the whole point of solid, and keeps today's bytes exactly.
+        // A much larger chunk than the many-packs case wants. There, small chunks keep every worker
+        // fed across a stream of 64 MiB blocks; here the block *is* the archive, so the only thing
+        // more chunks buy is more seams. Swept on enwik9 at 24 threads, against 387.12 s and
+        // 230,080,144 bytes single-threaded, and 7-Zip's 68.79 s and 224,618,387:
+        //
+        // | chunk | wall | bytes | over single-threaded |
+        // |---|---|---|---|
+        // | dictionary (the other branch's default) | 31.77 s | 240,013,768 | +4.32% |
+        // | 32 MiB | 44.24 s | 232,501,402 | +1.05% |
+        // | **64 MiB** | **46.76 s** | **231,264,375** | **+0.52%** |
+        // | 128 MiB | 72.63 s | 230,682,444 | +0.26% |
+        //
+        // 64 MiB is where the ratio loss stops being interesting while the result is still 8.3×
+        // faster than one thread and 1.47× faster than 7-Zip. 128 MiB gives back another 0.26% and
+        // loses the win.
+        const LONE_MT_CHUNK: u64 = 64 << 20;
+        let lone_chunk = self.chunk.max(LONE_MT_CHUNK);
+        let lone_big_block =
+            entries <= 1 && self.threads > 1 && bytes >= lone_chunk.saturating_mul(2);
         let compress: EncoderConfiguration = if store {
             EncoderConfiguration::new(EncoderMethod::COPY)
-        } else if self.solid {
+        } else if self.solid && !lone_big_block {
             // Single-threaded on purpose: parallelism comes from compressing whole packs at once
             // now, and LZMA2's own chunked MT costs ratio because a match cannot cross a chunk
             // boundary. One uninterrupted stream per pack is both faster in aggregate and smaller.
@@ -597,7 +636,12 @@ impl SevenZArchiveWriter {
             // partial tail before the next one can start. Defaulting to the dictionary size -- the
             // smallest the library will accept -- gives the most chunks a block can hold, so there
             // is still work to pick up while the stragglers finish.
-            Lzma2Options::from_level_mt(self.level, self.threads, self.chunk).into()
+            let chunk = if lone_big_block {
+                lone_chunk
+            } else {
+                self.chunk
+            };
+            Lzma2Options::from_level_mt(self.level, self.threads, chunk).into()
         } else {
             Lzma2Options::from_level(self.level).into()
         };
@@ -731,7 +775,7 @@ impl ArchiveWriter for SevenZArchiveWriter {
             // this: (a) the header reuses the LAST entry's IV, and (b) an archive that never had
             // an `add_file` (empty, or directories only) has no AES configuration at all and a
             // NamesToo header is silently written in PLAINTEXT.
-            sz.set_content_methods(self.content_methods(false, 0));
+            sz.set_content_methods(self.content_methods(false, 0, 0));
         }
         let file = sz.finish().map_err(ArchiveError::Io)?;
         let out_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
