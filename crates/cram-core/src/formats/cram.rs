@@ -1330,6 +1330,46 @@ struct ColdCandidate {
     pb: u32,
 }
 
+/// Bytes the `--small` filter screen looks at per pack, and how many windows it spreads them over.
+///
+/// **The screen used to cost more than the encode it was screening for.** It ran every candidate
+/// over the *whole* pack at preset 1 — six full LZMA passes to choose the seventh — and a profile of
+/// `--small` on the Cram corpus put **38.5% of the entire run in `Hc4::find_matches`**, which is
+/// preset 1's match finder, against **17.2% in `Bt4`**, which is the real encode's. The choice being
+/// made is which pre-filter and which `lc`/`lp`/`pb` suit the data, and that is a property of the
+/// data's structure rather than of its length: a sample decides it.
+///
+/// Windows spread across the pack rather than taken from its head, for the reason
+/// [`probe::spread_verdict`](crate::probe::spread_verdict) exists — a pack that only *begins* with
+/// x86 code would otherwise pick a BCJ filter for all of it.
+///
+/// `CRAM_COLD_SCREEN_MIB` overrides, and **0 restores the whole-pack screen**, so the two can be
+/// compared without a rebuild.
+const COLD_SCREEN_BYTES: usize = 4 << 20;
+const COLD_SCREEN_WINDOWS: usize = 4;
+
+/// The bytes [`pack_compress_cold`] screens candidates against. Borrowed when the pack is already
+/// small enough, so nothing is copied in the common case.
+fn cold_screen_sample(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    let budget = match env_i32("CRAM_COLD_SCREEN_MIB") {
+        Some(0) => return Cow::Borrowed(raw),
+        Some(n) if n > 0 => (n as usize).saturating_mul(1 << 20),
+        _ => COLD_SCREEN_BYTES,
+    };
+    if raw.len() <= budget {
+        return Cow::Borrowed(raw);
+    }
+    let win = budget / COLD_SCREEN_WINDOWS;
+    let stride = (raw.len() - win) / (COLD_SCREEN_WINDOWS - 1);
+    let mut s = Vec::with_capacity(budget);
+    for k in 0..COLD_SCREEN_WINDOWS {
+        let start = k * stride;
+        s.extend_from_slice(&raw[start..(start + win).min(raw.len())]);
+    }
+    Cow::Owned(s)
+}
+
 /// Fixed order, so a tie between two candidates of equal size breaks the same way on every machine.
 ///
 /// Deliberately small. Each entry is a full LZMA pass, and the answer is content-dependent rather
@@ -1426,10 +1466,14 @@ fn pack_compress_cold(raw: Vec<u8>, level: u32) -> Result<(u8, Vec<u8>)> {
     } else {
         // Screen cheaply, then commit. A candidate that cannot beat the plain one at preset 1 is not
         // going to start winning because the match finder got more patient.
+        //
+        // Cheaply means on a sample: see [`COLD_SCREEN_BYTES`]. Screening the whole pack made this
+        // loop cost more than the encode it exists to choose.
+        let sample = cold_screen_sample(&raw);
         let mut winner = &COLD_CANDIDATES[0];
         let mut winner_len = usize::MAX;
         for cand in COLD_CANDIDATES {
-            if let Some(c) = xz_encode(&raw, cold_options(1, cand, false))? {
+            if let Some(c) = xz_encode(&sample, cold_options(1, cand, false))? {
                 if c.len() < winner_len {
                     winner_len = c.len();
                     winner = cand;
