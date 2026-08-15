@@ -519,12 +519,17 @@ qualified to read this table knows pigz exists.
 The archive is smaller than both because the chunk is 1 MiB where pigz's is 128 KiB, so cram throws
 away eight times less dictionary at the seams.
 
-**Extraction is still single-threaded, and is now slightly faster anyway.** A standard `.gz` cannot be
-extracted in parallel by anyone, cram included: a decoder cannot find the block boundaries without
-inflating everything before them, and pigz decompresses in the same time as gzip for that reason.
-**`cram x` on a `.tar.gz` is 5.53 s against `gzip -dc | tar`'s 6.18** on the kernel tree — 1.12×
-faster, on one decode thread each. It was 2.26× *slower* until 2026-08-15; what changed was ours, not
-the format's, and the other tar codecs are in [Where cram loses](#where-cram-loses).
+**Extraction is still single-threaded, and is faster anyway.** A standard `.gz` cannot be extracted
+in parallel by anyone, cram included: a decoder cannot find the block boundaries without inflating
+everything before them, and pigz decompresses in the same time as gzip for that reason. **`cram x` on
+a `.tar.gz` is 5.58 s against `gzip -dc | tar`'s 6.17** on the kernel tree — 1.11× faster, on one
+decode thread each. It was 2.26× *slower* until 2026-08-15; what changed was ours, not the format's.
+
+`.tar.xz` and `.tar.bz2` are the exception, and for a reason specific to how cram writes them: both
+are emitted as a run of complete standalone streams, and a run of streams **can** be split without
+inflating anything before the split. Those two decode on every core, which is why `.tar.xz` is
+1.35× faster than `xz -dc | tar` rather than 2.32× slower. The remaining tar codecs are in
+[Where cram loses](#where-cram-loses).
 
 **What it costs.** The stream is cut into 1 MiB chunks compressed independently, so each starts with
 an empty dictionary and the archive grows by 0.19–0.34% against a single-stream gzip. Peak memory is
