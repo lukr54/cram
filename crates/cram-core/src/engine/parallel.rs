@@ -22,8 +22,22 @@ use crate::model::Entry;
 use crate::progress::ProgressSink;
 use crate::reader::RandomAccessReader;
 
-/// 8 MiB write blocks, sized to keep the write stream saturated.
-const WRITE_BUF: usize = 8 * 1024 * 1024;
+/// Write blocks, sized to keep the write stream saturated. One is live per concurrent worker, so
+/// this is multiplied by the pool width and not by anything else.
+///
+/// **1 MiB, measured 2026-08-15, down from 8 MiB which bought nothing.** Extracting silesia (twelve
+/// entries large enough that the cap binds on all of them), three runs each, wall time identical to
+/// two decimal places on both destinations:
+///
+/// | | 8 MiB | 1 MiB |
+/// |---|---|---|
+/// | `/dev/shm` | 0.13 s, 117 MB | 0.13 s, **36.7 MB** |
+/// | `/scratch` (SATA) | 0.14 s, 101 MB | 0.13 s, **30.5 MB** |
+///
+/// The old value was not wrong for the reason it was chosen — it is genuinely enough to saturate a
+/// write stream — it was simply four times more than enough, and the surplus is paid once per
+/// worker. A real disk does not distinguish them either, which is the row that settles it.
+const WRITE_BUF: usize = 1024 * 1024;
 
 /// Does the filesystem holding `dir` treat two names differing only in case as the same file?
 ///
@@ -512,7 +526,18 @@ fn write_entry(
     }
     created.note_file(&outpath);
     let file = File::create(&outpath)?;
-    let mut writer = ProgressWriter::new(BufWriter::with_capacity(WRITE_BUF, file), sink);
+    // Never a buffer larger than the file it is buffering. [`WRITE_BUF`] is sized for a stream that
+    // can use it, and one is live per concurrent worker: on the kernel tree, which averages 20 KB an
+    // entry, that was 8 MiB of buffer per 20 KB file and 192 MB resident on a 24-thread box, bought
+    // nothing, and was most of what made zip extraction 18× 7-Zip's memory and 35× Info-ZIP's. The
+    // floor keeps a tiny entry from turning into an unbuffered write per call.
+    //
+    // `entry.size` is authoritative on this path — the short-read check below rejects the entry if
+    // the decode does not produce exactly it — so sizing from it cannot truncate a longer stream.
+    let cap = usize::try_from(entry.size)
+        .unwrap_or(WRITE_BUF)
+        .clamp(4 << 10, WRITE_BUF);
+    let mut writer = ProgressWriter::new(BufWriter::with_capacity(cap, file), sink);
 
     match fill(&mut writer).and_then(|n| {
         writer.flush()?;
