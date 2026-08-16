@@ -960,13 +960,26 @@ on a tree averaging 20 KB an entry. Handing a small entry over whole took `futex
 
 | codec | before the day | after | native | |
 |---|---|---|---|---|
-| plain `.tar` | 3.38 s | **2.26 s** | GNU tar 1.75 | 1.29× behind |
-| `xz` | 6.61 s | **5.67 s** | 8.71 s | **1.54× faster** |
-| `gz` | 5.58 s | **4.79 s** | 6.14 s | **1.28× faster** |
-| `lz4` | 3.66 s | **2.52 s** | 2.02 s | 1.25× |
-| `zst` | 3.93 s | **2.80 s** | 2.10 s | 1.33× |
-| `br` | 6.05 s | **5.38 s** | 3.67 s | 1.47× |
-| `bz2` | 7.46 s | **6.12 s** | 3.13 s | 1.96× |
+| plain `.tar` | 3.38 s | **1.44 s** | GNU tar 1.69 | **1.17× faster** |
+| `xz` | 6.61 s | **5.50 s** | 8.81 s | **1.60× faster** |
+| `gz` | 5.58 s | **4.94 s** | 6.17 s | **1.25× faster** |
+| `lz4` | 3.66 s | **2.10 s** | 2.01 s | 1.05× |
+| `zst` | 3.93 s | **2.69 s** | 2.14 s | 1.27× |
+| `br` | 6.05 s | **5.40 s** | 3.77 s | 1.43× |
+| `bz2` | 7.46 s | **5.90 s** | 3.22 s | 1.83× |
+
+The last of those came from **writing the files on a pool**, which the syscall work above had
+left as the only thing still on one thread. Decoding a tar is one pass and must stay one; writing
+what it decodes need not, and the evidence was already in the tree — the same 94,778 files as a
+*stored* `.zip`, which takes the per-entry parallel path, extracted in 1.48 s at 234% CPU where
+this path took 2.32 s at 130%, with no decoding on either side.
+
+**Two things about that are worth keeping.** The width knees at eight and then goes backwards —
+1.43 s at eight against 1.50 s and 311% CPU at twenty-four — so it is capped rather than taken
+from the core count. And `plan.writers`, which decides it, was being set to `workers`, itself
+capped by the number of independently-decodable *blocks*: one, for any tar. So the pool was
+never built at all until that was separated. `writers` had been display-only for extraction
+until this change, which is why nothing had noticed.
 
 **Lessons.** *Remove the variable rather than profile around it* — a plain `.tar` isolated the
 engine from every codec in one command, and a CPU profile would have shown the cost smeared across

@@ -70,13 +70,14 @@ right comparison and `tar czf` is not: `tar czf` pipes through one thread, so be
 except that we use the machine. Numbers, and what the chunking costs, in
 [Writing `.tar.gz`](#writing-targz).
 
-**Reading one is now 1.28× faster than `gzip -dc | tar`** — 4.79 s against 6.14 on the kernel tree,
+**Reading one is now 1.25× faster than `gzip -dc | tar`** — 4.94 s against 6.17 on the kernel tree,
 both on a single decode thread, because a standard `.gz` cannot be parallelised by anybody. Until
 2026-08-15 this was 2.26× *slower*, and every cause was ours: a megabyte allocated and zeroed for
 every one of 94,778 entries, a decoder that could never get more than one message ahead of its
-consumer, and an extraction path issuing 1.83 million syscalls where GNU tar issues 0.79 million.
-**All six tar codecs improved, `.tar.xz` overtook `xz -dc | tar`, and the four still behind are
-within 1.25–1.96× rather than 2.2–5.6×**; see [Where cram loses](#where-cram-loses).
+consumer, an extraction path issuing 1.83 million syscalls where GNU tar issues 0.79 million, and
+files written on one thread while another decoded. **All six tar codecs improved, `.tar.xz` overtook
+`xz -dc | tar`, a plain `.tar` overtook GNU tar, and the four still behind are within 1.05–1.83×
+rather than 2.2–5.6×**; see [Where cram loses](#where-cram-loses).
 
 **One corpus exposed a real weakness, and it is mostly closed.** enwik9 is a single 1 GB file, and
 extraction fanned out per entry — one entry, one thread, whatever the machine. Cutting the entry at
@@ -104,8 +105,9 @@ dearer by one to two orders of magnitude — extracting a `.tar.gz` costs 113 MB
 tar`'s 3.5 — because a pipe holds nothing and a pipeline holds its buffers. That is the price of the
 parallel paths and it is not going away.
 
-Where a `.tar.bz2` or `.tar.xz` decodes on a pool the price is explicit and bounded: 473 MB and
-321 MB against 94 and 118 sequential, held to a 256 MiB budget for the decoded bytes in flight plus
+Extraction also holds a bounded batch of decoded entries for its writer pool, which is most of why a
+plain `.tar` now peaks at 219 MB against 133 before. Where a `.tar.bz2` or `.tar.xz` decodes on a
+pool as well the price is explicit and bounded: 594 MB and 439 MB against 94 and 118 sequential, held to a 256 MiB budget for the decoded bytes in flight plus
 the decoders themselves. `CRAM_PARALLEL_DECODE=0` gives the memory back and takes the speed with it.
 For comparison `lbzip2` peaks at 546 MB on the same archive, so on `bz2` this is not the expensive
 option.
@@ -550,19 +552,23 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
 
   | codec | cram | native | |
   |---|---|---|---|
-  | `xz` | **5.67 s** | 8.71 s | **1.54× faster** |
-  | `gz` | **4.79 s** | 6.14 s | **1.28× faster** |
-  | `lz4` | 2.52 s | 2.02 s (`lz4 -dc \| tar`) | 1.25× slower |
-  | `zst` | 2.80 s | 2.10 s | 1.33× |
-  | `br` | 5.38 s | 3.67 s (`brotli -dc \| tar`) | 1.47× |
-  | `bz2` | 6.12 s | 3.13 s (lbzip2) | 1.96× |
+  | `xz` | **5.50 s** | 8.81 s | **1.60× faster** |
+  | `gz` | **4.94 s** | 6.17 s | **1.25× faster** |
+  | `lz4` | 2.10 s | 2.01 s (`lz4 -dc \| tar`) | 1.05× slower |
+  | `zst` | 2.69 s | 2.14 s | 1.27× |
+  | `br` | 5.40 s | 3.77 s (`brotli -dc \| tar`) | 1.43× |
+  | `bz2` | 5.90 s | 3.22 s (lbzip2) | 1.83× |
+
+  A plain `.tar` — no codec at all — is **1.44 s against GNU tar's 1.69**, which is the same engine
+  underneath every row above.
 
   This was 2.2–5.6× behind on every row that morning, and `bz2` was 19.1× behind. Three fixes, none
   of them in a codec. The tar worker allocated and zeroed a 1 MiB buffer for **every entry** — 94,778
   of them on this tree, to carry files averaging 20 KB — and passed results over a one-slot channel,
   which is a ping-pong rather than a pipeline. The concatenated streams cram's chunked writer emits,
-  which had been walked one at a time, started being decoded on a pool. And the extraction path was
-  asking the filesystem the same questions twice per file.
+  which had been walked one at a time, started being decoded on a pool. The extraction path was
+  asking the filesystem the same questions twice per file. And writing those files ran on one thread
+  while decoding ran on another, so the machine's other cores did nothing.
 
   **That last one is the reason every row above moved, and it is worth being precise about.**
   Extracting a plain `.tar` — no codec, nothing to decode — took 3.38 s against GNU tar's 1.73, so
@@ -573,6 +579,13 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
   526,938 `read` calls for 2 GB because a plain `.tar` was handed an unbuffered file. Remembering
   which directories exist, creating with `create_new`, stamping the descriptor and buffering the
   source took it to 2.26 s and every compressed codec down with it.
+
+  **Writing them across a pool took it to 1.44 s, past GNU tar.** Decoding a tar is one pass and has
+  to stay one thread; writing what it decodes does not. Small entries accumulate into a bounded batch
+  and go out on eight writers — eight because the width knees there and then goes backwards, giving
+  1.43 s at eight against 1.50 s and 311% CPU at twenty-four. `gz` and `br` are the two rows that
+  pay ~3% for it rather than gaining, because their decode is single-threaded and is the wall, so
+  extra writers only contend.
 
   **`bz2` remains the outlier, and `cram t` says where the rest of it lives.** Decoding without
   writing anything, cram takes 5.22 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57 — so the
