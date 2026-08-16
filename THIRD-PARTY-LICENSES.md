@@ -5685,13 +5685,13 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ## MIT License
 
 Applies to:
-- `cram-cli` 1.1.0
-- `cram-core` 1.1.0
-- `cram-extract` 1.1.0
-- `cram-mount` 1.1.0
-- `cram-recovery` 1.1.0
-- `cram-shell` 1.1.0
-- `cram-sign` 1.1.0
+- `cram-cli` 1.2.0
+- `cram-core` 1.2.0
+- `cram-extract` 1.2.0
+- `cram-mount` 1.2.0
+- `cram-recovery` 1.2.0
+- `cram-shell` 1.2.0
+- `cram-sign` 1.2.0
 - `rdm-core` 0.1.0
 - `brotli-decompressor` 5.0.3
 - `default-boxed-derive` 0.2.0

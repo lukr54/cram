@@ -6,7 +6,7 @@ name = "cram-cli"
 # which the rest of the workspace skipped. They have moved together since 1.0.2, so this is the same
 # number as the workspace today and the override is kept only so the two can diverge again if
 # another crates.io-only fix is ever needed.
-version = "1.1.0"
+version = "1.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -29,15 +29,15 @@ path = "src/main.rs"
 # workspace and rewrites the dependency to the version when packaging for crates.io. Without the
 # version, `cargo publish` refuses the crate outright.
 [dependencies]
-cram-core = { path = "../cram-core", version = "1.1.0" }
+cram-core = { path = "../cram-core", version = "1.2.0" }
 # Reading the release JSON for `cram update`. Optional, so a default build (no `download`) does not
 # compile it; already in the graph via rdm-core, so it costs nothing extra in a shipped build.
 serde_json = { version = "1", optional = true }
 # See the `mimalloc` feature. Optional, so a default build never compiles it.
 mimalloc = { version = "0.1", optional = true }
-cram-mount = { path = "../cram-mount", version = "1.1.0" }
-cram-recovery = { path = "../cram-recovery", version = "1.1.0" }
-cram-sign = { path = "../cram-sign", version = "1.1.0" }
+cram-mount = { path = "../cram-mount", version = "1.2.0" }
+cram-recovery = { path = "../cram-recovery", version = "1.2.0" }
+cram-sign = { path = "../cram-sign", version = "1.2.0" }
 
 [features]
 default = []

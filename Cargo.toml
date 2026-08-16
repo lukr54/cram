@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lukr54/cram"
@@ -14,8 +14,16 @@ repository = "https://github.com/lukr54/cram"
 # Publishing the CLI forces publishing its whole dependency graph -- cargo will not accept a crate
 # whose dependencies are not on the registry. cram-core, cram-mount, cram-recovery, cram-sign and
 # rdm-core therefore go up too. They are implementation details of the CLI rather than libraries
-# offered for general use, and each says so in its own description; a breaking change to any of them
-# is a major version bump like anything else.
+# offered for general use, and each says so in its own description.
+#
+# WHAT THE VERSION NUMBER PROMISES, narrowed 2026-08-16. It tracks the `cram` command line and the
+# `.cram` format: a flag removed or repurposed, or an archive an older reader can no longer open, is
+# a major bump. It does NOT track the Rust API of the satellite crates. Those are on the registry
+# because cargo requires it, not because they are offered to depend on, and holding their signatures
+# stable would mean either freezing internals or bumping the CLI's major version for a change no CLI
+# user can observe. 1.2.0 changed `hw::load_profile` and `hw::save_profile` and added `hw::Wall`,
+# which under the old wording would have forced 2.0.0 and told every CLI user to expect a break that
+# does not exist. If you depend on one of these crates directly, pin an exact version.
 #
 # cram-shell opts OUT below: it is a COM cdylib that Explorer loads, useless as a dependency.
 publish = true
