@@ -1284,7 +1284,30 @@ pub fn derive_plan(
                         bottleneck,
                         shape: Shape::PerEntry,
                         workers: workers.max(1),
-                        writers: workers.max(1),
+                        // **Not `workers`, and not the core count either.**
+                        //
+                        // `workers` is capped by `blocks` because that is what *decoding* can be
+                        // spread over. Writing is a different question: one decode unit can hold a
+                        // hundred thousand files — a `.tar` is always exactly one — and the
+                        // sequential path writes them across a pool. Tying this to `blocks` left a
+                        // tar writing on one thread whatever it contained.
+                        //
+                        // The width knees early and then goes backwards, so it is capped rather than
+                        // taken from the machine. Kernel tree to tmpfs on a 24-core box, one binary,
+                        // sweeping this number:
+                        //
+                        // | writers | plain `.tar` | `.tar.lz4` | `.tar.zst` |
+                        // |---|---|---|---|
+                        // | 1 | 2.26 s | 2.55 s | 2.83 s |
+                        // | 4 | 1.52 s | 2.23 s | 2.79 s |
+                        // | **8** | **1.43 s** | 2.13 s | **2.68 s** |
+                        // | 12 | 1.46 s | **2.09 s** | 2.69 s |
+                        // | 16 | 1.50 s | 2.13 s | 2.71 s |
+                        //
+                        // Past eight the extra threads contend for page allocation and give time
+                        // back — at 24 a plain tar was 1.50 s and burned 311% CPU to do it. GNU tar
+                        // takes 1.69 s, so eight is also where this path overtakes it.
+                        writers: hw.physical.clamp(1, 8),
                         read_buf: 8 * MIB,
                         write_buf: 8 * MIB,
                         queue_bytes: workers.max(1) * 8 * MIB,
@@ -2198,10 +2221,18 @@ mod planner_table {
                 ));
             }
             // Whatever else moves, these must hold for every extraction plan.
-            assert_eq!(
-                p.writers, p.workers,
-                "{}: writers and workers are the same number on the per-entry shape",
-                c.name
+            //
+            // `writers == workers` used to be asserted here and is **deliberately no longer true**.
+            // It held while every extraction decoded and wrote on the same thread, so the two counts
+            // answered one question. The sequential path now decodes on one thread and writes on a
+            // pool, and `workers` is capped by the number of independently-decodable blocks — one,
+            // for any tar — while the number of files to write is not. What must still hold is that
+            // a plan never asks for writers it cannot use, and never asks for none.
+            assert!(
+                p.writers >= 1 && p.writers <= c.hw.logical.max(1),
+                "{}: {} writers is not a number this machine can serve",
+                c.name,
+                p.writers
             );
             assert!(
                 p.workers >= 1,

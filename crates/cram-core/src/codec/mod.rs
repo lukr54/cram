@@ -15,6 +15,26 @@ use std::io::Read;
 use crate::error::{ArchiveError, Result};
 use crate::format::Codec as StreamCodec;
 
+/// The brotli decoder's working buffer, and **not** simply "bigger is better" — the two things we
+/// care about move in opposite directions.
+///
+/// Every decoded byte passes through it, so a larger buffer decodes faster. But it also makes the
+/// decoder produce in burstier runs with longer gaps between them, and the extraction pipeline wants
+/// the opposite: a steady trickle keeps the writer pool fed. Swept on the kernel tree, two runs each:
+///
+/// | buffer | `cram x` | `cram t` (decode only) | CPU on `x` |
+/// |---|---|---|---|
+/// | 4 KiB (the crate's example value) | 5.41 s | 4.97 s | 129% |
+/// | **16 KiB** | **5.28 s** | **4.85 s** | 128% |
+/// | 64 KiB | 5.54 s | 4.70 s | 121% |
+/// | 256 KiB | 5.93 s | 4.61 s | 115% |
+/// | 1 MiB | 5.97 s | 4.49 s | 114% |
+///
+/// 16 KiB is the only value that beats 4 KiB on **both**; past it, extraction pays for what decoding
+/// gains and the falling CPU says why. Worth 2.4% and no more — brotli stays behind `brotli -dc`
+/// because the pure-Rust decoder is slower, which no buffer size fixes.
+const BROTLI_BUF: usize = 16 * 1024;
+
 pub mod plan;
 
 /// Decoding a run of concatenated streams on a pool instead of one at a time. Sits beside
@@ -303,7 +323,9 @@ pub fn decode_stream(
             frames::open_lz4(inner).map_err(|e| ArchiveError::Backend(format!("lz4: {e}")))?,
         ),
         // brotli has no multi-stream concept: two brotli streams end to end are not a brotli stream.
-        StreamCodec::Brotli => Box::new(brotli::Decompressor::new(inner, 4096)),
+        // The second argument is the decoder's own working buffer, and 4 KiB was the crate's example
+        // value rather than a chosen one — see [`BROTLI_BUF`].
+        StreamCodec::Brotli => Box::new(brotli::Decompressor::new(inner, BROTLI_BUF)),
     })
 }
 
