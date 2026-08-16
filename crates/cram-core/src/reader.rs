@@ -51,9 +51,27 @@ pub trait ArchiveReader {
     /// The detected container × codec.
     fn format(&self) -> Format;
 
-    /// The full member list (metadata only, no decode). Cheap: a central-directory / header scan.
-    /// `Result` because encrypted-name archives can't produce it until the header password is in.
+    /// The full member list (metadata only, no decode). Usually cheap: a central-directory or
+    /// header scan. `Result` because encrypted-name archives can't produce it until the header
+    /// password is in.
+    ///
+    /// **Not cheap for every backend** — see [`entries_are_cheap`](Self::entries_are_cheap).
     fn entries(&self) -> Result<&[Entry]>;
+
+    /// Whether [`entries`](Self::entries) can be answered without decoding the archive.
+    ///
+    /// A compressed tar cannot: its headers are interleaved with the bodies, so "skipping" a member
+    /// still decodes it, and building the list costs a **full pass**. Extracting one therefore paid
+    /// for two — measured on the kernel tree, `cram l` on a `.tar.bz2` takes 30.66 s and `cram t`
+    /// 61.37, an exact factor of two, and the same ratio holds for every codec.
+    ///
+    /// A caller that wants the listing (`cram l`) should ask for it and pay. A caller that is about
+    /// to stream every entry anyway should not, so the engine plans without it: for a tar the list
+    /// contributes nothing to the plan in any case, since `block_count` returns 1 for the container
+    /// and `plan_codec` reads only the codec.
+    fn entries_are_cheap(&self) -> bool {
+        true
+    }
 
     /// Pull the next member as a stream, or `None` at end of archive. The sequential path used for
     /// tar / raw / streaming-ZIP; the returned body borrows `self`.

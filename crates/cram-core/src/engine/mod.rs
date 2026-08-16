@@ -211,7 +211,16 @@ pub fn extract(
     // Derive the plan from the archive's codec/block shape (entries borrow ends with this block).
     let plan = {
         let units = reader.as_random_access().and_then(|ra| ra.decode_units());
-        let entries = reader.entries()?;
+        // Only ask for the member list when the backend can answer without decoding the archive.
+        // A compressed tar cannot, and an extraction is about to stream every entry anyway, so
+        // buying the list here means decoding the whole thing twice — an exact doubling, measured.
+        // Nothing below needs it for a tar in any case: `block_count` returns 1 for the container
+        // and `plan_codec` reads only the codec. See `ArchiveReader::entries_are_cheap`.
+        let entries: &[crate::model::Entry] = if reader.entries_are_cheap() {
+            reader.entries()?
+        } else {
+            &[]
+        };
         // Profile the DESTINATION drive, not the process's current directory: the plan has to
         // describe the disk the bytes actually land on, which for an extraction onto another disk
         // is not the one Cram happens to have been run from.

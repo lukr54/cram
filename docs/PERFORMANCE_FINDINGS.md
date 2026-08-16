@@ -1025,6 +1025,60 @@ those two had actually been measured.
 
 ---
 
+## 26. A compressed tar was decoded twice, and that was half of everything
+
+After findings 22–25 the tar family sat at `lz4` 1.05× behind, `zst` 1.27×, `br` 1.43× and `bz2`
+1.83×, with the causes believed to be a mixture of engine overhead and decoder speed. One
+measurement settles all four at once:
+
+| kernel-tree `.tar.bz2`, single-threaded | |
+|---|---|
+| `cram l` — build the member list | 30.66 s |
+| `cram t` — member list **and** bodies | 61.37 s |
+| our bzip2 decoder, one pass, no pipeline | 31.59 s |
+
+**An exact factor of two, and `cram l` is exactly one decode.** A tar's headers are interleaved with
+its bodies, so there is no way to enumerate members without decompressing everything — and
+extraction then decompressed everything again. The ratio held for every codec: `.tar.gz` was 2.16 s
+to list and 4.38 s to test.
+
+It was a documented limitation, sitting at the top of `formats/tar.rs` since the backend was
+written — *"a compressed tar is decoded twice for extraction… tar isn't the hot path (ZIP is); a
+single-pass optimization can come later"* — and it had quietly become the largest item in the
+project while four other things were fixed around it.
+
+**The fix is to stop buying what nothing uses.** The engine took `reader.entries()` before planning,
+and for a tar that list feeds *nothing*: `block_count` returns 1 for the container and `plan_codec`
+reads only the codec. Extraction progress starts at zero totals regardless. So `ArchiveReader` gained
+`entries_are_cheap()`, false for a compressed tar, and the engine plans without the list; the tar
+backend builds it lazily so `cram l` still pays for exactly one pass. The trait's own doc had
+asserted the opposite — *"Cheap: a central-directory / header scan"* — which is true of every other
+backend and was never true of this one.
+
+| codec | before | after | native | |
+|---|---|---|---|---|
+| `lz4` | 2.10 s | **1.47 s** | 2.01 s | **1.37× faster** |
+| `zst` | 2.69 s | **1.75 s** | 2.14 s | **1.22× faster** |
+| `gz` | 4.94 s | **2.85 s** | 6.17 s | **2.16× faster** |
+| `br` | 5.40 s | **3.15 s** | 3.77 s | **1.20× faster** |
+| `xz` | 5.50 s | **3.10 s** | 8.81 s | **2.84× faster** |
+| `bz2` | 5.90 s | **3.40 s** | 3.22 s | 1.06× slower |
+
+All six verified byte-identical against the source tree. Five of six now beat the tool everyone
+already has; `bz2` is the one left, and what remains there is that `lbzip2` ships its own
+decompressor which is ~1.3× the reference implementation's on a single thread (24.80 s against
+31.59 s on the same archive). Both sides scale about equally well — 92% efficiency at four threads
+against 94% — so it is per-thread speed and not parallelism.
+
+**Lesson.** *A cost that is documented stops being looked at.* This was written down as a known
+limitation years' worth of commits ago, with a reason attached ("tar isn't the hot path") that was
+true when written and stopped being true the moment tar extraction became the thing being optimised.
+Four separate fixes were made around it — a buffer, a channel, a syscall storm, a writer pool — and
+none of them prompted anyone to re-check the note that said the archive was being read twice. When a
+module's own docs name a limitation, price it before optimising anything else in that module.
+
+---
+
 ## Fixed since this document was written
 
 - **The create barrier.** `flush_batch` compressed synchronously, so the chunker stopped dead for

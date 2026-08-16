@@ -70,14 +70,17 @@ right comparison and `tar czf` is not: `tar czf` pipes through one thread, so be
 except that we use the machine. Numbers, and what the chunking costs, in
 [Writing `.tar.gz`](#writing-targz).
 
-**Reading one is now 1.25× faster than `gzip -dc | tar`** — 4.94 s against 6.17 on the kernel tree,
+**Reading one is now 2.16× faster than `gzip -dc | tar`** — 2.85 s against 6.17 on the kernel tree,
 both on a single decode thread, because a standard `.gz` cannot be parallelised by anybody. Until
 2026-08-15 this was 2.26× *slower*, and every cause was ours: a megabyte allocated and zeroed for
 every one of 94,778 entries, a decoder that could never get more than one message ahead of its
-consumer, an extraction path issuing 1.83 million syscalls where GNU tar issues 0.79 million, and
-files written on one thread while another decoded. **All six tar codecs improved, `.tar.xz` overtook
-`xz -dc | tar`, a plain `.tar` overtook GNU tar, and the four still behind are within 1.05–1.83×
-rather than 2.2–5.6×**; see [Where cram loses](#where-cram-loses).
+consumer, an extraction path issuing 1.83 million syscalls where GNU tar issues 0.79 million, files
+written on one thread while another decoded, and — worth about half of the total on its own — a
+compressed tar being decoded **twice**, once to list it and once to extract it.
+
+**Five of the six tar codecs are now faster than the tool everyone already has**, and a plain
+`.tar` is faster than GNU tar. `.tar.bz2` is the one that is not, at 1.06×; see
+[Where cram loses](#where-cram-loses).
 
 **One corpus exposed a real weakness, and it is mostly closed.** enwik9 is a single 1 GB file, and
 extraction fanned out per entry — one entry, one thread, whatever the machine. Cutting the entry at
@@ -546,29 +549,39 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
 
 ## Where cram loses
 
-- **Extracting a `.tar.*`, on four of six codecs.** Kernel tree, `/dev/shm`, archives written by
-  cram, every competitor re-measured in the same session on the same binary (2026-08-15), two runs
-  each agreeing within 2%:
+- **Extracting a `.tar.bz2`, and only that one.** Kernel tree, `/dev/shm`, archives written by
+  cram, every competitor re-measured in the same session on the same binary (2026-08-16), two runs
+  each agreeing within 2%. Five of the six are here because they used to be losses and the table
+  is the honest place to show they no longer are:
 
   | codec | cram | native | |
   |---|---|---|---|
-  | `xz` | **5.50 s** | 8.81 s | **1.60× faster** |
-  | `gz` | **4.94 s** | 6.17 s | **1.25× faster** |
-  | `lz4` | 2.10 s | 2.01 s (`lz4 -dc \| tar`) | 1.05× slower |
-  | `zst` | 2.69 s | 2.14 s | 1.27× |
-  | `br` | 5.40 s | 3.77 s (`brotli -dc \| tar`) | 1.43× |
-  | `bz2` | 5.90 s | 3.22 s (lbzip2) | 1.83× |
+  | `xz` | **3.10 s** | 8.81 s | **2.84× faster** |
+  | `gz` | **2.85 s** | 6.17 s | **2.16× faster** |
+  | `lz4` | **1.47 s** | 2.01 s (`lz4 -dc \| tar`) | **1.37× faster** |
+  | `zst` | **1.75 s** | 2.14 s | **1.22× faster** |
+  | `br` | **3.15 s** | 3.77 s (`brotli -dc \| tar`) | **1.20× faster** |
+  | `bz2` | 3.40 s | 3.22 s (lbzip2) | 1.06× slower |
 
   A plain `.tar` — no codec at all — is **1.44 s against GNU tar's 1.69**, which is the same engine
   underneath every row above.
 
-  This was 2.2–5.6× behind on every row that morning, and `bz2` was 19.1× behind. Three fixes, none
-  of them in a codec. The tar worker allocated and zeroed a 1 MiB buffer for **every entry** — 94,778
-  of them on this tree, to carry files averaging 20 KB — and passed results over a one-slot channel,
-  which is a ping-pong rather than a pipeline. The concatenated streams cram's chunked writer emits,
-  which had been walked one at a time, started being decoded on a pool. The extraction path was
-  asking the filesystem the same questions twice per file. And writing those files ran on one thread
-  while decoding ran on another, so the machine's other cores did nothing.
+  This was 2.2–5.6× behind on every row two days earlier, and `bz2` was 19.1× behind. Five fixes,
+  none of them in a codec. The tar worker allocated and zeroed a 1 MiB buffer for **every entry** —
+  94,778 of them on this tree, to carry files averaging 20 KB — and passed results over a one-slot
+  channel, which is a ping-pong rather than a pipeline. The concatenated streams cram's chunked
+  writer emits, which had been walked one at a time, started being decoded on a pool. The extraction
+  path was asking the filesystem the same questions twice per file. Writing those files ran on one
+  thread while decoding ran on another, so the machine's other cores did nothing.
+
+  **And a compressed tar was decoded twice.** A tar's headers are interleaved with its bodies, so
+  building the member list means decompressing everything — and then extraction decompressed it all
+  again. `cram l` on a `.tar.bz2` takes 30.66 s single-threaded and `cram t` 61.37, an exact factor
+  of two, and the same ratio held for every codec. The list is now built only when something asks
+  for it: `cram l` pays for one pass, and an extraction, which is about to stream every entry
+  anyway, pays for none. It was contributing nothing to the plan in any case — `block_count`
+  returns 1 for the container and `plan_codec` reads only the codec. **That single change is worth
+  1.9–2.0× on every row above.**
 
   **That last one is the reason every row above moved, and it is worth being precise about.**
   Extracting a plain `.tar` — no codec, nothing to decode — took 3.38 s against GNU tar's 1.73, so
@@ -587,11 +600,11 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
   pay ~3% for it rather than gaining, because their decode is single-threaded and is the wall, so
   extra writers only contend.
 
-  **`bz2` remains the outlier, and what is left is parallel *efficiency*, not the decoder.** Decoding
-  without writing anything, cram takes 5.29 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57.
-  Per core the three are the same: our decoder does 45.9 MiB/s on one thread and lbzip2 averages
-  49 MiB/s across its workers. The difference is what the parallelism returns — lbzip2 gets close to
-  linear scaling out of 24 threads, and cram gets 7.5× while occupying 17 cores' worth of CPU.
+  **`bz2` remains the outlier, and what is left is the decoder's single-thread speed.** Both sides
+  scale about as well — 92% efficiency at four threads for us against lbzip2's 94% — so the gap is
+  what each thread achieves. On the same archive single-threaded, `lbzip2 -dc -n 1` takes 24.80 s
+  where our decoder takes 31.59 s and `bunzip2 -c` takes 33.26: lbzip2 ships its own decompressor
+  and it is about 1.3× the reference implementation's. Ours is the reference implementation.
 
   **It is specifically not the codec library**, which was the obvious suspect and was measured rather
   than assumed: decoding an identical 400 MB stream, the pure-Rust `libbz2-rs-sys` takes 8.32 s and
@@ -603,9 +616,10 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
   decode on every core by splitting at the seams cram's own writer leaves; `pbzip2`, `lbzip2` and
   `cat a.xz b.xz` leave the same ones. An archive that is a **single** stream — what plain `bzip2`
   or `xz` produces — has nothing to split, and cram reads it at one-core speed like everyone else:
-  the same kernel tree through a single-stream `.tar.bz2` from stock `bzip2 -9` takes **62.4 s**, not
-  6.12. Detecting that costs nothing measurable (62.4 s against 62.5 s with the scan disabled
-  outright), but the speed is not there to be had.
+  the same kernel tree through a single-stream `.tar.bz2` from stock `bzip2 -9` takes tens of seconds,
+  not 3.40. Detecting that costs nothing measurable — 62.4 s against 62.5 s with the seam scan
+  disabled outright, measured before the double decode was removed — but the speed is not there to
+  be had.
 
   For scale: the same tree out of a `.cram` extracts in 1.84 s.
 - **Creating a `.tar.bz2` and a `.tar.xz`**, against the threaded specialists: bz2 7.85 s against

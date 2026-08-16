@@ -349,7 +349,11 @@ impl Drop for TarBody<'_> {
 pub struct TarReader {
     path: PathBuf,
     fmt: Format,
-    entries: Vec<Entry>,
+    /// Built on demand. For a **compressed** tar this costs a full decode — the headers are
+    /// interleaved with the bodies, so there is no way to read them without decompressing
+    /// everything — and an extraction that then streams every entry would pay for the archive
+    /// twice. See [`ArchiveReader::entries_are_cheap`].
+    listing: std::cell::OnceCell<Vec<Entry>>,
     rx: Option<Receiver<TarMsg>>,
     started: bool,
     /// Where the archive's independent streams begin, when it has more than one. `None` means the
@@ -360,11 +364,10 @@ pub struct TarReader {
 impl TarReader {
     pub fn open(path: &Path, fmt: Format, _pw: Arc<dyn PasswordProvider>) -> Result<Self> {
         let plan = multi::plan(path, fmt.codec);
-        let entries = scan(path, fmt, plan.as_ref())?;
         Ok(Self {
             path: path.to_path_buf(),
             fmt,
-            entries,
+            listing: std::cell::OnceCell::new(),
             rx: None,
             started: false,
             plan,
@@ -391,7 +394,18 @@ impl ArchiveReader for TarReader {
     }
 
     fn entries(&self) -> Result<&[Entry]> {
-        Ok(&self.entries)
+        if let Some(v) = self.listing.get() {
+            return Ok(v);
+        }
+        let v = scan(&self.path, self.fmt, self.plan.as_ref())?;
+        Ok(self.listing.get_or_init(|| v))
+    }
+
+    /// False for anything compressed: see the field doc on `listing`. A plain `.tar` still has to
+    /// be walked, but walking one is reading its headers and seeking past the bodies, which is not
+    /// the same order of cost as decompressing them.
+    fn entries_are_cheap(&self) -> bool {
+        self.fmt.codec == crate::format::Codec::None
     }
 
     fn next_entry(&mut self) -> Result<Option<EntryStream<'_>>> {

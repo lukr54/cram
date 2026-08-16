@@ -50,15 +50,33 @@ one thread; writing what it decodes does not, and both were running on one. Smal
 into a bounded batch — 32 MiB or 4,096 entries — and go out across eight writers, eight being where
 the width knees before contention starts giving time back.
 
-Kernel tree, and every codec moved because all of this is in the shared engine: plain `.tar` 3.38 s →
-**1.44**, `.tar.lz4` 3.66 → **2.10**, `.tar.zst` 3.93 → **2.69**, `.tar.gz` 5.58 → **4.94**,
-`.tar.br` 6.05 → **5.40**, `.tar.xz` 6.61 → **5.50**, `.tar.bz2` 7.46 → **5.90**. A plain `.tar` now
-extracts faster than GNU tar (1.69 s), `.tar.gz` faster than `gzip -dc | tar` and `.tar.xz` faster
-than `xz -dc | tar`. Extracted trees are byte-identical and modification times unchanged.
-
 `gz` and `br` pay about 3% for the writer pool rather than gaining, and that is worth saying: both
 decode on a single thread and that thread is the wall, so extra writers only contend for page
 allocation.
+
+**And a compressed tar was being decoded twice.** A tar's headers are interleaved with its bodies,
+so building the member list means decompressing the whole archive — and then extraction
+decompressed it all over again. `cram l` on a kernel-tree `.tar.bz2` takes 30.66 s single-threaded
+and `cram t` 61.37, an exact factor of two, and the same ratio held for every codec. The list is now
+built only when something asks for it, so `cram l` pays for one pass and an extraction — which is
+about to stream every entry anyway — pays for none. It was never feeding the plan: `block_count`
+returns 1 for a tar and `plan_codec` reads only the codec.
+
+Kernel tree, and every codec moved because all of this is in the shared engine:
+
+| | was | now | native | |
+|---|---|---|---|---|
+| plain `.tar` | 3.38 s | **1.44 s** | GNU tar 1.69 s | **1.17× faster** |
+| `.tar.lz4` | 3.66 s | **1.47 s** | 2.01 s | **1.37× faster** |
+| `.tar.zst` | 3.93 s | **1.75 s** | 2.14 s | **1.22× faster** |
+| `.tar.gz` | 5.58 s | **2.85 s** | 6.17 s | **2.16× faster** |
+| `.tar.br` | 6.05 s | **3.15 s** | 3.77 s | **1.20× faster** |
+| `.tar.xz` | 6.61 s | **3.10 s** | 8.81 s | **2.84× faster** |
+| `.tar.bz2` | 7.46 s | **3.40 s** | 3.22 s | 1.06× slower |
+
+Extracted trees are byte-identical to the source on all six and modification times are unchanged.
+`.tar.bz2` is the only one still behind, and what is left there is `lbzip2`'s own decompressor,
+which is about 1.3× the reference implementation's on a single thread.
 
 **One big file into a `.7z` used one core**, because solid mode asks for one uninterrupted LZMA2
 stream per pack and an archive of a single file is a single pack. enwik9 went from 375 s at 99% CPU
