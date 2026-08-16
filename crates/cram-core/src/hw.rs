@@ -1951,12 +1951,19 @@ mod tests {
     /// quarter of that wall.
     #[test]
     fn a_write_bound_plan_fields_enough_workers_to_saturate_the_wall() {
+        // Every field is stated. `..HwProfile::detect()` used to fill the rest, which left
+        // `ram_avail` and `work_drive` coming from whatever machine ran the test -- and
+        // `derive_plan` reads both, `ram_avail` for the memory cap and `work_drive` for the HDD
+        // check. On a 23 GiB box the cap allowed all nineteen workers and this passed; on a CI
+        // runner with a couple of gigabytes free the same call returned 2 and it failed. A planner
+        // test whose answer depends on the host is testing the host.
         let hw = HwProfile {
             logical: 24,
             physical: 24,
             smt: false,
             ram_total: 24 << 30,
-            ..HwProfile::detect()
+            ram_avail: 20 << 30,
+            work_drive: None,
         };
         let rates = Rates {
             deflate_enc: 5.0,
