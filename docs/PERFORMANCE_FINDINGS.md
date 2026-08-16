@@ -899,7 +899,9 @@ and bzip2 twenty-four:
 5.43 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57. So the pool works, and what remains is
 CPU per byte — **90 CPU-seconds against `bunzip2`'s 33** for the same data. That is not cram's
 machinery: on `gz` the identical pipeline costs 4.7 CPU-seconds against `gzip -dc`'s 5.74, which is
-*cheaper* than the reference. It is the pure-Rust bzip2 backend, and at 1662% CPU on a 24-thread
+*cheaper* than the reference. **This was later measured and the attribution was wrong — it is not the
+backend** (finding 25): an identical stream decodes in 8.32 s through the pure-Rust `libbz2-rs-sys`
+and 8.55 s through the C `bzip2-sys`. What is left is parallel efficiency. At 1662% CPU on a 24-thread
 machine no amount of extra width can close a 3.25× gap.
 
 **Two lessons.** A pool at 149% CPU with workers to spare is a buffer problem, not a scheduling
@@ -986,6 +988,42 @@ engine from every codec in one command, and a CPU profile would have shown the c
 `__libc_*` where it means nothing. And *`strace -c` time is not wall time either*: it put `futex` at
 60% of the syscall cost, and cutting `futex` by 65% moved the wall clock 4%. The **counts** are
 exact and were the useful part; the seconds column is inflated by the tracer on every call it counts.
+
+## 25. The slow codec was not the codec
+
+Finding 24 left `bz2` 1.83× behind `lbzip2 | tar` and `br` 1.43× behind `brotli -dc | tar`, and
+attributed both to the pure-Rust decoder crates: `cram t` spends **90 CPU-seconds** on a kernel-tree
+`.tar.bz2` where `bunzip2` spends 33, and our own machinery could be ruled out because the identical
+pipeline on `gz` costs *less* CPU than `gzip -dc`. The conclusion drawn was that C backends would
+close both, at the cost of putting C parsers on untrusted input.
+
+**Measured directly, and it is wrong.** Same 400 MB stream, best of three, the decoder alone with no
+pipeline around it:
+
+| | wall | throughput |
+|---|---|---|
+| pure-Rust `libbz2-rs-sys` | **8.32 s** | 45.9 MiB/s |
+| C `bzip2-sys` | 8.55 s | 44.6 MiB/s |
+| `bunzip2 -c` | 9.03 s | — |
+
+The Rust backend is *marginally faster* than the C one, and both beat the reference CLI. Brotli is
+the same story with a smaller margin: the Rust crate decodes a stream in 0.55 s against the C CLI's
+0.48. **Swapping either to C buys nothing**, so the security trade never had to be weighed.
+
+**Where the CPU actually goes is parallel efficiency.** Per core the implementations agree — ours
+does 45.9 MiB/s on one thread and `lbzip2` averages 49 MiB/s across its workers. What differs is the
+return on threads: lbzip2 turns 24 of them into roughly 24× (1096 MiB/s aggregate), and cram turns
+17 cores' worth of CPU into 7.5×. A 44% scaling efficiency against something close to linear is the
+open question — not the decoder.
+
+**Lesson.** *CPU-seconds against a reference tool locate a cost; they do not name it.* 90 against 33
+is a real difference, and the inference from it — a slower library — was the plausible one, was
+written into a public document, and took two micro-benchmarks and twenty minutes to disprove. The
+cheap test existed the whole time: run the two libraries over the same bytes with nothing else in
+the way. Ruling out our machinery was not the same as ruling *in* the dependency, and only one of
+those two had actually been measured.
+
+---
 
 ## Fixed since this document was written
 

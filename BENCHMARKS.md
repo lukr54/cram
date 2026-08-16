@@ -587,11 +587,17 @@ stream, so a 1-thread and a 24-thread run produce the same archive to the byte.
   pay ~3% for it rather than gaining, because their decode is single-threaded and is the wall, so
   extra writers only contend.
 
-  **`bz2` remains the outlier, and `cram t` says where the rest of it lives.** Decoding without
-  writing anything, cram takes 5.22 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57 — so the
-  pool works, and what is left is CPU per byte: 90 CPU-seconds against `bunzip2`'s 33 for the same
-  data. That is the pure-Rust bzip2 backend rather than cram's machinery, and the same machinery on
-  `gz` costs 4.7 CPU-seconds against `gzip -dc`'s 5.74. More workers cannot fix it.
+  **`bz2` remains the outlier, and what is left is parallel *efficiency*, not the decoder.** Decoding
+  without writing anything, cram takes 5.29 s against `lbzip2 -dc`'s 1.67 and `bunzip2 -c`'s 33.57.
+  Per core the three are the same: our decoder does 45.9 MiB/s on one thread and lbzip2 averages
+  49 MiB/s across its workers. The difference is what the parallelism returns — lbzip2 gets close to
+  linear scaling out of 24 threads, and cram gets 7.5× while occupying 17 cores' worth of CPU.
+
+  **It is specifically not the codec library**, which was the obvious suspect and was measured rather
+  than assumed: decoding an identical 400 MB stream, the pure-Rust `libbz2-rs-sys` takes 8.32 s and
+  the C `bzip2-sys` 8.55 s, so the Rust one is marginally the faster of the two and both beat the
+  `bunzip2` CLI's 9.03 s. Swapping the backend to C would gain nothing. The same holds for brotli:
+  the Rust crate decodes a stream in 0.55 s against the C CLI's 0.48 s.
 
   **The `xz` and `bz2` rows depend on the archive being a run of streams, and say so.** Those two
   decode on every core by splitting at the seams cram's own writer leaves; `pbzip2`, `lbzip2` and

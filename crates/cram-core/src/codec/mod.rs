@@ -32,7 +32,9 @@ use crate::format::Codec as StreamCodec;
 ///
 /// 16 KiB is the only value that beats 4 KiB on **both**; past it, extraction pays for what decoding
 /// gains and the falling CPU says why. Worth 2.4% and no more — brotli stays behind `brotli -dc`
-/// because the pure-Rust decoder is slower, which no buffer size fixes.
+/// because our whole read pipeline is, not because the decoder is: measured against the C CLI on an
+/// identical stream, this crate takes 0.55 s to its 0.48. No buffer size fixes the remainder, and
+/// neither would a C backend.
 const BROTLI_BUF: usize = 16 * 1024;
 
 pub mod plan;
