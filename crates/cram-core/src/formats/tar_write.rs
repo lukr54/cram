@@ -147,6 +147,12 @@ enum TarSink {
 /// — a penalty on every third-party tool that reads what we write, for a codec chosen because it is
 /// fast to read.
 ///
+/// The `cram x` row is stale in absolute terms. The tar decode path was reworked after this sweep,
+/// and the 16 August 2026 run puts `.tar.lz4` extraction at 1.22 s against `lz4 -dc | tar`'s 2.04 on
+/// the same tree, so cram now reads its own `.tar.lz4` faster than the native tool does. What the
+/// decision rests on is the difference between the two columns inside one run, and that was not
+/// re-measured.
+///
 /// It also *looked* like it gained 3% of ratio, which is impossible for chunking and was the clue
 /// worth following: the gain belonged to the block size, arriving by accident because a worker's
 /// first write is a whole 8 MiB chunk rather than a 512-byte tar header. That is [`LZ4_BLOCK`], and
@@ -851,6 +857,10 @@ fn br_quality(level: Level) -> u32 {
 /// pipe for anyone using the native tool. Paying 12% of our read speed and 24% of theirs to save 3%
 /// is backwards for the one codec chosen because it is fast to read; a caller who wants 3% has zstd
 /// beside it at 30% smaller. Recorded here so the 3.03% is not rediscovered and taken.
+///
+/// Same caveat as [`ChunkCodec`]'s table: this predates the tar decode rework, and the 16 August 2026
+/// run puts `.tar.lz4` extraction at 1.22 s against the native pipe's 2.04. The 12% and 24% are
+/// within-run deltas and were not re-measured; the archive sizes still hold, they are format output.
 const LZ4_BLOCK: BlockSize = BlockSize::Max64KB;
 
 const BR_BUF: usize = 256 << 10;

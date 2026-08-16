@@ -73,10 +73,17 @@ const MAX_SLOTS: usize = 64;
 
 /// Decoded bytes the pool may hold at once: `width × slots × CHUNK` is held to this.
 ///
-/// 256 MiB rather than something proportional to the machine, because past a certain width the pool
-/// stops being the bottleneck and the extra memory buys nothing. The tar consumer writes ~95,000
-/// files in about 5.5 s whatever fed it, so a decode that costs 15 CPU-seconds needs three workers
-/// to disappear behind it and gains nothing from twenty.
+/// 256 MiB rather than something proportional to the machine. This is a memory bound, and [`shape`]
+/// spends it on buffer depth before width, because depth is what decides whether the pool works at
+/// all.
+///
+/// **The arithmetic that used to justify the number is withdrawn.** It rested on the tar consumer
+/// writing ~95,000 files in about 5.5 s whatever fed it, and therefore on three workers being enough
+/// to hide a 15 CPU-second decode behind it. That floor is 1.19 s: the 16 August 2026 run extracts
+/// the 94,778-file kernel tree from a plain `.tar` in 1.19 s, on one machine, medians of 3, to
+/// `/dev/shm` with the archive read into page cache first. A floor that low asks for more workers
+/// than three, not fewer. The budget has not been re-derived against it. The shipping end-to-end
+/// figures from the same run are 3.14 s for `.tar.bz2` and 2.85 s for `.tar.xz`.
 const BUDGET: u64 = 256 << 20;
 
 /// Assumed decompression ratio, used only to guess how many chunks a piece will decode to.
@@ -353,9 +360,16 @@ fn merge(bounds: &[u64], len: u64, min_piece: u64) -> Vec<Piece> {
 /// pieces are 4 MiB, went 61.60 s → 8.85 s at 995% CPU, while xz, whose pieces are 32 MiB, went
 /// 20.68 s → 17.86 s at 149%. 32/4 predicts 1.14× and 1.16× is what it did.
 ///
+/// **Those four numbers are the rejected configuration, not the shipping one.** The fixed four-chunk
+/// buffer is exactly what this function exists to replace, so 8.85 and 17.86 are the cost of the
+/// mistake rather than current figures. What ships measures 3.14 s for `.tar.bz2` and 2.85 s for
+/// `.tar.xz` on the same tree: 16 August 2026, one machine, medians of 3, `/dev/shm` destination
+/// with the archive read into page cache first.
+///
 /// So size the buffer against the piece first and let the width take what is left of the budget.
-/// The two trade directly, and width is the one to give up: three or four workers already hide a
-/// decode behind the tar consumer, and the twentieth buys nothing.
+/// The two trade directly. Which one to give up is no longer settled by the argument that used to
+/// close this paragraph — "three or four workers already hide a decode behind the tar consumer" —
+/// because that consumer was taken to cost ~5.5 s and costs 1.19 s. See [`BUDGET`].
 ///
 /// `CRAM_WORKERS` caps the width, as everywhere else in the engine. The RAM fraction is the same
 /// 60% [`crate::formats::tar_write`] uses, and binds only on a machine with under ~430 MiB free.

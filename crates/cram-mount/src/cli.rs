@@ -2,10 +2,21 @@
 //! name (ignored) and the mount parameters are read from `args[1..]`, the same shape the former
 //! standalone `cram-mount` binary parsed, so behavior is unchanged.
 //!
-//! `cram mount [--selftest] [-p <pw>] <archive> <mount-dir>`, mount an archive as a virtual folder via
-//! ProjFS. The format is sniffed; every readable container mounts: the natively-seekable ones (`.cram`,
-//! ZIP, ISO 9660) serve ranges straight from disk, and the sequential ones (tar/7z/rar/raw) are decoded
-//! once into a bounded in-memory cache and served from there.
+//! ```text
+//! cram mount [--writable] [--remember] [--selftest] [-p <pw>] <archive> <mount-dir>
+//! cram mount --restore | --list | --forget <mount-dir>
+//! ```
+//!
+//! Mount an archive as a virtual folder via ProjFS. The format is sniffed; every readable container
+//! mounts: the natively-seekable ones (`.cram`, ZIP, ISO 9660) serve ranges straight from disk, and
+//! the sequential ones (tar/7z/rar/raw) are decoded once into a bounded in-memory cache and served
+//! from there.
+//!
+//! `--writable` keeps whatever is written into the mount folder as a layer over the archive, which is
+//! never modified. `--remember` records the mount in [`crate::registry`], and `--restore` brings the
+//! recorded ones back after a reboot; `--list` prints them and `--forget <mount-dir>` drops one. An
+//! encrypted archive is not remembered, because its password cannot be stored. The three list verbs
+//! mount nothing, so they answer before an archive and a directory are required.
 //!
 //! Without `--selftest`: mounts and waits for Enter (browse it in Explorer, then press Enter to
 //! unmount). With `--selftest`: mounts, walks + reads the whole virtual tree back through ProjFS,

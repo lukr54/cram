@@ -10,8 +10,10 @@
 //!   Works over a plain `Read`, so it covers tar, raw single-stream codecs, and *streaming* ZIP
 //!   (extract-while-download). `EntryStream::meta_final = false` marks optimistic metadata (a ZIP
 //!   local header / data-descriptor whose CRC/size is only confirmed by the trailing record).
-//! - **Random-access** ([`RandomAccessReader`]), the capability **ZIP and `.cram`** offer (both
-//!   seekable/individually-addressable). [`copy_entry`](RandomAccessReader::copy_entry) streams one entry into a
+//! - **Random-access** ([`RandomAccessReader`]), the capability **ZIP, 7z, `.cram` and ISO 9660**
+//!   offer (all seekable/individually-addressable; 7z through its block index and, where the archive
+//!   carries LZMA2 dictionary resets, the segments inside a block).
+//!   [`copy_entry`](RandomAccessReader::copy_entry) streams one entry into a
 //!   caller-supplied writer from its own file handle, so the parallel rayon extraction path fans out
 //!   *and* the engine keeps owning file-creation / overwrite policy / progress;
 //!   [`read_range`](RandomAccessReader::read_range) serves a byte-range of an entry's *uncompressed*
@@ -61,14 +63,18 @@ pub trait ArchiveReader {
     /// Whether [`entries`](Self::entries) can be answered without decoding the archive.
     ///
     /// A compressed tar cannot: its headers are interleaved with the bodies, so "skipping" a member
-    /// still decodes it, and building the list costs a **full pass**. Extracting one therefore paid
-    /// for two — measured on the kernel tree, `cram l` on a `.tar.bz2` takes 30.66 s and `cram t`
-    /// 61.37, an exact factor of two, and the same ratio holds for every codec.
+    /// still decodes it, and building the list costs a **full pass**. An extraction that bought the
+    /// list first therefore decoded the archive twice, and because both passes decode the same bytes
+    /// the cost is close to an exact doubling, for every codec.
     ///
     /// A caller that wants the listing (`cram l`) should ask for it and pay. A caller that is about
     /// to stream every entry anyway should not, so the engine plans without it: for a tar the list
     /// contributes nothing to the plan in any case, since `block_count` returns 1 for the container
     /// and `plan_codec` reads only the codec.
+    ///
+    /// What one pass costs, so the saving has a scale: cram extracts the kernel tree's `.tar.bz2` in
+    /// 3.14 s and its `.tar.xz` in 2.85 s — one machine, medians of 3, `/dev/shm` destination with
+    /// the archive read into page cache first, 16 August 2026.
     fn entries_are_cheap(&self) -> bool {
         true
     }
@@ -77,16 +83,19 @@ pub trait ArchiveReader {
     /// tar / raw / streaming-ZIP; the returned body borrows `self`.
     fn next_entry(&mut self) -> Result<Option<EntryStream<'_>>>;
 
-    /// Random-access capability, `Some` for seekable containers (ZIP and `.cram`). Its presence is
-    /// what lets the orchestrator choose the tuned parallel per-entry path over the sequential one.
+    /// Random-access capability, `Some` for seekable containers (ZIP, 7z, `.cram`, ISO 9660). Its
+    /// presence is what lets the orchestrator choose the tuned parallel per-entry path over the
+    /// sequential one.
     fn as_random_access(&self) -> Option<&dyn RandomAccessReader> {
         None
     }
 }
 
-/// Per-entry random access (ZIP and `.cram`; later ranged 7z). `Send + Sync` and safe to call
+/// Per-entry random access (ZIP, 7z, `.cram`, ISO 9660). `Send + Sync` and safe to call
 /// from many rayon workers at once, implementors open their own handle per call rather than
-/// sharing a cursor, so many workers extract independently.
+/// sharing a cursor, so many workers extract independently. Ranged 7z has landed: see
+/// [`entry_splits`](Self::entry_splits), `formats::sevenz`, and the segment cutter in
+/// `formats::lzma2seg`.
 pub trait RandomAccessReader: Send + Sync {
     /// The full member list (already scanned at open).
     fn entries(&self) -> &[Entry];
@@ -173,10 +182,13 @@ pub trait RandomAccessReader: Send + Sync {
     ///
     /// This exists because [`copy_entry`](Self::copy_entry) is the wrong shape for a solid format.
     /// It addresses one entry, so serving a block's entries through it means decoding the block and
-    /// *keeping* it — 7z extraction of the benchmark corpus went from 190 MB of peak RSS to 1.8 GB
-    /// that way, against 7-Zip's 176 MB, to be 10% faster than it. The bytes are already flowing
-    /// past in the right order; the only reason to hold them was that the interface had no way to
-    /// hand them over as they went by.
+    /// *keeping* it: 7z extraction of the benchmark corpus peaked at 1.8 GB of RSS that way, against
+    /// 190 MB once the bytes were handed over as they emerged. Measured when this landed and not
+    /// re-measured since. The 176 MB 7-Zip figure that used to sit beside it is dropped rather than
+    /// carried forward: 7-Zip's measured peak across the four corpora of the 16 August 2026 run is
+    /// 255 / 1176 / 2284 / 4877 MB, and none of those is near it. The bytes are already flowing past
+    /// in the right order; the only reason to hold them was that the interface had no way to hand
+    /// them over as they went by.
     ///
     /// `visit` is not required to read the body it is given. The implementor must drain whatever is
     /// left before moving on, since a solid stream has to be advanced past an entry to reach the

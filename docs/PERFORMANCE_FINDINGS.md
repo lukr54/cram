@@ -10,6 +10,25 @@ reading `.7z`, including the scheduler and calibration changes that came out of 
 Machines: Ryzen 7 3700X / 16T / 15.9 GiB / Windows 11, and Ryzen 9 5900X / 24 vCPU /
 23 GiB / Ubuntu 24.04 (KVM guest).
 
+## Corpora referenced below
+
+This document spans six weeks and reuses "the kernel tree" for checkouts whose file counts do not
+agree with each other: 86,618 / 94,753 / 94,778 / 94,829 all appear somewhere below. Two findings
+that both say "the kernel tree" are not necessarily measuring the same bytes. Named here so a table
+can cite a specific one instead of the generic name:
+
+| tag | files | size stated in this document | where it is used |
+|---|---:|---|---|
+| kernel-86618 | 86,618 | 1605 MiB | item 1, 14 Aug re-run |
+| kernel-94753 | 94,753 | not stated as a total | item 1's original text (2–3 Aug); items 2, 6, 8, 9 and 11 say "the kernel tree" / "linux tree" unqualified in the same window and are presumed, not confirmed, to be this same checkout |
+| kernel-94778 | 94,778 | **1,920,837,858 bytes** per `MEASURED-2026-08-16.md` | item 10 (3 Aug), items 22 and 24 (14 Aug), and every figure this pass adds in a "Superseded" header. A matching file count across three weeks is presumed to mean the same pinned checkout, not confirmed byte-for-byte |
+| kernel-94829 | 94,829 | not stated as a total | item 7 (3 Aug) only |
+
+Silesia (211,938,580 bytes), enwik9 (1,000,000,000 bytes) and Cram corpus 1.0 (2,800,604,582 bytes,
+42,151 files, 15.0% duplicate — called "the corpus" or "the public corpus" below) are fixed public or
+pinned datasets and do not have this problem. Item 3's "enwik8" (95.4 MiB) is a distinct, smaller
+corpus used only there.
+
 ---
 
 ## 1. Extraction of many small files is pathologically slow
@@ -115,6 +134,24 @@ the default level (zstd packs).
 
 ## 3. `PACK_TARGET` caps the match window at 8 MiB
 
+**Superseded by the 16 August 2026 run.** `PACK_TARGET` no longer exists. Pack size is now
+`pack_target_for(level)` (`formats/cram.rs:226`), tiered per level exactly as the paragraph below
+recommends — 8 MiB at `--fast`, 16 MiB at `--auto` (default), 32 MiB at `Level::Best`, and the format
+ceiling (64 MiB less one maximum chunk) at `--small`/`--tiny`. "If this is pursued, tie pack size to
+level" is not an open recommendation; it shipped. The 32 MiB tier is not reachable from the command
+line: `--best` is a compatibility alias for `--small`, so it lands on the 64 MiB tier.
+
+The Silesia comparison this section draws also has its sign reversed. 16 August, medians of 3: cram
+`--small` writes **48,394,418 B** (ratio 0.2283) against `xz -9e`'s **48,624,588 B** (0.2294) — cram
+is **0.47% smaller**, not "roughly two thirds of a 3.0% deficit" behind it. Against `7-Zip -mx=9`
+tuned (48,287,980 B, 0.2278) cram is 0.22% larger and no longer holds the smallest archive on this
+corpus.
+
+The original text follows for the reasoning, which still holds even though both figures it quotes
+have moved.
+
+---
+
 **Severity: medium. Cause confirmed, fix has a real trade-off.**
 
 `formats/cram.rs` sets `PACK_TARGET = 8 * 1024 * 1024`. Unique chunks are grouped into packs
@@ -149,6 +186,23 @@ Note issue 1 first: larger packs would make a pack-locality problem worse, not b
 ---
 
 ## 4. The calibration profile is not consumed by the create path
+
+**Superseded by the 16 August 2026 run.** The create path now calls `hw::` directly.
+`formats/cram.rs:1547` computes `hw::create_batch(pack_target, &hwp)`, whose ceiling is
+`hw.logical` — not a hardcoded 16 — and whose budget is half the machine's available RAM
+(`hw.rs:1014-1044`). "`engine/create.rs` contains no `hw::` reference" and "the hardcoded
+`clamp(1, 16)` caps pack compression at 16 concurrent packs... 8 threads are unavailable to create
+by construction" both describe code that no longer exists; `rayon::current_num_threads()` does not
+appear anywhere in the tree.
+
+Current kernel-tree create at the default level, 16 August (kernel-94778, see Corpora above):
+**7.64 s**, 2092 MB peak RSS, against 7-Zip `-mx=5`'s 50.06 s at 5963 MB — 6.6x faster. The create
+CPU-utilization figure this section quotes (~930% of 2400%) has not been re-profiled; only the code
+path this section is about has changed.
+
+The original text follows.
+
+---
 
 **Severity: medium (correctness of the abstraction, not of output).**
 
@@ -196,6 +250,21 @@ measured wall it is not re-measuring.
 ---
 
 ## 6. `--best` is hard to justify in its current form
+
+**Superseded by the 16 August 2026 run.** Reversed. On the Linux kernel tree (kernel-94778,
+94,778 files, 1,920,837,858 bytes — see Corpora above), cram `--small` (`--best` renamed, see item
+1) now writes **450,691,514 B** (ratio 0.2346) against 7-Zip `-mx=5`'s **452,190,211 B** (0.2354) —
+cram is **0.33% smaller**, not larger. 7-Zip is still faster: **50.06 s against 118.86 s, 2.37x**,
+not 1.18x.
+
+The default-level "gap 7-Zip has no answer for" cannot be re-checked as written — `-mx=1` was never
+re-measured on 16 August — but the default level itself is still well ahead of 7-Zip's default:
+cram `--auto` **7.64 s / 493,816,077 B (0.2571)** against 7-Zip `-mx=5` **50.06 s / 452,190,211 B
+(0.2354)**, 6.6x faster for a 9.2% larger archive.
+
+The original text follows.
+
+---
 
 **Not a bug. A design question raised by the numbers.**
 
@@ -245,7 +314,7 @@ Three things follow.
   `walk`'s `fs::metadata`, the filesystem is touched three times per entry before a byte is
   compressed.
 - **For `.cram` the probe is pure waste.** `CramArchiveWriter::add_file` takes `_hint: WriteHint`
-  and ignores it, where `zip_write.rs:172` and `sevenz_write.rs:156` both consume it. The pass costs
+  and ignores it, where `zip_write.rs` and `sevenz_write.rs` both consume it. The pass costs
   its 2.33 s and every one of those extra opens, and the `.cram` writer discards the verdict.
 - **Hashing is not the bottleneck and never was.** BLAKE3 is 722 ms against read+CDC's 7239 ms,
   running at ~3.2 GiB/s. Parallelising it would buy almost nothing.
@@ -287,6 +356,22 @@ pack ids reserved per buffer rather than a single `next_pack_id`, since two buff
 ---
 
 ## 9. Raising the pack-batch clamp makes create SLOWER. Measured, not assumed
+
+**Superseded by the 16 August 2026 run.** `batch: rayon::current_num_threads().clamp(1, 16)` is
+gone. Pack-compression concurrency now comes from `hw::create_batch(pack_target, &hw)`
+(`hw.rs:1014`), ceilinged at `hw.logical` and budgeted against half the machine's available RAM
+rather than a flat thread clamp — see item 4's header. The clamp-16-vs-clamp-64 comparison below
+describes a mechanism that no longer ships; it has not been re-run against the RAM-budgeted
+replacement, and no such sweep is in the 16 August canonical run.
+
+Current kernel-tree create at the default level, 16 August (kernel-94778, see Corpora above):
+**7.64 s, 2092 MB peak RSS**. Not directly comparable to the 8.36 s / 1.22 GB row below — a
+different code path, and the corpus behind that row was never pinned to a byte count in this
+document.
+
+The original text follows.
+
+---
 
 **Tried and rejected 2026-08-03. This contradicts issue 4, which is corrected below.**
 
@@ -358,6 +443,18 @@ assuming more packs in flight is free.
 ---
 
 ## 11. The pack-batch cap: measured on one machine, not yet a rule
+
+**Superseded by the 16 August 2026 run.** The question this section leaves open — derive the batch
+cap rather than guess it — was resolved by replacing the mechanism, not by finding a better
+constant for it. `hw::create_batch` (`hw.rs:1014-1044`) ceilings at `hw.logical`, sized against half
+the available RAM: `((ram_avail / 2) / (pack_bytes * 12)).clamp(1, hw.logical)`. There is no more
+flat `clamp(1, 16)` for any machine to be "1% off" or "13% off" of; "the shipped `clamp(1, 16)`" in
+the sweep below is code that no longer exists. The 4/8/12/16/20/24 sweep and its "half the logical
+cores" reading were the input to that redesign, not a result it left standing.
+
+The original text follows.
+
+---
 
 Following issue 9, the cap was swept on the idle 24-thread box, kernel tree, warm cache. Archive size
 was **identical at every setting**, so batching never reaches the output.
@@ -486,11 +583,33 @@ straddling entry by every pack it touches. Worth perhaps 20-30% of the remaining
 
 ## 14. Pack size is the match window. 32 MiB is the knee, and the spec caps it anyway
 
+**Superseded by the 16 August 2026 run.** The "off the frontier" comparison this section opens with
+reverses. Kernel tree (kernel-94778, see Corpora above): cram `--small` (`--best` renamed, see item
+1) now writes **450,691,514 B** (0.2346) against `7z -mx=5`'s **452,190,211 B** (0.2354) — cram is
+0.33% smaller, not larger, though `-mx=5` is still 2.37x faster (50.06 s against 118.86 s). It is no
+longer "the only cell in `BENCHMARKS.md` where a competitor dominated outright" — the dominating
+cell on 16 August is `7-Zip -mx=9` (442,486,736 B in 93.59 s, spread 8.4%; quote the spread with it
+or not at all, per the truth file's own instruction).
+
+`PACK_TARGET` is gone; pack size is tiered by level (`pack_target_for`, `formats/cram.rs:226`),
+exactly the "tie pack size to level" recommendation from item 3. But the tiering did not stop at
+this section's 32 MiB knee: `--fast` gets 8 MiB, `--auto` 16 MiB, the internal `Best` tier 32 MiB —
+and `--small`/`--tiny` (the renamed `--best`, i.e. what this section's sweep actually measured) get
+the full format ceiling, 64 MiB less one maximum chunk. "The question is closed rather than
+deferred" did not hold: the code comment justifying the ceiling for `--small`/`--tiny` cites "32 →
+64 MiB measured 0.7% on Silesia" (`formats/cram.rs:236-238`) — undated, not in the 16 August run,
+carried forward from that comment and not independently verified here.
+
+The original text follows.
+
+---
+
 `.cram` compresses each pack independently, so the pack **is** the archive's match window. 8 MiB of
 context against LZMA's whole-archive solid block is why `7z -mx=5` beat `--best` on the kernel tree
 on both axes at once, the only cell in `BENCHMARKS.md` where a competitor dominated outright.
 
-Swept with `CRAM_PACK_TARGET`, linux tree, `--best`, 24 threads:
+Swept with `CRAM_PACK_TARGET`, linux tree (exact snapshot not recorded — see Corpora above),
+`--best`, 24 threads:
 
 | pack | output | create | create RSS | verify | extract | packs | decodes/pack |
 |---|---|---|---|---|---|---|---|
@@ -529,6 +648,23 @@ measuring with the feature enabled, and it matters more than `--best` does, bein
 without passing a flag.
 
 ## 15. The chunker is no longer one thread, and the win is mostly pipelining, not parallelism
+
+**Superseded by the 16 August 2026 run.** Every absolute figure in the lane sweep below is beaten by
+the canonical run, same corpus (Cram corpus 1.0, 2,800,604,582 bytes, 42,151 files, 15.0%
+duplicate — see Corpora above): `--store` **2.58 s** against the sweep's best of 4.08 s at 24 lanes;
+`--fast` **2.45 s** against 3.96 s; `--auto` **6.95 s** against the "10.73 to 10.97 s, which is
+noise" the prose below reports. The *shape* survives — store and fast gain from pipelining, auto
+does not move — the absolutes do not.
+
+`prepare_lanes` (`hw.rs:1099-1112`) caps the compressing case (`packs_are_cheap = false`, i.e.
+`--fast`/`--auto`) at **`(logical / 8).clamp(2, 6)`, a ceiling of 6, not 3**. Below, "caps the
+compressing case at 3" and "shipped lane counts: `--fast` and `--auto` get 3" both describe what
+that formula evaluates to on this 24-thread machine specifically, not the cap itself — a 48-thread
+machine gets 6, not 3.
+
+The original text follows.
+
+---
 
 Finding 9 above concluded that "the chunker is a single thread on the critical path, and every extra
 compression worker takes cores away from it". That was true when it was written and is no longer:
@@ -814,6 +950,19 @@ every later one is free, and a segment decode per read would be worse.
 
 ## 22. Reading a `.tar.*` was 2–5× behind, and none of it was tar, the codecs or the filesystem
 
+**Superseded by the 16 August 2026 run.** Findings 23–26 fixed most of what this section found, and
+16 August adds a canonical measurement on top of all of them. Current tar-family extraction, kernel
+tree (kernel-94778, see Corpora above), destination `/dev/shm`, medians of 3: plain `.tar` **1.19 s**
+against GNU tar's 1.69 (1.42x); `gz` **2.63 s** against `gzip -dc`'s 6.13 (2.33x); `xz` **2.85 s**
+against `xz -dc -T0`'s 8.91 (3.13x); `lz4` **1.22 s** against 2.04 (1.67x); `zst` **1.53 s** against
+2.14 (1.40x); `br` **2.91 s** against 3.71 (1.27x); `bz2` **3.14 s** against `lbzip2 -dc`'s 3.24 —
+level, not a loss (see finding 26 and its own correction below).
+
+The original text follows for how the two-decode bug and the syscall storm were found; none of the
+"before/after" figures in it are current.
+
+---
+
 Extraction of a `.tar.gz` sat at 2.26× behind `gzip -dc | tar`, across every codec, against readers
 using a single thread. Three separate diagnoses were written down and all three were wrong.
 
@@ -991,6 +1140,19 @@ exact and were the useful part; the seconds column is inflated by the tracer on 
 
 ## 25. The slow codec was not the codec
 
+**Superseded by the 16 August 2026 run.** The bottom-line consequence this section explains — cram
+behind `lbzip2` on `.tar.bz2` — is no longer true. 16 August, tar-family, medians of 3: cram
+**3.14 s** against `lbzip2 -dc`'s **3.24 s** on 497,686,838 bytes — level, not a loss (also F1,
+medians of 5: cram 3.16 s against lbzip2 3.22 s, spread ≤2.2%; see finding 26's own correction).
+Finding 26 (the double-decode fix) is most of why: it roughly halved what `cram t` spends on this
+codec. The per-core throughput and scaling-efficiency figures below (45.9 vs 49 MiB/s single-core,
+44% vs near-linear multi-core) are a separate, lower-level measurement outside the 16 August run;
+they are not re-measured here and may or may not still hold.
+
+The original text follows.
+
+---
+
 Finding 24 left `bz2` 1.83× behind `lbzip2 | tar` and `br` 1.43× behind `brotli -dc | tar`, and
 attributed both to the pure-Rust decoder crates: `cram t` spends **90 CPU-seconds** on a kernel-tree
 `.tar.bz2` where `bunzip2` spends 33, and our own machinery could be ruled out because the identical
@@ -1064,11 +1226,33 @@ backend and was never true of this one.
 | `xz` | 5.50 s | **3.10 s** | 8.81 s | **2.84× faster** |
 | `bz2` | 5.90 s | **3.40 s** | 3.22 s | 1.06× slower |
 
-All six verified byte-identical against the source tree. Five of six now beat the tool everyone
-already has; `bz2` is the one left, and what remains there is that `lbzip2` ships its own
-decompressor which is ~1.3× the reference implementation's on a single thread (24.80 s against
-31.59 s on the same archive). Both sides scale about equally well — 92% efficiency at four threads
-against 94% — so it is per-thread speed and not parallelism.
+> **Superseded in every cell by the 16 August 2026 run.** The table above was measured without
+> warming the archive, so each figure carries a cold read of the archive off a SATA drive, worth
+> roughly 0.2 s. Re-measured to `/dev/shm` with the archive warmed, medians of 3, all verified:
+>
+> | codec | cram | native | |
+> |---|---|---|---|
+> | `lz4` | **1.22 s** | 2.04 s | **1.67×** |
+> | `zst` | **1.53 s** | 2.14 s | **1.40×** |
+> | `gz` | **2.63 s** | 6.13 s | **2.33×** |
+> | `br` | **2.91 s** | 3.71 s | **1.27×** |
+> | `xz` | **2.85 s** | 8.91 s | **3.13×** |
+> | `bz2` | 3.14 s | 3.24 s | level |
+>
+> **Six of six now match or beat the native tool**, so the "five of six... `bz2` is the one left"
+> conclusion below does not hold, and neither does the explanation under it. `bz2` is level rather
+> than a win: F1 re-ran it at medians of 5 and got cram 3.16 s against lbzip2 3.22 s with spreads of
+> 1.0% and 2.2%, a gap inside the noise. Do not blend that 5-round pair with the 3-round pair in this
+> table; they are two measurements at different repetition counts.
+
+All six verified byte-identical against the source tree. Five of six beat the tool everyone already
+has, and `bz2` looked like the one left over.
+
+*It was not.* The 1.06× came from a single unwarmed run; re-measured with the archive in page cache
+it is level, and the investigation that followed the gap explained something that did not exist.
+What that investigation established is still worth keeping, because it rules things out: it is not
+the Rust port (`libbz2-rs-sys` and C `bzip2-sys` measure within 3%) and not parallel scaling
+(92% efficiency at four threads against lbzip2's 94%). It was the measurement.
 
 **Lesson.** *A cost that is documented stops being looked at.* This was written down as a known
 limitation years' worth of commits ago, with a reason attached ("tar isn't the hot path") that was

@@ -3,7 +3,7 @@
 //! mechanics; this engine owns the tree walk, per-entry file I/O, progress, and cancellation.
 //!
 //! Naming mirrors the CLI intuition: a top-level input keeps its own base name as the archive root
-//! (`cramc a out.zip pics` → `pics/…`, `cramc a out.zip note.txt` → `note.txt`). Directories are
+//! (`cram a out.zip pics` → `pics/…`, `cram a out.zip note.txt` → `note.txt`). Directories are
 //! emitted before their children so empty dirs are preserved.
 
 use std::fs::{self, File};

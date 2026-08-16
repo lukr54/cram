@@ -1,7 +1,9 @@
 //! The orchestrator: the piece that consumes [`hw::derive_plan`]. It sniffs the format, opens a
 //! reader, derives the plan from the machine profile + the archive's codec/block shape, and
-//! dispatches, the parallel per-entry path when the format is random-access (ZIP), otherwise the
-//! sequential path (RAR/tar/7z/raw).
+//! dispatches, the parallel per-entry path when the format is random-access (ZIP, 7z, `.cram`,
+//! ISO 9660), otherwise the sequential path (RAR/tar/raw). 7z moved onto the parallel path when
+//! `as_random_access` landed for it; a solid block is served as one coalesced work item rather than
+//! as its entries, so the path is per-*unit* there and per-entry elsewhere.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -213,7 +215,8 @@ pub fn extract(
         let units = reader.as_random_access().and_then(|ra| ra.decode_units());
         // Only ask for the member list when the backend can answer without decoding the archive.
         // A compressed tar cannot, and an extraction is about to stream every entry anyway, so
-        // buying the list here means decoding the whole thing twice — an exact doubling, measured.
+        // buying the list here means decoding the whole thing twice, and because both passes decode
+        // the same bytes that is close to an exact doubling.
         // Nothing below needs it for a tar in any case: `block_count` returns 1 for the container
         // and `plan_codec` reads only the codec. See `ArchiveReader::entries_are_cheap`.
         let entries: &[crate::model::Entry] = if reader.entries_are_cheap() {
@@ -287,7 +290,8 @@ pub fn extract(
     // ours to remove, even when this run overwrote it.
     let created = unwind::CreatedLog::default();
 
-    // Random-access (ZIP) → tuned parallel per-entry; everything else → sequential stream.
+    // Random-access (ZIP, 7z, `.cram`, ISO 9660) → tuned parallel per-entry; everything else
+    // (RAR, tar, raw single-stream) → sequential stream.
     let out = if reader.as_random_access().is_some() {
         let ra = reader.as_random_access().unwrap();
         parallel::run(ra, dest, plan.workers, opts.skip_existing, sink, &created)

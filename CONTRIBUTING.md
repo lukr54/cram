@@ -1,9 +1,8 @@
 # Contributing to Cram
 
-Thanks for looking. Cram is a small, opinionated codebase. Read
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first; every source file also carries a module-level
-`//!` comment explaining what it is for. The
-module-level `//!` comments in each file are the streets.
+Thanks for looking. Cram is 88 `.rs` files, 41,663 lines, across 8 crates. Read
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first: it is the map. Every source file also carries a
+module-level `//!` comment explaining what it is for, and those are the streets.
 
 **Found a security problem? Do not open a public issue**, see [`SECURITY.md`](SECURITY.md).
 
@@ -57,7 +56,7 @@ Optional features are opt-in so the base build always compiles:
 | `zstd-c` | full-range zstd encoder (C libzstd). **The shipped binary is built with this**, it is not a pure-Rust build. |
 | `download` | `cram dl` segmented downloader, and `cram update`. Opens no listening socket. |
 | `phash` | perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos. Pure Rust, but a large dependency tree. |
-| `mimalloc` | replaces the system allocator. Create is allocation-heavy — a pack buffer per lane, a chunk buffer per file, a small `Vec` per chunk of every file — so the allocator sits on the hot path. C, so it is opt-in; **on in the shipped binary**. |
+| `mimalloc` | replaces the system allocator. Create is allocation-heavy (a pack buffer per lane, a chunk buffer per file, a small `Vec` per chunk of every file), so the allocator sits on the hot path. C, so it is opt-in; **on in the shipped binary**. |
 
 The release CLI is built as:
 
@@ -80,15 +79,15 @@ libraries. A dependency that pulled in a runtime DLL the way `cram.exe` pulls in
 `cram --version` prints which of these are compiled in, worth checking before you report a bug,
 since a `zstd-c` build writes different `.cram` bytes than the pure-Rust default.
 
-`cram diag report` writes that and the rest of what a bug report needs — the machine profile that
-decides Cram's thread and pack sizing, the archive's pack layout and codec mix, the create timings,
-and every entry that failed — into one text file you can attach. Nothing is sent anywhere. File and
-folder names are described by shape rather than included, so it is safe to attach to a public issue
-without reading it first; `--full-paths` includes the real names if a maintainer asks.
+`cram diag report` writes what a bug report needs into one text file you can attach: the machine
+profile that decides Cram's thread and pack sizing, the archive's pack layout and codec mix, the
+create timings, and every entry that failed. Nothing is sent anywhere. File and folder names are
+described by shape rather than included, so it is safe to attach to a public issue without reading it
+first; `--full-paths` includes the real names if a maintainer asks.
 
 Two things worth knowing when you use it. `cram <any command> --diag-report` writes a report for
-that run whether it succeeded or failed, which is how to report something that worked but was slow —
-the timings only exist while the command is running. And `cram diag on` adds a per-entry trace,
+that run whether it succeeded or failed, which is how to report something that worked but was slow,
+since the timings only exist while the command is running. And `cram diag on` adds a per-entry trace,
 which costs a little speed and is therefore off until you ask for it.
 
 ### Mounting
@@ -114,19 +113,29 @@ cargo test -p cram-core         # one crate
 cargo test -- --ignored         # runs ONLY the ignored (heavy) tests
 ```
 
-On default features that is **273 passing tests, 0 failures**, and **286** with the features the
-release is built with (`download,zstd-c,phash,mimalloc`), which compile code the default build leaves out.
-Counted on `main` after 1.1.0. Those counts drift with every commit and are given only as a sanity check; green
-is the gate.
+Counted on `a84d77d`, 16 August 2026, with zero failures on either platform:
 
-One test is marked `#[ignore]` on default features: it pushes more than 16 MiB through the pure-Rust
-XZ compressor and is skipped for time, not because it fails. A `download` build has a second, named
-`sleeper`, which is not a test at all; it is the child process that
-`a_running_binary_can_still_be_replaced` starts so it has a genuinely running executable to replace.
+| | default features | `download,zstd-c,phash,mimalloc` |
+|---|---:|---:|
+| Windows | 310 | 323 |
+| Linux | 296 | 309 |
+
+Windows runs more because the Windows-only path and shell tests do not exist elsewhere; the release
+feature set adds tests that compile code the default build leaves out. These counts drift with every
+commit and are a sanity check rather than a target. Green is the gate.
+
+One test is marked `#[ignore]` on default features:
+`unencrypted_multipack_build_is_byte_identical` (`crates/cram-core/tests/reproducible.rs:138`) builds
+a 36 MB fixture twice and checks that the multi-pack archive comes out byte-identical both times. It
+is skipped for the cost of generating and chunking 36 MB twice in a debug build, not for the
+compressor: the fixture is incompressible, so the probe stores each pack raw and XZ is never entered.
+Run it with `cargo test -- --ignored`. A `download` build has a second, named `sleeper`, which is not
+a test at all; it is the child process that `a_running_binary_can_still_be_replaced` starts so it has
+a genuinely running executable to replace.
 
 [`crates/cram-core/tests/fuzz_parsers.rs`](crates/cram-core/tests/fuzz_parsers.rs) runs as part of
 that suite: a bounded smoke-fuzz of every pure-Rust parser (150 iterations each by default). It
-drives the random-access side as well as `next_entry`, because they read different structure — the
+drives the random-access side as well as `next_entry`, because they read different structure: the
 7z one walks LZMA2 chunk framing that the sequential path never looks at. Each input gets its own
 thread and 60 seconds, so a parser that never returns is a reported failure with a re-runnable seed
 rather than a run that merely looks slow. Raise it when you touch a parser:

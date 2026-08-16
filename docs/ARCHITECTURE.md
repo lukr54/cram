@@ -22,9 +22,12 @@ The traits are in [`cram-core/src/reader.rs`](../crates/cram-core/src/reader.rs)
 ```
 ArchiveReader          the read core (every readable container)
   ├ format()           the detected Container × Codec
-  ├ entries()          the full member list (a cheap header/central-directory scan)
+  ├ entries()          the full member list (a header/central-directory scan — cheap, unless
+  │                    entries_are_cheap() below says it isn't)
+  ├ entries_are_cheap() whether entries() can be answered without a decode; false for a compressed
+  │                    tar, whose headers are interleaved with the bodies
   ├ next_entry()       pull the next member as a streamed (metadata, body)   ← sequential path
-  └ as_random_access() Some(..) for seekable containers (ZIP, .cram, ISO)    ← unlocks the parallel path
+  └ as_random_access() Some(..) for seekable containers (ZIP, 7z, .cram, ISO)    ← unlocks the parallel path
 
 RandomAccessReader     the per-entry capability (Send + Sync)
   ├ entries()
@@ -119,12 +122,15 @@ measured:
   instead of 11.
 - `copy_unit` serves a whole unit in one pass, handing each entry over as its bytes decode. The
   per-entry `copy_entry` cannot express that for a solid format: serving a block through it means
-  decoding the block and *keeping* it, which cost 1.8 GB of peak RSS where streaming costs 175 MB.
+  decoding the block and *keeping* it, which cost 1.8 GB of peak RSS where streaming costs 190 MB
+  (figures from `RandomAccessReader::copy_unit`'s own doc comment in `reader.rs`; not part of the
+  16 August canonical run and carries no machine or repetition count of its own).
 - `entry_splits` answers the opposite question: not how wide the *archive* can fan out, but how wide
   **one entry** can. That is the number that matters when an archive holds very few of them. A 1 GB
   `.cram` of a single file spans sixty independent packs and still extracted on one thread, because
-  the unit of work was the entry and there was one — 9.05 s at 1.0 effective cores against 7-Zip's
-  1.64 s at 4.4. `.cram` cuts at pack boundaries, the only seams that do not make two workers decode
+  the unit of work was the entry and there was one — 9.03 s at 1.0 effective cores against 7-Zip's
+  1.61 s at 4.4 (same source and caveat as above: `entry_splits`' doc comment, undated). `.cram` cuts
+  at pack boundaries, the only seams that do not make two workers decode
   the same pack; the engine decodes a window of pieces concurrently and writes them in order, which
   needs no positional writes and leaves every rule around the bytes where it was.
 
@@ -141,14 +147,17 @@ measured:
 
 **A block that will not fit the cache is streamed, not refused.** Both the archive-level gate and the
 segment gate used to judge the wrong quantity, and between them a `.7z` written by a
-single-threaded encoder fell out of this path entirely and back onto the sequential reader. The
-lesson generalises: a gate written for one shape of access outlives the reason for it silently, and
-the cost shows up as a whole path not being taken rather than as a failure.
+single-threaded encoder fell out of this path entirely and back onto the sequential reader. The cost
+showed up as a whole path not being taken rather than as a failure, which is why it survived so
+long.
 
 **Everything else, tar, RAR, a bare compressed stream; takes the sequential path**
-([`engine/sequential.rs`](../crates/cram-core/src/engine/sequential.rs)), one entry at a time. These
-are front-to-back streams with no seek interface: entry *n* can only be decoded by decoding what precedes
-it, so there is nothing to fan out over.
+([`engine/sequential.rs`](../crates/cram-core/src/engine/sequential.rs)). Decode is one entry at a
+time: these are front-to-back streams with no seek interface, entry *n* can only be decoded by
+decoding what precedes it, so there is nothing to fan out over on that side. Writing is not bound the
+same way, small entries accumulate into a bounded batch (32 MiB or 4,096 entries, whichever comes
+first) and go out across a pool, sized by `Plan::writers` rather than by `Plan::workers` (see "Worker
+count" below).
 
 The two paths share the write machinery in
 [`engine/mod.rs`](../crates/cram-core/src/engine/mod.rs), `restore_mtime`, the `ProgressWriter` that
@@ -179,32 +188,42 @@ cached in `%APPDATA%\cram\profile.toml`, keyed by a schema version and a machine
 roaming profile is re-measured rather than misapplied. The write-ceiling probe is bounded and is
 skipped when the destination is short on free space, a calibration must never be what fills someone's
 disk; absence in the profile means "not measured", never `0`. `hw::derive_plan` turns those inputs
-into a `Plan`, and `engine::parallel` sizes its pool from `plan.workers`. The `calibrate` binary runs
-the same measurements standalone.
+into a `Plan`, which carries two pool sizes rather than one: `engine::parallel` sizes its rayon pool
+from `plan.workers`, and `engine::sequential` sizes its batching writer pool from `plan.writers`
+(`hw.rs`) — deliberately not always the same number, since on the sequential path decode concurrency
+and write concurrency are different questions (see §3 above). The `calibrate` binary runs the same
+measurements standalone.
 
 **The profile holds two kinds of number and they do not have the same scope.** Codec rates belong to
 the CPU and are the same wherever the bytes land, so one set is kept per machine. A write wall
-belongs to the *volume*, so it is recorded per volume (`wall.<key>`, from `st_dev` on unix and the
-volume root on Windows). Keeping one machine-wide wall meant whichever destination was extracted to
+belongs to the *volume*, so it is recorded per volume, keyed from `st_dev` on unix and the volume
+root on Windows. Profile schema 4 stores it under two prefixes rather than one: `wall.<key>` for a
+figure a probe watched step down and sample past, `burst.<key>` for one that never left the drive's
+cache. Only the first sizes a worker pool. Keeping one machine-wide wall meant whichever destination was extracted to
 first set the figure for every later one — a `/dev/shm` measurement of 2689.6 MiB/s was live here,
 planning writes to an ext4 disk. A destination never measured gets no wall rather than another
 volume's, and probes.
 
-**A write-bound plan sizes its pool from those two rates, not from a fraction of the cores.** Being
-write-bound is a claim about their ratio, so saturating a wall of `wall` MiB/s at `decode_rate`
-MiB/s per worker takes `wall / decode_rate` workers. The fixed `(physical * 3 / 4).clamp(4, 8)` this
-replaced was right only for a codec fast enough that eight workers outrun any drive; on a slow one
-it contradicted the decision it came from, projecting twenty-one units of LZMA decode against the
-wall to *call* the extraction write-bound and then running eight. The old value survives as a floor,
-so this can only add workers. It follows that a wrong wall now sets a wrong thread count, which is
-why the per-volume scoping above is not a tidiness matter.
+**A write-bound plan sizes its pool from those two rates, not from a fraction of the cores — but only
+when the wall is trustworthy.** Being write-bound is a claim about their ratio, so saturating a wall
+of `wall` MiB/s at `decode_rate` MiB/s per worker takes `wall / decode_rate` workers, and that scaling
+fires only when the wall is a measured **sustained** ceiling (`wall.sustained`, `hw.rs`): a burst
+reading, a probe that never left the drive's cache, falls back to the same fixed floor as before
+instead of scaling by a number that may be nothing but page-cache bandwidth. The fixed
+`(physical * 3 / 4).clamp(4, 8)` this replaced was right only for a codec fast enough that eight
+workers outrun any drive; on a slow one it contradicted the decision it came from, projecting
+twenty-one units of LZMA decode against the wall to *call* the extraction write-bound and then
+running eight. The old value survives as that floor, so this can only add workers. It follows that a
+wrong wall now sets a wrong thread count, which is why the per-volume scoping above is not a tidiness
+matter — and that an honest but unsustained wall is not a wrong one: it simply declines to scale.
 
 ### `cram test`
 
 [`engine/verify.rs`](../crates/cram-core/src/engine/verify.rs) mirrors the same dispatch: it decodes
 every entry, writing nothing to disk, and checks what the container makes checkable. It must use
-`copy_entry` for random-access formats, `next_entry` for `.cram` materializes a whole entry body in
-memory and caps its size, so verifying a large healthy `.cram` entry through it would wrongly fail.
+`copy_entry` for random-access formats. It cannot fall back to `next_entry` for `.cram`, because
+that path materializes a whole entry body in memory and caps its size, so verifying a large healthy
+`.cram` entry through it would wrongly fail.
 
 What "verified" means is per format, and the difference matters:
 
@@ -239,7 +258,9 @@ What "verified" means is per format, and the difference matters:
 engine::create walks the source tree → a member list (dirs before children, sorted for determinism)
   → probe::classify_file per entry (store-vs-compress) when the level is Auto
     → formats::create(path, fmt, opts) → Box<dyn ArchiveWriter>
-      → add_dir / add_file(entry, body, hint) per member → finish() -> CreateReport
+      → add_dir(entry) per directory; for files, add_file(entry, body, hint) — or, when the writer's
+        own takes_paths() says yes, add_path(entry, path, hint) hands over the path instead and the
+        writer reads it on its own schedule (only `.cram` says yes) → finish() -> CreateReport
 ```
 
 The adaptive **probe** ([`probe.rs`](../crates/cram-core/src/probe.rs)) classifies each file in two
@@ -255,9 +276,14 @@ intact until the new one is complete, and what makes a failed create leave the o
 Same directory means same volume, so the rename is atomic.
 
 **Symlinks and other special files are skipped on create**; only regular files and directories are
-archived. They are skipped **silently**, nothing counts or names them in the `CreateReport` or in
-the CLI's `created …` line, so an archive of a tree containing symlinks is quietly missing those
-members and there is no runtime signal of it.
+archived. Symlinks are not dropped in silence: the walk names every one it skips in
+`CreateReport.skipped_links` (`writer.rs`), and the CLI prints a warning naming the first five and
+counting the rest — "N symbolic links were not archived; the archive is not a complete copy of the
+source" — so a tree containing symlinks says so at creation time, while the source is still there to
+check against. `tests/symlinks.rs` covers the count and the naming across every writable format, that
+a directory symlink is not followed into the archive, and that a symlink cycle terminates rather than
+hanging. Other special files, a FIFO, a socket, a device node, have no archive representation either
+and stay genuinely silent: only symlinks are counted and named.
 
 `convert` ([`engine/convert.rs`](../crates/cram-core/src/engine/convert.rs)) is the read and write
 spines composed: read any source front-to-back and stream each entry into a destination writer, so
@@ -361,10 +387,14 @@ byte-level spec is [`CRAM_FORMAT.md`](CRAM_FORMAT.md); the code is
 - **Global dedup**: each chunk is identified by its BLAKE3 hash and stored once, so an identical chunk
   *anywhere* across all inputs costs nothing further, dedup with no dictionary-window limit, unlike
   classic solid compression.
-- Surviving chunks are grouped into **packs** (~8 MiB), each compressed as a unit (stored / XZ /
-  zstd), and a **footer index** maps entries to chunk lists and chunks to (pack, offset, length). The
-  index sits at EOF so the writer can stream packs out in a single pass. Pack granularity is also the
-  mount's seek unit, there is no separate mount format.
+- Surviving chunks are grouped into **packs**, sized by level (`pack_target_for`,
+  `formats/cram.rs`): 8 MiB at `--fast`, 16 MiB at `--auto` (the default), up to the format's ceiling
+  less one maximum chunk (64 MiB − 256 KiB) at `--small`/`--tiny`. (`Level::Best`'s 32 MiB tier exists
+  in the enum but is not reachable from the `cram` CLI today: its `--best` flag is an undocumented
+  compatibility alias for `--small`.) Each pack is compressed as a unit (stored / XZ / zstd), and a
+  **footer index** maps entries to chunk lists and chunks to (pack, offset, length). The index sits at
+  EOF so the writer can stream packs out in a single pass. Pack granularity is also the mount's seek
+  unit, there is no separate mount format.
 - **Encryption** (optional): the password is stretched with **Argon2id** over a random per-archive
   salt, and every pack and the index are sealed with **AES-256-GCM**; compress-then-encrypt, a fresh
   nonce per blob, the pack id or index role as AAD. The index's own tag doubles as the password
@@ -575,6 +605,14 @@ Archives are untrusted input, so hardening is centralized rather than sprinkled 
   - **`phash`** (off by default in the engine, **on** in the shipped CLI) adds perceptual image
     hashing. It gates `cram dedup --similar`, which on a default build prints "rebuild with
     --features phash" and does nothing. §4's perceptual "similar" groups depend on it.
+  - **`mimalloc`** (off by default, **on** in the shipped CLI) swaps `cram-cli`'s global allocator for
+    mimalloc, a C allocator, ahead of the system one — create is allocation-heavy (a pack buffer per
+    lane, a chunk buffer per file, one small `Vec` per chunk), which is what it targets. Unlike the
+    three features above it lives only in `cram-cli` (`#[global_allocator]` in `main.rs`), not in
+    `cram-core`, so it changes nothing about which formats or codecs are compiled. Kept optional so a
+    default build stays compilable on a bare mingw toolchain with zero C dependencies; on in the
+    shipped binary, which already links C for UnRAR (and libzstd when `zstd-c` is on), so it costs
+    that build nothing new.
   - `cram --version` prints which of these the binary was built with.
 - **ProjFS binding is clean-room and lazy.** The mount uses the MIT/Apache `windows` crate's ProjFS
   *type* definitions rather than the GPL `windows-projfs` crate, and lives in its own crate. The

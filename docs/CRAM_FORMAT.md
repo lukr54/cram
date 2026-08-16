@@ -39,9 +39,9 @@ document and the code disagree, that is a bug in one of them; please file it.
 
 `packs_start` is `8` for an unencrypted archive and `8 + 28 = 36` for an encrypted one. The index
 sits at the end of the packs region (immediately before the trailer) so the writer can stream packs
-out in a single forward pass, appending throughout. It seeks exactly once, back to offset 6, and
-only when it has to promote the archive to v2 because an entry was transformed. The trailer records where the index begins, so a reader finds everything by reading the
-fixed-size trailer first.
+out in a single forward pass, appending throughout. It seeks exactly once, back to offset 6, and only
+when it has to promote the archive to v2 because an entry was transformed. The trailer records where
+the index begins, so a reader finds everything by reading the fixed-size trailer first.
 
 ---
 
@@ -91,8 +91,8 @@ an untrusted file, a reader **must** clamp them before use (§8): reject `m_cost
 ## 4. Packs region
 
 The packs region is the concatenation of every pack blob, back to back, with no padding or
-separators. A pack is a group of unique file chunks (§10) compressed, and, if encrypted, sealed; 
-as one unit. Nothing in the region is self-describing: a pack's location, on-disk length, codec, and
+separators. A pack is a group of unique file chunks (§10) compressed, and, if encrypted, sealed, as
+one unit. Nothing in the region is self-describing: a pack's location, on-disk length, codec, and
 decompressed length all come from the pack table in the index (§6). A reader therefore never scans
 the region; it seeks to a pack by its index entry.
 
@@ -165,7 +165,7 @@ before trusting it in any budget calculation.
 - `is_dir`, `0` for a file, non-zero for a directory.
 - `name`, the member path, UTF-8, forward-slash separated, no leading slash. Two distinct rules:
   - a name that is **not valid UTF-8** is corruption, the reference reader rejects the whole
-    archive (§9 item 13);
+    archive (§9 item 15);
   - a name that is valid UTF-8 but **unsafe as a path** is handled three different ways, and the
     difference matters to anyone writing a reader:
     - **dropped** (neither listed nor extracted, archive not rejected): a `..` component, any
@@ -191,9 +191,9 @@ before trusting it in any budget calculation.
 
 A v1 archive **cannot** hold a symbolic link: there is no field for a target, and `mode` carries
 permission bits only. The writer therefore does not archive them, and `cram a` reports every one it
-left out, by name, on stderr. Saying nothing was a real defect: a Linux kernel tree went in with 99
-links and came out with none while `cram t` called the archive clean, because by its own index it
-was.
+left out on stderr, with the first five named. Saying nothing was a real defect: a Linux kernel tree
+went in with 99 links and came out with none while `cram t` called the archive clean, because by its
+own index it was.
 
 **The intended mechanism, when this is implemented**, so that nothing else claims the space:
 
@@ -295,8 +295,8 @@ any violation as corruption (never a panic, never an unbounded allocation):
 12. **Path depth:** an entry name with more than 4096 path components is dropped, not extracted.
 13. **Transform expansion:** a transformed entry's declared `size` may be at most **64×** the summed
     length of its chunks. A transformed entry whose chunks sum to zero is rejected.
-12. Reject an unknown pack `codec`, only STORE (0), XZ (1), and ZSTD (2) are defined (§11).
-13. Every entry `name` must be valid UTF-8; a non-UTF-8 name is corruption and rejects the archive.
+14. Reject an unknown pack `codec`, only STORE (0), XZ (1), and ZSTD (2) are defined (§11).
+15. Every entry `name` must be valid UTF-8; a non-UTF-8 name is corruption and rejects the archive.
     (A name that is valid UTF-8 but unsafe as a path is *not* corruption, see §6.)
 
 ---
@@ -312,9 +312,17 @@ index fully determines reconstruction, but it explains why the format deduplicat
   across versions of a file) produce identical chunks.
 - A chunk's identity is its **BLAKE3** hash (256-bit). The writer keeps a hash→chunk-id table; a
   chunk whose hash is already present is not stored again, its id is simply referenced.
-- Unique chunks accumulate into a pack buffer; when the buffer reaches the writer's pack target
-  (8 MiB at `--fast`, 16 MiB at `--auto`, the §9 maximum at `--small`; always `≤ 64 MiB`, §9 check 5) it is
-  flushed as a pack (§4). A pack that compression does not shrink is stored with codec STORE so a
+- Unique chunks accumulate into a pack buffer; when the buffer reaches the writer's pack target it is
+  flushed as a pack (§4): 8 MiB at `--fast`, 16 MiB at `--auto` (default), and 64 MiB less one
+  maximum chunk (64 MiB − 256 KiB) at `--small`/`--tiny`. The reference writer carries a fourth tier
+  of 32 MiB that the `cram` command line cannot currently select: `--best` is an undocumented
+  compatibility alias for `--small`, so it reaches the 64 MiB tier and not the 32 MiB one. An
+  independent writer may use any target it likes within §9. That largest target is not the
+  §9 check 5 ceiling itself, it sits one `max`-sized chunk below it: the buffer is only checked
+  against the target *after* the chunk that pushes it there is added, so a target of exactly 64 MiB
+  could still flush a pack with `raw_len` up to 64 MiB + 255 KiB, which every conforming reader
+  rejects. Backing off by one maximum chunk (§10's `max = 256 KiB`) keeps the flushed `raw_len` at or
+  under 64 MiB in every case. A pack that compression does not shrink is stored with codec STORE so a
   pack never grows.
 
 The dedup identity (BLAKE3) is a writer-side concern only; the format records chunk **locations**,
@@ -331,10 +339,12 @@ not hashes, so a reader neither computes nor trusts any hash.
 | ZSTD  | 2  | pack plaintext is a single zstd frame; `raw_len` is its decoded length    |
 
 Every build can **decode** all three codecs (the XZ and zstd decoders are pure-Rust and always
-present), so any `.cram` file is readable regardless of which build produced it. Which codec a **writer** emits is a
-build and effort-level choice, and does not affect readability. A pure-Rust build always writes XZ.
-Every officially released binary is built with `zstd-c` and writes **ZSTD** at `--fast` and `--auto`
-and **XZ** at `--small`, picking STORE for any pack the codec fails to shrink.
+present), so any `.cram` file is readable regardless of which build produced it. Which codec a
+**writer** emits is a build and effort-level choice, and does not affect readability. A pure-Rust
+build always writes XZ. Every officially released binary is built with `zstd-c` and writes **ZSTD**
+at `--fast` and `--auto`. At `--small` it compresses every pack with **both** XZ and ZSTD and keeps
+whichever is smaller, so a released `--small` archive carries a mix of XZ, ZSTD and STORE, never XZ
+alone. STORE is picked for any pack neither codec shrinks.
 
 ---
 
@@ -375,7 +385,7 @@ Two caveats:
   (STORE/XZ/ZSTD), footer index, trailer, optional whole-archive AES-256-GCM with Argon2id.
 - **v2**, adds the per-entry `transform` byte (§6) and, with it, `LEPTON`: lossless JPEG
   recompression. Photos are already entropy-coded, so a general-purpose compressor gains ~0% on them;
-  redoing that coding is worth ~23% while still reconstructing the original file byte-for-byte. The
-  writer emits v2 only when a transform was actually used, and verifies every candidate round-trips
-  before storing it, a file that fails to verify is stored untransformed. Everything else is
-  unchanged from v1.
+  redoing that coding was worth 23.6% while still reconstructing the original file byte-for-byte, on
+  one folder of 34 phone photos (26.1 MB): a single sample, not a benchmark. The writer emits v2 only
+  when a transform was actually used, and verifies every candidate round-trips before storing it, a
+  file that fails to verify is stored untransformed. Everything else is unchanged from v1.

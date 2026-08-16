@@ -9,122 +9,282 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Things that ran on one thread, and one that could not run at all.
+**Ships as 1.2.0.** The manifests are already at 1.2.0; this heading and its link reference get the
+version and the date when the tag is cut.
 
-**Reading a `.tar.*` was the largest weakness in the project and is now, on four of seven, faster
-than the tool everyone already has.** Four separate causes, each measured; the running totals below
-are stages, and the standings are in the last of them.
+`cram-core`'s Rust API did break in this cycle — `hw::load_profile` and `hw::save_profile` changed
+signature and `hw::Wall` is new — and an earlier reading of the workspace policy would have made
+that 2.0.0. The policy was narrowed instead (see the comment in the workspace `Cargo.toml`): the
+version number tracks the `cram` command line and the `.cram` format, not the Rust API of crates
+that are on crates.io only because publishing the CLI requires it. No flag was removed or
+repurposed and no archive an older reader could open has become unreadable, so no CLI user faces a
+break. Anyone depending on those crates directly should pin an exact version.
 
-First, the tar worker allocated and zeroed a megabyte for **every entry** — 94,778 of them on the
-Linux kernel tree, to carry files averaging 20 KB — and passed the results over a one-slot channel,
-so the decoder could never get more than one message ahead of whoever was writing the files. Kernel
-tree: `.tar.gz` 13.99 s → 5.58; `.tar.zst` 11.94 → 3.93; `.tar.lz4` 10.95 → 3.66; `.tar.br`
-15.77 → 6.05. Writing the 94,778 files was never the cost — that is 0.32 s — and neither was
-inflate.
+Two themes. Reading a `.tar.*` was the largest weakness in the project, and it is now faster than
+the tool everyone already has on six of seven codecs and level on the seventh. And the containers
+that still wrote an archive on one core, `.zip` and `.tar.xz` and `.tar.bz2` and `.tar.zst` and a
+`.7z` holding one large file, now use the machine.
 
-**A `.tar.bz2` or `.tar.xz` now decodes on every core.** Compressing on every core means cutting the
-tar into chunks and writing each as a complete standalone stream, and we had been writing those
-seams for months and then reading them back one at a time. They are findable: a bzip2 stream begins
-with a header the previous stream's end-of-stream magic sits in front of, and an xz stream with a
-header whose CRC checks out behind a `YZ` footer. Cram scans for them, decodes the spans between
-them on a pool, and yields the bytes in order. `.tar.xz` 20.79 s → 6.61; `.tar.bz2` 62.08 → 7.46,
-against `bunzip2 -c | tar`'s 34.81 for the same archive.
+**Where the figures come from.** Anything below dated 16 August 2026 is from one canonical run:
+`cram 1.1.0`, commit `a84d77d`, features `download,zstd-c,phash,mimalloc`, on a Ryzen 9 5900X with
+24 threads and 23 GiB of RAM under Ubuntu 24.04.4, decoding to `/dev/shm` with the archive read into
+page cache first. Every other figure was measured when the change landed, between 12 and 16 August
+2026, on the same machine but not under that method, and carries its date where it appears. One
+machine and one afternoon either way.
 
-This works on any archive that is a run of concatenated streams, not only cram's own — `pbzip2` and
-`lbzip2` output, Wikipedia multistream dumps, `cat a.xz b.xz` — and a single-stream archive falls
-back to the sequential decoder unchanged. Nothing about what cram *writes* changed. A false seam
-cannot corrupt an extraction silently, since the spans either side of it fail to decode. Bare `.xz`
-and `.bz2` files take the same path. `CRAM_PARALLEL_DECODE=0` turns it off.
+**Reading a `.tar.*`.** Linux kernel tree, 94,778 files, 1,920,837,858 bytes, extracted to
+`/dev/shm` with the archive warmed; medians of 3 with the warm-up discarded, spreads 0.7–4.7%, every
+extraction `diff -rq`'d against the source. Measured 16 August 2026.
 
-**Extraction stopped asking the filesystem the same question twice per file.** A plain `.tar` — no
-codec, nothing to decode — took 3.38 s where GNU tar took 1.73, so none of that gap was compression.
-`strace` counted **1.83 million syscalls against GNU tar's 0.79 million**, and most of the excess was
-work whose answer we already had: a `mkdir` for every *file* rather than every directory, which
-failed `EEXIST` 94,779 times on the Linux kernel tree; two `statx` per file asking about paths the
-following `openat` was about to answer; a second `openat` per file because the modification time was
-stamped by path instead of on the descriptor still open; and 526,938 `read` calls to move 2 GB,
-because a plain `.tar` was handed an unbuffered file and the tar parser reads 512-byte headers.
+| codec | cram | native | standing | archive bytes |
+|---|---:|---|---|---:|
+| plain `.tar` | **1.19 s** | GNU tar 1.69 s | **1.42x faster** | 1,997,117,440 |
+| `.tar.lz4` | **1.22 s** | `lz4 -dc` 2.04 s | **1.67x faster** | 763,711,608 |
+| `.tar.zst` | **1.53 s** | `zstd -dc` 2.14 s | **1.40x faster** | 534,639,379 |
+| `.tar.gz` | **2.63 s** | `gzip -dc` 6.13 s | **2.33x faster** | 558,402,429 |
+| `.tar.xz` | **2.85 s** | `xz -dc -T0` 8.91 s | **3.13x faster** | 454,397,720 |
+| `.tar.br` | **2.91 s** | `brotli -dc` 3.71 s | **1.27x faster** | 487,982,888 |
+| `.tar.bz2` | 3.14 s | `lbzip2 -dc` 3.24 s | level | 497,686,838 |
 
-**And a tar's files are now written on every core.** Decoding one is a single pass and has to stay
-one thread; writing what it decodes does not, and both were running on one. Small entries accumulate
-into a bounded batch — 32 MiB or 4,096 entries — and go out across eight writers, eight being where
-the width knees before contention starts giving time back.
+`.tar.bz2` was run five more times on its own to settle which side of level it falls on. cram's
+median is 3.16 s over a 1.0% spread against lbzip2's 3.22 s over 2.2%, so the 1.9% gap is inside the
+noise: not a win, and not a loss either. Extraction to a real disk is write-bound and the tools
+converge, so these figures say what a decoder can do rather than what a drive will.
 
-`gz` and `br` pay about 3% for the writer pool rather than gaining, and that is worth saying: both
-decode on a single thread and that thread is the wall, so extra writers only contend for page
-allocation.
+### Added
 
-**And a compressed tar was being decoded twice.** A tar's headers are interleaved with its bodies,
-so building the member list means decompressing the whole archive — and then extraction
-decompressed it all over again. `cram l` on a kernel-tree `.tar.bz2` takes 30.66 s single-threaded
-and `cram t` 61.37, an exact factor of two, and the same ratio held for every codec. The list is now
-built only when something asks for it, so `cram l` pays for one pass and an extraction — which is
-about to stream every entry anyway — pays for none. It was never feeding the plan: `block_count`
-returns 1 for a tar and `plan_codec` reads only the codec.
+- **`--tiny`**, a rung below `--small` that reaches for a slower encoder where one exists. Today
+  that is one thing: a `.zip` is written with zopfli instead of the usual DEFLATE encoder, and the
+  output is an ordinary DEFLATE stream that every unzip already reads. Silesia: **64,712,418 bytes
+  against `--small`'s 67,799,807, 4.55% off, in 316 s against 5.5**, so about sixty times the wall
+  time. A separate rung rather than part of `--small` because the trade is different in kind, and
+  folding it in would turn a flag people use into one they would avoid. No other container here has
+  a slower encoder to reach for. Measured 15 August 2026.
 
-Kernel tree, and every codec moved because all of this is in the shared engine:
+- `CRAM_PROFILE=1` prints the extraction plan and every input to it — bottleneck, workers, decode
+  units, measured decode rate and write wall — so "why did this run on two threads" is one line
+  rather than an afternoon of bisecting. It now also prints the walk, the store-versus-compress
+  probe and the zip writer's own wait/parse/copy split, for every backend rather than only `.cram`.
 
-| | was | now | native | |
-|---|---|---|---|---|
-| plain `.tar` | 3.38 s | **1.44 s** | GNU tar 1.69 s | **1.17× faster** |
-| `.tar.lz4` | 3.66 s | **1.47 s** | 2.01 s | **1.37× faster** |
-| `.tar.zst` | 3.93 s | **1.75 s** | 2.14 s | **1.22× faster** |
-| `.tar.gz` | 5.58 s | **2.85 s** | 6.17 s | **2.16× faster** |
-| `.tar.br` | 6.05 s | **3.15 s** | 3.77 s | **1.20× faster** |
-| `.tar.xz` | 6.61 s | **3.10 s** | 8.81 s | **2.84× faster** |
-| `.tar.bz2` | 7.46 s | **3.40 s** | 3.22 s | 1.06× slower |
+- **`--no-solid`** (7z) writes one independently-decodable pack per entry instead of packing members
+  together: a much larger archive, and cheaper to read one member out of. Solid remains the default
+  and `--solid` states it explicitly. It was previously reachable only through an environment
+  variable, while `CreateOptions::solid` said `false` and the writer ignored it and made every
+  archive solid regardless.
 
-Extracted trees are byte-identical to the source on all six and modification times are unchanged.
-`.tar.bz2` is the only one still behind, and what is left there is `lbzip2`'s own decompressor,
-which is about 1.3× the reference implementation's on a single thread.
+- **mimalloc**, behind a feature and on in the shipped binary. Worth **1.22x on extraction** for 13%
+  more memory. Not worth what the note claimed: on zip create it is 1.08x for 2.7x the memory, and
+  on `.cram` create it is nothing at all. Measured 14 August 2026. The corpus was not recorded and
+  none of the three ratios was re-run on 16 August, so carry them forward with that attached.
 
-**One big file into a `.7z` used one core**, because solid mode asks for one uninterrupted LZMA2
-stream per pack and an archive of a single file is a single pack. enwik9 went from 375 s at 99% CPU
-to **46.5 s**, which is 1.48× faster than 7-Zip, for half a percent of size. Archives of many files
-are byte-identical to before.
+- `CRAM_WORKERS=n` forces the pool width, so a benchmark can ask what the plan is worth. There was
+  no way to: `taskset` narrows which CPUs the process may use without narrowing the core count the
+  planner sees, so it still asks for every worker and simply gets them descheduled, which measures
+  contention rather than the count. Deliberately not a CLI flag, and it prints a line of its own
+  when in effect so it cannot be quietly set during a measurement.
 
-**`--tiny` now beats 7-Zip.** zopfli takes one master block per `write` call and splits each at most
-fifteen ways, so handing it a 51 MB entry whole bought sixteen Huffman trees for the file. Fed in
-1 MiB blocks, silesia goes from 1.26% behind 7-Zip `-mx=9` to **0.02% ahead**, and peak memory falls
-from 2.3 GB to 712 MB.
-
-**Extraction stopped giving every file an 8 MiB buffer it could not use.** One is live per concurrent
-worker, so a 24-thread machine held 192 MB of buffer whatever the archive. Peak memory extracting a
-zip: silesia 125 MB → 36.6, kernel tree 214 → 146, both slightly faster.
-
-Also: `cram x --help` printed `No such file or directory` instead of help, because the read verbs took
-`--help` as the archive name; `--small` on a large corpus spent more time choosing a filter than
-compressing with it (336 s → 192 s for 0.0019% more bytes); and the README now says which crate to
-install, since `cargo install cram` fetches somebody else's.
-
-Extraction, from four directions. 7z ran on one thread whatever the archive or the machine — 25 s
-against 7-Zip's 3.7 s on the benchmark corpus — and is now level with it there and 2.4× faster on an
-archive cram wrote, in less memory either way. A single large file used one core because the unit of
-work was the entry and there was one; enwik9 went from 9.05 s to 2.06 s. An archive of many small
-files was pathologically slow and is now 760× quicker than the finding that recorded it. And a
-crafted `.7z` could hang `cram t` forever.
-
-Then creation: `.tar.gz` used one core and is now 6.9× to 9.7× faster, for a fifth of a percent in
-size. And a ranged read of a large solid `.7z` — the thing a mount is built on — decoded from the
-start of the block every time, which made mounting one impractical; it now starts at the segment
-holding the range, 0.54 s against 24.80.
+- **A regression table for the planner.** Adaptive parallelism is the thesis everything here rests
+  on and nothing asserted it as a whole; the plan flipped between 8 and 24 workers twice in one day
+  and both times a human caught it reading `CRAM_PROFILE` output. Seven named scenarios across three
+  machines that have been measured, each asserting a whole plan and carrying the reason it is that
+  answer, so a change has to state what it meant to change.
 
 ### Changed
 
-- **`.tar.gz` is created on every core.** gzip is one stream with no boundaries a writer has to
-  respect, so cram wrote it through a single encoder and used one thread — marginally slower than
-  stock `tar czf`. The tar stream is now cut into 1 MiB chunks, each deflated by its own compressor
-  and ended with a sync flush so it stops on a byte boundary, and the chunks are concatenated; the
-  result is one ordinary gzip member that `gzip -t`, `zcat` and `tar -xzf` read as usual. On the
-  24-thread box, to tmpfs: **Silesia 6.26 s → 0.72 s, enwik9 29.82 → 3.07, the kernel tree 37.43 →
-  5.43** — 5.9× to 9.6× faster than `tar czf` on the same corpus. Old and new decompress to a
-  byte-identical tar.
+- **A compressed tar is no longer decoded twice to extract it once.** A tar's headers are
+  interleaved with its bodies, so enumerating its members means decompressing the whole archive, and
+  extraction then decompressed it all over again. It showed as an exact factor of two on every
+  codec: listing a compressed tar cost a full decompression pass, and testing it cost two. The list
+  was feeding nothing — `block_count`
+  returns 1 for a tar whatever is in it, and `plan_codec` reads only the codec — so it is now built
+  only when something asks for it. `cram l` pays for one pass, and an extraction that is about to
+  stream every entry anyway pays for none. `ArchiveReader::entries_are_cheap` says which backends
+  can answer cheaply; the trait's own doc had claimed all of them could. The extraction figures this
+  produced are in the table at the top of this section, measured 16 August 2026.
 
-  It costs **0.19–0.34% in size**, because each chunk starts with an empty dictionary, and 30–39%
-  more CPU and about 160 MB of window. On the kernel tree the archive is still 1.40% smaller than
-  gzip's own. **Only create is parallel** — a standard `.gz` cannot be extracted in parallel by
+- **The tar worker stopped allocating a megabyte per entry.** It allocated and zeroed one for every
+  entry, 94,778 of them on the kernel tree, to carry files averaging 20 KB, and passed the result
+  over a one-slot channel, so the decoder could never get more than one message ahead of whoever was
+  writing the files. As a stage, on the kernel tree: `.tar.gz` 13.99 s → 5.58; `.tar.zst`
+  11.94 → 3.93; `.tar.lz4` 10.95 → 3.66; `.tar.br` 15.77 → 6.05. Writing the 94,778 files was never
+  the cost, at 0.32 s, and neither was inflate. Measured 15 August 2026.
+
+- **A `.tar.bz2` or `.tar.xz` decodes on every core.** Compressing on every core means cutting the
+  tar into chunks and writing each as a complete standalone stream, and cram had been writing those
+  seams for months and then reading them back one at a time. They are findable: a bzip2 stream
+  begins with a header the previous stream's end-of-stream magic sits in front of, and an xz stream
+  with a header whose CRC checks out behind a `YZ` footer. Cram scans for them, decodes the spans
+  between them on a pool, and yields the bytes in order. As a stage, on the kernel tree: `.tar.xz`
+  20.79 s → 6.61; `.tar.bz2` 62.08 → 7.46. Measured 15 August 2026.
+
+  This works on any archive that is a run of concatenated streams, not only cram's own: `pbzip2` and
+  `lbzip2` output, Wikipedia multistream dumps, `cat a.xz b.xz`. A single-stream archive falls back
+  to the sequential decoder unchanged, and nothing about what cram *writes* changed. A false seam
+  cannot corrupt an extraction silently, since the spans either side of it fail to decode. Bare
+  `.xz` and `.bz2` files take the same path. `CRAM_PARALLEL_DECODE=0` turns it off.
+
+- **Extraction stopped asking the filesystem the same question twice per file.** A plain `.tar`,
+  with no codec and nothing to decode, took 3.38 s against GNU tar's 1.73 in the same run, so none
+  of that gap was compression. `strace` counted **1.83 million syscalls against GNU tar's 0.79
+  million**, and most of the excess was work whose answer cram already had: a `mkdir` for every
+  *file* rather than every directory, which failed `EEXIST` 94,779 times on the kernel tree; two
+  `statx` per file asking about paths the following `openat` was about to answer; a second `openat`
+  per file because the modification time was stamped by path instead of on the descriptor still
+  open; and 526,938 `read` calls to move 2 GB, because a plain `.tar` was handed an unbuffered file
+  and the tar parser reads 512-byte headers. Measured 15 August 2026.
+
+- **A tar's files are written on every core.** Decoding one is a single pass and has to stay one
+  thread; writing what it decodes does not, and both were running on one. Small entries now
+  accumulate into a bounded batch, 32 MiB or 4,096 entries, whichever comes first, and go out across
+  a pool of writers; entries over 4 MiB still stream inline. The width knees at eight and then goes
+  backwards. Swept on one binary, a plain `.tar` took 2.26 s at one writer, 1.52 at four, **1.43 at
+  eight**, 1.46 at twelve and 1.50 at twenty-four, where it burned 311% CPU to be slower, so **the
+  shipped cap is eight**. A second sweep of the same knob on the same corpus recorded 1.52 at eight
+  and 1.44 at sixteen; the two disagree, one of them is older, and neither is guidance for raising
+  the cap until they are re-run together. `gz` and `br` pay about 3% for the pool rather than
+  gaining, because both decode on a single thread and that thread is the wall, so extra writers only
+  contend for page allocation. The batch and the pool cost about 100 MB: peak RSS on a plain `.tar`
+  is 251 MB on 16 August against GNU tar's 3 MB, and the codec rows run 175 to 537 MB against native
+  tools holding 3 to 10 — `lbzip2` alone matches cram, at 537 MB either side. The sweep
+  above is a width comparison on one binary rather than a standing; the standings are in the table
+  at the top. Measured 16 August 2026.
+
+  The five entries above are stages of one piece of work. Every codec moved on all five, because
+  the work is in the shared engine, and extracted trees are byte-identical to the source on all
+  seven with modification times unchanged.
+
+- **A `.zip` is created on every core.** cram wrote every non-native container on a single core: a
+  `.zip` averaged 1.00 effective cores against `.cram`'s 8.69 on the same tree, because the engine's
+  create loop streams each file into the writer in turn and only `.cram` escaped it. Workers now
+  build a complete one-entry zip in memory and the writer thread copies the already-compressed bytes
+  in with `raw_copy_file`, in submission order, which keeps every header field the zip crate's
+  business rather than growing a second encoder that can disagree with the first. Output is
+  byte-identical to the sequential writer, and that is what the tests assert. **14,386 entries:
+  27.20 s → 7.96.**
+
+  A deeper queue then kept the pool fed through a slow entry, since entry durations on a real tree
+  span three orders of magnitude and a queue only twice the pool size leaves every worker idle while
+  the writer waits on one big file. On a 41,305-file tree at 16 threads, depth 32 gave 11.24 s and
+  depth 2048 gave **6.68 s**, at 222 MB peak RSS; depth is now 2048 and the in-flight byte ceiling
+  does the memory bounding. Encrypted archives joined once a round-trip test proved WinZip-AES
+  framing survives `raw_copy_file`: the kernel tree at AES-256, 94,778 files, went from **72.83 s at
+  0.9 effective cores to 5.68 s at 16.8**, so 12.8x, with the two archives identical in size and
+  7-Zip accepting both.
+
+  Two escape hatches ship with it. `CRAM_ZIP_SEQUENTIAL` restores the old single-threaded writer for
+  one run, and `CRAM_ZIP_DEPTH` re-finds the queue knee on hardware that is not this machine.
+  Measured 12–15 August 2026.
+
+  Against the two reference implementations on 16 August, kernel tree, `/dev/shm`, medians of 3:
+  creating is **4.42× 7-Zip's ZIP encoder and 9.21× Info-ZIP**, for an archive 0.55% larger than
+  7-Zip's and 1.41% smaller than Info-ZIP's. Reading the same archive back is **3.81× and 5.11×**,
+  because neither of them extracts a `.zip` on more than one core; cram runs that at 272–409% CPU
+  against their 99–100%, and holds 150 MB against 31 and 4.9. Full table in `BENCHMARKS.md`.
+
+- **`.tar.gz` is created on every core.** gzip is one stream with no boundaries a writer has to
+  respect, so cram wrote it through a single encoder and used one thread. The tar stream is now cut
+  into 1 MiB chunks, each deflated by its own compressor and ended with a sync flush so it stops on
+  a byte boundary, and the chunks are concatenated; the result is one ordinary gzip member that
+  `gzip -t`, `zcat` and `tar -xzf` read as usual. Workers take the next chunk the moment they finish
+  one and a writer thread emits in index order, so a straggler cannot idle the pool. The gzip
+  trailer's CRC is folded in that same in-order pass, because `Crc::combine` is associative but not
+  commutative and folding chunks as they finished would make the checksum depend on thread
+  scheduling.
+
+  Kernel tree, 16 August 2026: **3.28 s for 558,402,429 bytes**, against `pigz -6 -p 24` at 3.50 s
+  for 566,208,712. That is 1.07x faster in an archive 1.38% smaller. `gzip -6` takes 30.92 s for
+  566,354,268; it compresses on one thread, so it is scale rather than a comparison. The cost is
+  memory: **233 MB peak RSS against pigz's 19 MB**, and 0.19–0.34% in size
+  against cram's own single-threaded output (measured 14 August), because each chunk starts with an
+  empty dictionary. **Only create is parallel.** A standard `.gz` cannot be extracted in parallel by
   anyone, this included, because a decoder cannot find the block boundaries without inflating
   everything before them.
+
+- **A `.tar.xz` and a `.tar.bz2` are created on every core as well.** The chunking that gzip got
+  stopped there, so `.tar.xz` built the kernel tree in 442.63 s at 1.0 effective cores while
+  `xz -T0` took 34.45 at 6.0. The compressor was never the problem; it simply used one core.
+  Complete streams of both codecs concatenate, which is what `xz -T0`, `pbzip2` and `lbzip2` all
+  rely on and what cram's own reader already handled, so a window of chunks compresses in parallel
+  and is written in order. Chunk sizes are set per codec against its window, 32 MiB for xz against
+  an 8 MiB dictionary and 4 MiB for bzip2 against a 900 KB block, and the pool is bounded by bytes
+  in flight rather than by the core count, because 24 workers each holding a 32 MiB xz chunk is most
+  of a gigabyte on a machine that may not have one.
+
+  Kernel tree: `.tar.xz` **442.63 s at 1.0 effective cores → 41.35 at 18.9**, against `xz -T0`'s
+  34.45 s while writing 0.88% less; `.tar.bz2` 9.54 s at 15.5 → **7.85 at 19.2**. The memory goes
+  the other way and is worth stating: xz peak RSS 2709 MB → 3960, above `xz -T0`'s 3196. Measured
+  14–15 August 2026.
+
+- **The `zstd-c` feature reaches `.tar.zst`, which changes the bytes cram writes at `--auto`.** The
+  feature had reached `formats/cram.rs` and nowhere else, so a `.tar.zst` was written at ruzstd's
+  Fastest, its only level, and read back by the pure-Rust decoder, in a shipping build that already
+  links the C library for `.cram` packs. On the kernel tree that was 18.78 s for 742,491,196 bytes
+  against `zstd -T0 -3`'s 1.73 s for 540,088,970, and extraction 16.18 s against GNU tar's 2.12;
+  going through libzstd took create to 5.26 s and the archive to 534,639,379 bytes. **`--auto` now
+  means zstd level 3**, zstd's own default, the way `--auto` already means gzip 6 and xz 6, so a
+  `.tar.zst` written by a `zstd-c` build is a different file from the one 1.1.0 wrote and a
+  head-to-head against `zstd` at its default compares like with like. The pure-Rust path is
+  unchanged and still there for builds without the feature. Measured 14 August 2026; the 16 August
+  run confirms the archive size.
+
+- **A `.tar.zst` is then written by libzstd's own workers.** At 5.26 s it was running at 0.9
+  effective cores, the last codec in the tar family still doing everything on one. libzstd's workers
+  share one context and one window, so unlike chunking this costs no ratio and needs no seams, and
+  the output is a plain single-frame `.zst` that `zstd -t` accepts. Kernel tree, 24 threads:
+  **5.26 s at 0.9 effective cores → 1.92 at 3.1**, against `zstd -T0`'s 1.71 s. Peak RSS 84 MB →
+  339, against its 275. Proven on windows-gnu before landing, which was the risk, and Cargo.lock is
+  unchanged. Measured 15 August 2026.
+
+- **A `.tar.br` stops using a 16,384-bucket hash table whatever its size.** brotli picks its hash
+  table from `size_hint` and nothing else, and a caller that never sets one gets whatever
+  `update_size_hint` infers from the first write. tar streams through `io::copy` in 8 KiB writes, so
+  every `.tar.br` inferred 8 KiB and used the smallest table brotli has, however large the archive
+  was. The walk already counts every byte for the progress bar, so that figure now reaches the
+  encoder; an archive whose size could not be counted guesses high, since the hint selects a hasher
+  and bounds nothing. Kernel tree: **608,920,976 → 487,982,888 bytes, 19.9% off**, marginally under
+  what `brotli -q 6` writes. Round-trip verified byte-identical and `brotli -t` accepts the output.
+  Measured 14 August 2026; the 16 August run confirms the archive size.
+
+- **One big file into a `.7z` used one core.** Solid mode asks for one uninterrupted LZMA2 stream
+  per pack, and an archive of a single file is a single pack, so enwik9 ran at 99% CPU. A block
+  holding a lone entry now uses the multi-threaded encoder, at a 64 MiB chunk rather than the
+  dictionary-sized default the many-packs branch uses, because there the block is the whole archive
+  and smaller chunks only buy more seams. **enwik9: 375.41 s → 46.51**, which is 8.1x, and 1.48x
+  faster than 7-Zip's 68.79 s for 0.51% more bytes. Peak RSS 122 MB → 2961, under 7-Zip's 3866.
+  Restricted to a lone entry on purpose: a block of many small files keeps the cross-file matching
+  that is the point of solid, and keeps its bytes exactly, with Silesia byte-identical before and
+  after at 49,197,225. Measured 15 August 2026.
+
+- **`--tiny` feeds zopfli in master blocks, which puts it past 7-Zip's DEFLATE encoder.** Zopfli
+  compresses one master block per `write` call and splits each at most fifteen ways, so handing it a
+  51 MB entry whole bought sixteen Huffman trees for the file. Fed in 1 MiB blocks, Silesia goes
+  from 1.26% behind to **0.02% ahead of `7z -tzip -mx=9`**, 64,712,418 bytes against 64,725,403, and
+  peak memory falls from 2,390,804 KB to 728,652 KB at unchanged wall time. That comparison is
+  DEFLATE against DEFLATE and nothing more: 7-Zip writing its own `.7z` format at `-mx=9` puts the
+  same corpus in 48,688,243 bytes, 25% smaller than either, in a fraction of the time. Verified
+  byte-identical three ways, by `cram t`, by Info-ZIP `unzip`, and by comparing all twelve entries.
+  Measured 15 August 2026; the 7-Zip `.7z` figure is from the 16 August run.
+
+- **Extraction stopped giving every file an 8 MiB buffer it could not use.** One is live per
+  concurrent worker, so a 24-thread machine held 192 MB of buffer whatever the archive, and the
+  kernel tree averages 20 KB an entry. A buffer is now never larger than the file, and the block
+  itself is 1 MiB rather than 8, which is still enough to saturate a write stream. Peak RSS
+  extracting a zip: **Silesia 125 MB → 36.6, kernel tree 214 → 146**, both corpora marginally
+  faster. Only the parallel path changes; the sequential and streaming paths hold one buffer in
+  total rather than one per worker. Measured 15 August 2026.
+
+- **`--small` chooses its pre-filter from a sample instead of compressing each pack six times.**
+  `pack_compress_cold` screened six candidates by compressing the whole pack with each at preset 1
+  and then encoded once more at the real preset, seven full LZMA passes per pack to keep one, and
+  profiling put 38.5% of a `--small` run in preset 1's match finder against 17.2% in preset 9's.
+  What the screen decides is which pre-filter and which literal-context settings suit the data,
+  which is a property of its structure rather than of its length, so four windows spread across the
+  pack, 4 MiB in total, answer it. Cram corpus 1.0, 42,151 files, 2,800,604,582 bytes, to
+  `/dev/shm`: **336.50 s → 191.98 for 32,176 more bytes, which is 0.0019%.** Peak RSS goes the other
+  way, 7.18 GB → 8.34, because packs are no longer throttled by the screen;
+  `CRAM_COLD_SCREEN_MIB=0` restores the whole-pack screen. `--small` output changes as a result and
+  stays deterministic. Measured 15 August 2026; the 16 August run puts the same corpus at 192.62 s
+  and 1,660,873,216 bytes.
 
 - **A ranged read of a large solid `.7z` starts at a segment instead of the block.** This is the
   mount primitive, and on a block too large to cache it decoded from the block's first byte, so
@@ -139,9 +299,12 @@ holding the range, 0.54 s against 24.80.
   entry, so an archive holding one file used one core however many were free. A `.cram` entry is a
   list of chunks and every chunk names its pack, so the entry can be cut at pack boundaries — the
   only seams that do not make two workers decode the same pack — and its pieces decoded
-  concurrently. enwik9 goes from **9.05 s at 1.0 effective cores to 2.06 s at 5.4**, byte-identical
-  to the original 1,000,000,000-byte file, in 900 MB against 7-Zip's 1176 MB. Still 26% behind
-  7-Zip's 1.64 s rather than 5.5× behind, and `BENCHMARKS.md` says so.
+  concurrently. enwik9 goes from **9.05 s at 1.0 effective cores to 2.06 s at 5.4** (measured
+  14 August, with the archive unwarmed, which reads the drive), byte-identical to the original
+  1,000,000,000-byte file. The 16 August run measures the same extraction at **1.20 s in 1245 MB,
+  against 7-Zip's 1.69 s in 1176 MB**, so cram is 1.4x faster in 6% more memory. The claim this
+  entry used to carry, that cram was still 26% behind 7-Zip here, came from the unwarmed run and
+  does not hold.
 
 - **A block too large to cache is streamed rather than refused.** Two gates were judging the wrong
   quantity, and between them a 1 GiB `.7z` written by a single-threaded encoder fell all the way back
@@ -157,17 +320,19 @@ holding the range, 0.54 s against 24.80.
   4 GiB probe measures 84, and on a RAM disk it reports memory bandwidth. Twenty decoders were being
   fielded where the measured knee is eight. A write figure now records whether it is a sustained
   ceiling or a burst, only a ceiling is scaled by, and the distinction survives a reload (profile
-  schema 4, so older profiles are re-measured rather than misread). On the corpus that is **40% less
-  CPU and 41% less memory for 11% more wall time**, which is a trade and is written down as one.
+  schema 4, so older profiles are re-measured rather than misread). On Cram corpus 1.0 that is
+  **40% less CPU and 41% less memory for 11% more wall time**, which is a trade and is written down
+  as one.
 
 - **`cram t` and extraction of many small files.** Both were listed as open findings, one at the
   highest severity, and both had been fixed by earlier work that never came back to say so. The
-  kernel tree extracts at **29,664 files/s against the 39 files/s** the finding recorded, and
-  verifies in **1.10 s against 17.64 s**. Every one of the 86,618 files byte-identical at both
-  compression levels.
+  kernel checkout used by those findings, 86,618 files, extracts at **29,664 files/s against the
+  39 files/s** the finding recorded, and verifies in **1.10 s against 17.64 s**. Every one of the
+  86,618 files byte-identical at both compression levels. That is an older and smaller snapshot than
+  the 94,778-file / 1,920,837,858-byte kernel tree the tables above use.
 
-- **7z extraction uses a third of the memory it did this morning, by asking the archive how big its
-  dictionary is.** A segment's own length was the only bound available while the 7z crate kept coder
+- **7z extraction asks the archive how big its dictionary is, and uses a third of the memory.** A
+  segment's own length was the only bound available while the 7z crate kept coder
   properties private. It is always safe — a segment opens on a dictionary reset, so nothing in it
   reaches further back than its start — and it is about four times too large, since 7-Zip writes
   32 MiB dictionaries into 128 MiB thread blocks and every concurrent segment holds a window.
@@ -178,8 +343,9 @@ holding the range, 0.54 s against 24.80.
 - **7z packs are compressed concurrently instead of chunked inside one.** Packs were compressed
   straight into the output stream, so two could never be built at once and every thread had to come
   from LZMA2's chunking within a single pack — capped at pack size over dictionary, and costing
-  ratio because a match cannot cross a chunk boundary. Creating the corpus went from 57.9 s to
-  43.4 s, and the archive came out *smaller*: 284.0 MB against 289.1 MB.
+  ratio because a match cannot cross a chunk boundary. Creating a 2.8 GB corpus went from 57.9 s to
+  43.4 s, and the archive came out *smaller*. The two archive sizes this entry used to quote could
+  not be reconciled with any corpus this project measures, so they are gone rather than restated.
 
   Both of the above needed API that `sevenz-rust2` keeps private, so cram now depends on
   `sevenz-rust2-cram`, upstream 0.21.3 plus those two additions and nothing else (163 inserted
@@ -187,16 +353,20 @@ holding the range, 0.54 s against 24.80.
   land.
 
 - **7z extracts in parallel.** Entries in a 7z share a solid block, so the block is the unit of work
-  rather than the entry. On the Cram corpus that took a cram-written `.7z` from 8.62 s to 1.35 s
-  against 7-Zip's 3.25 s, every extraction checked file-by-file against the corpus manifest.
+  rather than the entry. On Cram corpus 1.0 that took a cram-written `.7z` from 8.62 s to 1.35 s
+  (measured 13 August), every extraction checked file-by-file against the corpus manifest. 7-Zip
+  extracts its own archive of that corpus in 3.82 s on 16 August, at a 5.6% spread; the 3.25 s this
+  entry used to compare against sits outside that band and has been dropped rather than kept.
 
 - **A 7z written by a multi-threaded encoder is split finer than its blocks.** 7-Zip's default puts
   an entire archive in ONE solid block, which no amount of block-level parallelism can divide. But
   its multi-threaded encoder resets the LZMA2 dictionary at each thread-block boundary, and a chunk
   with a dictionary reset can be decoded without anything before it. Cram walks that framing and
-  treats each reset as a starting point: the corpus archive has 47,011 chunks and 21 resets, and
-  extracting it went from 25.01 s to 3.66 s against 7-Zip's 3.68 s, using 2795 MB where 7-Zip uses
-  4876 MB.
+  treats each reset as a starting point: the Cram corpus 1.0 archive has 47,011 chunks and 21
+  resets, and extracting it went from 25.01 s to 3.66 s against 7-Zip's 3.68 s, using 2795 MB where
+  7-Zip uses 4876 MB. Measured 13 August. The 16 August run puts 7-Zip on that corpus at 3.82 s and
+  4877 MB with a 5.6% spread, so its half of the comparison holds; cram's 2795 MB does not, because
+  the dictionary-size entry above took it to 867 MB the same day.
 
   This depends on how the archive was written, not on the format. A `.7z` written single-threaded,
   or smaller than one thread-block, has one segment and extracts at the old speed. Chains with a BCJ
@@ -204,7 +374,7 @@ holding the range, 0.54 s against 24.80.
 
 - **Extraction no longer holds a decoded block in memory.** Serving a solid block's entries one at a
   time meant decoding the block and keeping every entry's bytes until asked for them — 1.8 GB of
-  peak RSS on the corpus. Entries are now handed over as they decode, which is both smaller and
+  peak RSS on Cram corpus 1.0. Entries are now handed over as they decode, which is both smaller and
   faster: 175 MB, and 38% less CPU than the path it replaced. `cram test` shares it, 8.04 s to
   1.16 s.
 
@@ -223,9 +393,48 @@ holding the range, 0.54 s against 24.80.
 
 ### Fixed
 
-- **Creating a `.7z` of a large tree died with `Too many open files`.** The kernel tree, 86,618
-  files, on a tree 7-Zip archives without complaint. A block holds up to 8,192 open handles and up to
-  `inflight_max` packs hold as many again, so on a 24-thread machine the writer wants around 205,000
+- **A multi-frame `.lz4` was decoded to the end of its first frame and reported as complete.** A
+  `.lz4` is a run of frames: `cat a.lz4 b.lz4` produces one, and so does any parallel lz4 writer.
+  `lz4_flex`'s `FrameDecoder` stops at the first frame's EndMark, so cram returned what it had with
+  **no error and no short-read signal**. Two concatenated frames gave 40,000 bytes of 80,000; five
+  gave 49,152 of 197,385. The comment beside that decoder claimed the opposite, that `FrameDecoder`
+  already advances through concatenated frames, and nothing checked it. Silent wrong output on a
+  read path, so it is worth reading twice if you hold `.lz4` files written by anything other than
+  the reference CLI. There is a test now, and it fails against the old reader. zstd already had this
+  walk; both formats use the same skippable-frame layout, so the machinery is shared.
+
+- **A RAR archive of many small files re-detected the hardware once per entry.** `inmem_ceiling`
+  decides whether an entry is held in RAM or routed through a scratch file, and it called
+  `HwProfile::detect`, which re-reads CPU topology and `/proc/meminfo` and probes the work drive
+  through `/sys/block` or an IOCTL on Windows. That is about 1.25 ms of syscalls per entry to answer
+  a question whose answer cannot usefully change between two entries of the same archive. It is now
+  resolved once when the reader opens. On the 94,778-file kernel tree, `cram t` goes **124.03 s →
+  75.09** and extraction **135.88 → 79.35**; Silesia's twelve files are unchanged at 0.53 s, which
+  is the shape the finding predicted. This does not close the gap to `unrar`, which tests the same
+  archive in 4.28 s: 42% of what is left is inside UnRAR's own header reading, which is quadratic in
+  extract mode and not reachable from the `unrar` crate. Measured 15 August 2026.
+
+- **A directory passed to `l`, `x`, `t` or `conv` surfaced as the platform's error for opening a
+  folder as a file.** On Windows that is `Access is denied`, which sends people looking for a
+  permissions problem that is not there. The check sits in `sniff_path`, which every read verb
+  funnels through. Pointing at the wrong thing is also not a bug report, so this one error no longer
+  writes a diagnostic report; with diagnostics on, a typo was producing a crash-style file and
+  burying the genuine reports.
+
+- **`cram x --help` printed `No such file or directory` instead of help**, and so did `t` and `l`.
+  Those three take an archive as their first positional and `--help` looked like one, which made the
+  first thing a new user types the first thing that breaks. `--help` or `-h` anywhere in a verb's
+  arguments now prints that verb's own section of the usage block, to stdout, exit 0, and
+  `cram help <verb>` works too. The section is extracted from `USAGE` rather than written out a
+  second time, so the two cannot drift, and a value that looks like a flag is still a value:
+  `cram x a.zip -p -h` is a password of `-h`.
+
+- **The README named the wrong crate to install.** `cargo install cram` fetches somebody else's
+  package; the CLI is `cram-cli`.
+
+- **Creating a `.7z` of a large tree died with `Too many open files`.** An 86,618-file kernel
+  checkout, on a tree 7-Zip archives without complaint. A block holds up to 8,192 open handles and
+  up to `inflight_max` packs hold as many again, so on a 24-thread machine the writer wants 205,000
   descriptors against a raised soft limit of 65,536. The recovery existed and could not work: it
   drained one finished pack and retried once, and because that drain succeeded it never went on to
   flush the block holding most of the handles. It now releases progressively and retries after each
@@ -247,36 +456,8 @@ holding the range, 0.54 s against 24.80.
 - **A single large file no longer disabled parallel 7z extraction for the whole archive.** The
   memory bound was applied to the largest block, and a block holding one big entry needs no cache at
   all — it can be streamed. One 263 MiB video, alone in its block, was 5.5% over the budget and took
-  the other 48 blocks of the benchmark corpus down with it, leaving extraction on 1.3 effective
-  cores. The bound now applies only to blocks that more than one entry shares.
-
-### Added
-
-- `CRAM_PROFILE=1` prints the extraction plan and every input to it — bottleneck, workers, decode
-  units, measured decode rate and write wall — so "why did this run on two threads" is one line
-  rather than an afternoon of bisecting.
-
-- **`--no-solid`** (7z) writes one independently-decodable pack per entry instead of packing members
-  together: a much larger archive, and cheaper to read one member out of. Solid remains the default
-  and `--solid` states it explicitly. It was previously reachable only through an environment
-  variable, while `CreateOptions::solid` said `false` and the writer ignored it and made every
-  archive solid regardless.
-
-- **mimalloc**, behind a feature and on in the shipped binary. Worth **1.22× on extraction** for 13%
-  more memory. Not worth what the note claimed: on zip create it is 1.08× for 2.7× the memory, and
-  on `.cram` create it is nothing at all.
-
-- `CRAM_WORKERS=n` forces the pool width, so a benchmark can ask what the plan is worth. There was
-  no way to: `taskset` narrows which CPUs the process may use without narrowing the core count the
-  planner sees, so it still asks for every worker and simply gets them descheduled, which measures
-  contention rather than the count. Deliberately not a CLI flag, and it prints a line of its own
-  when in effect so it cannot be quietly set during a measurement.
-
-- **A regression table for the planner.** Adaptive parallelism is the thesis everything here rests
-  on and nothing asserted it as a whole; the plan flipped between 8 and 24 workers twice in one day
-  and both times a human caught it reading `CRAM_PROFILE` output. Seven named scenarios across three
-  machines that have been measured, each asserting a whole plan and carrying the reason it is that
-  answer, so a change has to state what it meant to change.
+  the other 48 blocks of Cram corpus 1.0 down with it, leaving extraction on 1.3 effective cores.
+  The bound now applies only to blocks that more than one entry shares.
 
 ---
 
@@ -465,13 +646,16 @@ re-save). These are reported separately, are never counted as reclaimable, and n
 them: a perceptual hash cannot tell a redundant re-encode from two different frames of a burst.
 Needs the `phash` feature.
 
-**Lossless JPEG recompression in `.cram`**, on by default. A photo is already entropy-coded, so
+**Lossless JPEG recompression in `.cram`**, at `--small` or on any level with `--recompress`. It is
+off at the default `--auto`, and `--no-recompress` overrides both. (This entry said "on by default"
+when 1.0.0 shipped and that was wrong then too: `recompress_choice` has always been
+`--recompress` or `Level::Cold`.) A photo is already entropy-coded, so
 general-purpose compressors gain roughly nothing on one; redoing that coding with a stronger coder
 (Lepton) is worth about 23% while extraction reconstructs the original file byte-for-byte. Measured
 on one folder of 34 phone photos (26.1 MB): ZIP and 7z both produced output fractionally *larger*
 than the originals, `tar.xz` managed 2.7%, and `.cram` was 23.6% smaller with all 34 files
 extracting byte-identical. That is a single sample rather than a benchmark. Every candidate is verified to round-trip before it is stored, and anything that
-fails verification is stored untouched. `cram a --no-recompress` turns it off.
+fails verification is stored untouched.
 
 **Linux and macOS support** (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`), built and tested
 alongside Windows, plus an `install.sh` that fetches the right binary for either. See Known

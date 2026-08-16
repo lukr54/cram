@@ -1,8 +1,11 @@
 //! Adaptive create-side probe: decide, per file, whether compressing it is worth the CPU; the
 //! "store the incompressible" optimization. Already-compressed media/archives (JPEG, MP4, ZIP, …)
 //! do not shrink under DEFLATE/LZMA; running the compressor over them only burns CPU and often
-//! grows the data slightly. Detecting them and storing them verbatim is the single biggest
-//! real-world archiver win, and it is what [`Level::Auto`](crate::writer::Level) turns on.
+//! grows the data slightly. Detecting them and storing them verbatim is what
+//! [`Level::Auto`](crate::writer::Level) turns on. On the 2,800,604,582-byte Cram corpus, `--auto`
+//! reaches 0.7104 in 6.95 s where `7z -mx=5` reaches 0.8202 in 68.25 s (16 August 2026, Ryzen 9
+//! 5900X, 24 threads, medians of 2). That level is this probe plus dedup plus the pack pipeline, so
+//! the figure sizes the level and not this file.
 //!
 //! Two-tier classification, cheapest first:
 //!   1. **Extension**, a hard list of formats that are essentially always incompressible (store)

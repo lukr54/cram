@@ -203,8 +203,10 @@ OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## 4. Zstandard, the bundled C library
 
-The release build enables the `zstd-c` feature, which compiles Meta's C Zstandard library into
-`cram.exe` / `cram-extract.exe` (through the `zstd` / `zstd-sys` crates) as a fast `.cram` pack codec.
+The release build enables the `zstd-c` feature for `cram.exe`, which compiles Meta's C Zstandard
+library into that binary (through the `zstd` / `zstd-sys` crates) as a fast `.cram` pack codec.
+`cram-extract.exe` is built feature-free and decodes zstd through the pure-Rust `ruzstd` crate
+instead, so it does not link libzstd and this obligation does not attach to it.
 Its BSD-3-Clause licence requires the copyright notice, the conditions and the disclaimer to be
 reproduced in binary distributions:
 
@@ -249,7 +251,7 @@ appear, with their own notices, in `THIRD-PARTY-LICENSES.md`.)
 
 Cram statically links a large graph of third-party Rust crates. **There is no GPL, AGPL, LGPL or MPL
 anywhere in the graph**, every dependency is permissive. The licences the resolved graph actually uses,
-with the crate count behind each, are MIT (247), Unicode-3.0 (19), Apache-2.0 (11), BSD-3-Clause (8),
+with the crate count behind each, are MIT (250), Unicode-3.0 (19), Apache-2.0 (12), BSD-3-Clause (8),
 BSD-2-Clause (3), ISC (3), CC0-1.0 (1), CDLA-Permissive-2.0 (1) and bzip2-1.0.6 (1). `about.toml`
 additionally permits 0BSD, Unlicense, Zlib and Unicode-DFS-2016, all of which are permissive and any of
 which a future dependency may resolve to; nothing outside that list can enter without failing
@@ -261,13 +263,13 @@ permissive, carries no copyleft, and the obligation is to preserve the disclaime
 
 The **full copyright notice and licence text for every one of these crates** is reproduced in the
 companion [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md), generated from each crate's own
-`LICENSE` file and distributed alongside the binaries. That appendix, not a summary, is what discharges
-the reproduction requirement the MIT, BSD-2/3-Clause, ISC, Unicode-3.0, CDLA and bzip2 licences place on
-binary distributions. `ring` is the one to note: it descends from BoringSSL and therefore OpenSSL, so it
-carries a bespoke composite licence with an explicit reproduction requirement, satisfied by its entry in
-the appendix.
+`LICENSE` file and distributed alongside the binaries. That appendix is what discharges the
+reproduction requirement the MIT, BSD-2/3-Clause, ISC, Unicode-3.0, CDLA and bzip2 licences place on
+binary distributions. `ring` carries two licence entries in the appendix, a stock Apache License 2.0
+grant and a short ISC notice for the code Brian Smith wrote directly. No BoringSSL, OpenSSL or Eric
+Young attribution text appears in either.
 
-### The appendix covers all three shipped platforms, not just Windows
+### The appendix covers all three shipped platforms
 
 The dependency graph genuinely differs by platform, and for a while this appendix did not account for
 that. On `x86_64-pc-windows-gnu` the downloader uses SChannel, so no TLS stack is statically linked. On
@@ -290,10 +292,11 @@ cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md \
   --workspace --features "download zstd-c phash mimalloc"
 ```
 
-No `--target` flag: `about.toml` pins the triples itself, which is also why the check runs on any
-runner. `--workspace` rather than `-m crates/cram-cli/Cargo.toml`: the zip ships three artifacts and
-only one of them is the CLI. Resolving the whole workspace is the only single command that also covers
-`cram-extract.exe` and `cram_shell.dll`. On Windows, convert the result to LF before committing
+`about.toml` pins the triples itself, so no `--target` flag is needed, which is also why the check
+runs on any runner. Generation uses `--workspace` rather than `-m crates/cram-cli/Cargo.toml` because
+the zip ships three artifacts and only one of them is the CLI. Resolving the whole workspace is the
+only single command that also covers `cram-extract.exe` and `cram_shell.dll`. On Windows, convert the
+result to LF before committing
 (`.gitattributes` stores it that way, and a handful of crates' own LICENSE files carry CRLF). CI
 regenerates and diffs on every push, and the release job will not run unless that check passes, so an
 appendix that has drifted from `Cargo.lock` fails the build instead of shipping.

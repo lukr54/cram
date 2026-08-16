@@ -4,11 +4,16 @@
 //! Layers:
 //!   1. [`HwProfile::detect`], static profile (cores, RAM, per-drive media/bus/physical-id).
 //!   2. [`classify`], per-job bottleneck side from the archive's own header metadata.
-//!   3. [`Governor`], runtime self-tuning from decode→writer queue occupancy.
-//!   4. [`calibrate`], one-time micro-bench → this machine's real per-core codec rates;
+//!   3. [`calibrate`], one-time micro-bench → this machine's real per-core codec rates;
 //!      [`measure_write_wall`] measures the number no API exposes (gated: it writes to disk).
 //!
 //! [`derive_plan`] combines them into a [`Plan`] (workers, writers, pipeline shape, buffers, …).
+//!
+//! **Nothing in cram self-tunes mid-job, and this list used to say it did.** [`Governor`] was
+//! written and unit-tested as a fourth layer and never wired in: it is constructed in exactly two
+//! places, both `#[cfg(test)]` functions in this file. The plan is chosen once, before the job
+//! starts, from the static profile and the archive's own shape. The adaptivity the design claims is
+//! "measure this machine, then decide", not a feedback loop that watches itself run.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -934,12 +939,18 @@ pub enum Bottleneck {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Shape {
-    /// Each worker reads+decodes+writes its own entry, the default. Parallel per-entry writers keep
-    /// the SSD saturated where a single write stream underutilizes it, so they beat a one-writer
-    /// pipeline on the drives we measured.
+    /// Each worker reads+decodes+writes its own entry, the default. One write stream underutilizes
+    /// an SSD, so the writes go out in parallel.
+    ///
+    /// **A settled decision, not a figure to cite.** The "per-entry writers beat a single-writer
+    /// pipeline by 36%, 191 against 123 MiB/s" claim that used to sit here is retracted: `git log
+    /// -S` finds no commit containing either number, and the pipeline it was compared against is
+    /// gone from the tree.
     PerEntry,
-    /// N decoders → bounded queue → 1 dedicated sequential writer. Reserved / not emitted by
-    /// default: the QLC "sequential is better" theory did not hold on the tested NVMe SSD.
+    /// N decoders → bounded queue → 1 dedicated sequential writer. **Never emitted** — no branch of
+    /// [`derive_plan`] builds a `Plan` with this shape — and kept only as a name for the rejected
+    /// alternative. See [`PerEntry`](Shape::PerEntry) for what that rejection does and does not
+    /// rest on.
     Pipeline,
     /// 1-2 workers, serialized (HDD, where parallel seeks thrash).
     Serial,
@@ -1209,8 +1220,10 @@ pub fn derive_plan(
                 (Bottleneck::WriteBound, Topology::TwoDrive) => Plan {
                     bottleneck,
                     shape: Shape::PerEntry,
-                    // dst drive isn't serving reads; ~physical-core writers measured as the SSD
-                    // write peak (more than that was slower).
+                    // dst drive isn't serving reads, so writers scale with physical cores. The
+                    // "~physical cores is the SSD write peak, more than that was slower" note this
+                    // replaces cited no run and none survives in the tree; the value is carried
+                    // forward as a choice, not as a measurement.
                     workers: hw.physical,
                     writers: hw.physical,
                     read_buf: 8 * MIB,
@@ -1221,9 +1234,10 @@ pub fn derive_plan(
                     note: "2nd drive: reads free → parallel per-entry writers (~physical cores)",
                 },
                 (Bottleneck::WriteBound, _) => {
-                    // Single drive: parallel per-entry writers. A lone sequential writer measured
-                    // slower than parallel on the tested NVMe SSD (one write stream underutilizes
-                    // the drive), so the pipeline is NOT built.
+                    // Single drive: parallel per-entry writers, because one write stream
+                    // underutilizes the drive. The pipeline is NOT built. That is a settled
+                    // decision rather than a measurement — see `Shape::PerEntry` for the retraction
+                    // of the numbers that used to be quoted for it.
                     //
                     // Enough workers to keep the drive fed, and no more. Being write-bound is a
                     // statement about the *ratio* of the two rates, so the worker count has to come
@@ -1249,8 +1263,14 @@ pub fn derive_plan(
                     // Scale by the wall only when the wall is a *ceiling*. `needed` is linear in it,
                     // so a burst figure -- a probe that never left the drive's cache -- multiplies
                     // straight through into decoders that have nothing to feed. Measured on the
-                    // corpus with a tmpfs destination reporting 2928 MiB/s: 20 workers where 8 was
-                    // the knee, for 7% of the wall time and 78% more CPU. See `Wall`.
+                    // corpus with a tmpfs destination reporting 2841.9 MiB/s: 20 workers where 8 was
+                    // the knee, for 7% of the wall time and 78% more CPU. Undated, and not part of
+                    // the 16 August 2026 run. See `Wall`.
+                    //
+                    // 2841.9, not the 2928 this comment used to give. Three values for the one
+                    // experiment are written down in this file -- 2689, 2841.9, 2928 -- and only
+                    // 2841.9 yields the twenty workers the sentence turns on (2841.9 / 145.0 =
+                    // 19.6, so twenty). It is also the value the test fixtures below carry.
                     //
                     // Without a ceiling, take the floor. That is not a retreat to the old constant:
                     // the sweep put the knee at exactly 8 on this machine, and every worker past it
@@ -1307,6 +1327,15 @@ pub fn derive_plan(
                         // Past eight the extra threads contend for page allocation and give time
                         // back — at 24 a plain tar was 1.50 s and burned 311% CPU to do it. GNU tar
                         // takes 1.69 s, so eight is also where this path overtakes it.
+                        //
+                        // **Stale in absolute terms, and one of two sweeps of this knob.**
+                        // `engine/sequential.rs` carries the other, on the same corpus, reporting
+                        // 1.52 s at eight where this table says 1.43, and a GNU tar control of
+                        // 1.77 s where this one says 1.69. The 16 August 2026 run measures GNU tar
+                        // at 1.69 — this sweep's control exactly — and cram at 1.19 s for the same
+                        // plain `.tar`, on one machine, medians of 3, to `/dev/shm` with the archive
+                        // read into page cache first. Carry the shape forward, a knee and then a
+                        // slow reversal; whether the knee is still at eight takes one re-run.
                         writers: hw.physical.clamp(1, 8),
                         read_buf: 8 * MIB,
                         write_buf: 8 * MIB,
@@ -1321,11 +1350,15 @@ pub fn derive_plan(
     }
 }
 
-// Runtime governor, the free feedback loop that self-corrects worker count from queue fill.
+// Runtime governor. Written, unit-tested, and wired into nothing.
 
 /// EWMA of decode→writer queue occupancy with hysteresis. Full queue ⇒ writer is the wall ⇒
-/// shed a worker; starved ⇒ decode is the wall ⇒ add one. Corrects any static mis-estimate
-/// and tracks the SLC-cache cliff mid-job, no hardware database required.
+/// shed a worker; starved ⇒ decode is the wall ⇒ add one. The design would correct a static
+/// mis-estimate and follow the SLC-cache cliff mid-job with no hardware database.
+///
+/// **It does none of that today.** No engine path constructs one; the only callers are the two unit
+/// tests at the bottom of this file. [`derive_plan`] fixes the worker count before the job starts
+/// and nothing revisits it. This is an unused component, not behaviour cram has.
 pub struct Governor {
     fill: f64,
     alpha: f64,
@@ -2075,7 +2108,13 @@ mod planner_table {
         }
     }
 
-    /// Measured on the dev box, 2026-08-14.
+    /// Measured on the dev box, 2026-08-14 — the two decode rates, at least.
+    ///
+    /// `deflate_enc: 5.0` is not credible beside a `deflate_dec` of 948.0: that is 190:1, and the
+    /// same 5.0 appears in an unrelated fixture. Read it as a value carried forward rather than as a
+    /// rate. Nothing can catch it from here, because no planning code reads the field —
+    /// `Rates::decode_rate` covers the decode side only, and `deflate_enc` is calibrated, saved,
+    /// reloaded and printed by `calibrate` without ever reaching `derive_plan`.
     fn dev_rates() -> Rates {
         Rates {
             deflate_enc: 5.0,

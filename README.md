@@ -32,35 +32,61 @@ has a native format (`.cram`) that stores repeated data once and losslessly repa
 - [Cram Studio](#cram-studio)
 - [Repository layout](#repository-layout)
 - [Security](#security)
+- [How this was built](#how-this-was-built)
 - [License](#license)
 
 </details>
 
 ## Speed
 
-Creating an archive from 2.8 GB and 42,151 files, on a 24-thread Ryzen 9 5900X. Each tool at its
-own default effort, median of three runs. **Measured on Cram 1.0.0** and not re-run since: 1.1.0
-changed duplicate scanning and the directory walk, not the compression path, but that is a reason to
-expect the numbers to hold rather than evidence that they do.
+Creating an archive from 2.8 GB and 42,151 files, on a 24-thread Ryzen 9 5900X, median of two runs.
 
 | | create | archive | peak memory |
 |---|---|---|---|
-| **Cram** | **6.9 s** | 1.99 GB | 2.6 GB |
-| 7-Zip 26.01 `-mx=5 -mmt=24` | 65.5 s | 2.30 GB | 7.4 GB |
-| WinRAR 7.12 `-m3 -s -mt24` | 84.1 s | 1.99 GB | 0.3 GB |
+| **Cram** `--auto` | **6.95 s** | 1.99 GB | 2.6 GB |
+| 7-Zip 26.01 `-mx=5 -mmt=24` | 68.25 s | 2.30 GB | 7.1 GB |
+| WinRAR 7.12 `-m3 -mt24` | 53.25 s | 2.38 GB | 0.3 GB |
+| WinRAR 7.12 `-m5 -s -mt24` | 86.78 s | 1.99 GB | 0.6 GB |
 
-Both competitors are given every thread explicitly; Cram sizes its own from the machine. RAR gets
-`-s` because 7-Zip is solid by default and RAR is not, and measuring RAR without it would cost it
-10% of its ratio for a reason that has nothing to do with RAR.
+**Measured 16 August 2026** on `cram 1.1.0`, commit `a84d77d`, built with the feature set the
+releases ship (`download,zstd-c,phash,mimalloc`): Ryzen 9 5900X, 24 threads, 23 GiB of RAM, Ubuntu
+24.04, archives written to ext4 on a dedicated volume. One machine, one afternoon. `cargo install
+cram-cli` gives a default build with no `zstd-c`, which writes XZ packs where the shipping build
+writes zstd, so it will not reproduce this table.
 
-**9.4× faster than 7-Zip and 12.1× faster than WinRAR**, matching WinRAR's ratio and beating
-7-Zip's by 13%. At `--fast` it creates the same corpus in 2.8 s, which is 23× 7-Zip's default, and
-still writes 12% less than 7-Zip does.
+Both competitors are given every thread explicitly; Cram sizes its own from the machine. The first
+three rows are each tool at its own default effort. RAR gets a fourth row because 7-Zip is solid by
+default and RAR is not: `-m5 -s` is where RAR reaches Cram's ratio, and it is there so the size
+comparison is not decided by one switch.
 
-**The size column depends on your data and the speed column does not.** That corpus is 15%
-duplicate content, which `.cram` stores once and no setting on either competitor can collapse. On
-corpora that never repeat themselves (Silesia, enwik9, a kernel checkout) Cram stays 6–11× faster
-than 7-Zip's default and writes 9–19% *larger*. Deduplication needs something to deduplicate.
+**9.8× faster than 7-Zip's default, writing 13.4% less.** Against RAR's default, 7.7× faster and
+16.3% smaller. Against RAR at `-m5 -s`, where the two archives are 0.12% apart in size, 12.5×
+faster. At `--fast` Cram writes the same corpus in 2.45 s, 28× 7-Zip's default, and still 12.3%
+smaller than 7-Zip's output.
+
+The memory column goes both ways. On create, Cram is lighter than 7-Zip on three of the four corpora
+and 0.9% heavier on the fourth, Silesia, at 915 MB against 907 MB. On extraction it ranges from 3.8×
+lighter, 1271 MB against 4877 on this corpus, to 86% heavier, 475 MB against 255 on Silesia. Against
+a tar pipe, which holds nothing, it is heavier everywhere. The extraction figures are peak RSS while
+reading, not the create column above.
+
+**Both columns depend on your data, and not equally.** This corpus is 15% duplicate content by
+construction, which `.cram` stores once and no setting on either competitor can collapse. On
+Silesia, enwik9 and a kernel checkout, where there is little to deduplicate, Cram writes 9.2% to
+19.2% *larger* than 7-Zip's default instead of 13.4% smaller. Speed moves much less: 6.0× to 11.4×
+across all four corpora.
+
+The kernel checkout carries more redundancy than a file-level scan finds. 634 of its 94,778 files
+are byte-identical copies, 0.20% of the tree, and `cram --store`, which compresses nothing, still
+writes 2.09% less than went in. The other 1.89% is redundancy inside files.
+
+**That table is Cram's own format. On `.zip`, the one people actually exchange, the gap is
+parallelism rather than deduplication.** Reading a kernel-tree `.zip`, Cram takes 1.89 s against
+7-Zip's 7.21 and Info-ZIP's 9.65, because neither of them extracts a `.zip` on more than one core
+even though every entry in the format is independently addressable. Writing one, 3.08 s against
+13.61 and 28.37, for an archive 0.55% larger than 7-Zip's and 1.41% smaller than Info-ZIP's. It
+costs memory: 150 MB against 31 and 4.9. Full table in
+[BENCHMARKS.md](BENCHMARKS.md#zip-against-7-zip-and-info-zip).
 
 ### Check it yourself
 
@@ -87,7 +113,7 @@ Cram 1.1.0, from the [releases page](https://github.com/lukr54/cram/releases/lat
 | Linux (x86-64) | [`cram-latest-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-unknown-linux-gnu.tar.gz) |
 | macOS (Apple Silicon) | [`cram-latest-aarch64-apple-darwin.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-aarch64-apple-darwin.tar.gz) |
 | Cram Studio, Windows GUI | [`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) |
-| Firefox hand-off add-on | [`cram-handoff-latest.xpi`](https://github.com/lukr54/cram/releases/latest/download/cram-handoff-latest.xpi) — [what it does](#downloading-and-handing-a-browser-download-to-cram), needs Studio |
+| Firefox hand-off add-on | [`cram-handoff-latest.xpi`](https://github.com/lukr54/cram/releases/latest/download/cram-handoff-latest.xpi) ([what it does](#downloading-and-handing-a-browser-download-to-cram), needs Studio) |
 
 Every release publishes a `SHA256SUMS` for each platform. **Nothing is code-signed yet**, so Windows
 SmartScreen warns on the first run of a downloaded binary and macOS keeps it quarantined until you
@@ -108,9 +134,10 @@ do not need Studio at all.
 
 This repository is the engine and the command line. It is written in Rust, and Windows (the
 GNU/mingw toolchain), Linux and Apple Silicon macOS each build and run the full test suite. Archive
-**mount** is Windows-only (see [Limitations](#limitations)). Everything is pure Rust **except the
-UnRAR C++ decoder**, which is always compiled in because it is what reads RAR; the optional
-`zstd-c` feature links C libzstd.
+**mount** is Windows-only (see [Limitations](#limitations)). Everything is pure Rust **except three C
+components**, all of which the released binaries carry: the UnRAR C++ decoder, always compiled in
+because it is what reads RAR; the optional `zstd-c` feature, which links C libzstd; and the optional
+`mimalloc` feature, which replaces the global allocator.
 
 ---
 
@@ -250,7 +277,7 @@ author, which has held that name on crates.io since before this project existed.
 
 That gives you the `cram` binary alone. `cram-extract`, which `cram make-sfx` shells out to, is a
 separate crate (`cargo install cram-extract`), and the Explorer right-click DLL is not published to
-crates.io at all — on Windows, take the zip above if you want all three.
+crates.io at all; on Windows, take the zip above if you want all three.
 
 ### Building from source
 
@@ -297,18 +324,24 @@ Optional features are opt-in, so the base build always compiles on a bare mingw 
 | `zstd-c` | full-range zstd encoder (C libzstd), and the default `.cram` pack codec once enabled. Without it, `.cram` packs use pure-Rust XZ. |
 | `download` | enables the `cram dl` segmented downloader. It is a client and opens no listening socket. |
 | `phash` | perceptual image hashing, so `cram dedup --similar` can flag visually-alike photos. Pure Rust, but a large dependency tree, hence opt-in. |
+| `mimalloc` | replaces the global allocator with mimalloc (C). Enabled in the released binaries. |
+
+The released binaries are built with all four. That is also the configuration the benchmarks were
+run in, so it is the one to build if you want to reproduce them:
 
 ```sh
-cargo build --release -p cram-cli --features zstd-c,download
+cargo build --release -p cram-cli --features download,zstd-c,phash,mimalloc
 ```
 
 `cram --version` prints which optional features a given binary was compiled with. A `zstd-c` build
 writes different `.cram` bytes than the pure-Rust default, so it is worth checking before comparing
 two archives.
 
-Run the tests with `cargo test`; that is 212 tests across the workspace, and 224 with the features
-the release is built with (`download,zstd-c,phash,mimalloc`), which compile code the default build leaves out.
-Exact counts drift with every commit; what matters is that the suite is green.
+Run the tests with `cargo test`; on 16 August 2026 that was 310 tests on Windows and 296 on Linux,
+rising to 323 and 309 with the features the release is built with
+(`download,zstd-c,phash,mimalloc`). Counts and platforms are in
+[CONTRIBUTING.md](CONTRIBUTING.md#running-the-tests); they drift with every commit, and what matters
+is that the suite is green.
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -336,9 +369,12 @@ cram l  <archive>                                 list entries
 cram x  <archive> [-o <dir>] [-p <pw>] [--skip]   extract
 cram a  <archive> <input...> [-p <pw>]            create [--fast|--auto|--small|--tiny|--store]
            [--solid|--no-solid] [--overwrite]     [--overwrite] replaces an existing <archive>
+           [--recompress|--no-recompress]         [--recompress] repacks JPEGs losslessly; it is
+                                                  already on at --small and --tiny, off at --auto
 cram t  <archive> [-p <pw>]                       test integrity (decode + checksums, no extract)
-cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format [--fast|--auto|--small|--tiny]
-           [--overwrite]                          [--overwrite] replaces an existing <out>
+cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format
+           [--overwrite]                          [--fast|--auto|--small|--tiny|--store]
+                                                  [--overwrite] replaces an existing <out>
 cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <mb>]
                                                   segmented download; several URLs are mirrors of
                                                   one file. --discover finds mirrors, --auto ramps
@@ -347,9 +383,14 @@ cram dl <url…|FILE.meta4> [-o <out>] [--extract <dir>] [-n <conns>] [--chunk <
 cram dedup <folder|file…> [--similar]             find duplicate files across folders and drives.
            [--similar-distance <0-15>]            Previews by default; --link (hard-link) or
            [--link] [--quarantine <dir>]          --quarantine <dir>, each with --apply, reclaim
-           [--apply] [--min-size <bytes>]         the space. --similar also flags visually-alike
-           [--json]                               images for human review.
-cram mount [--selftest] [-p <pw>] <archive> <dir> mount as a virtual folder (ProjFS)
+           [--apply] [--min-size <bytes>]         the space. --keep picks which copy survives
+           [--keep shortest|oldest|first]         (default: the shortest path). --similar also
+           [--json]                               flags visually-alike images for human review.
+cram mount [--selftest] [-p <pw>] [--writable]    mount as a virtual folder (ProjFS). --writable
+           [--remember] <archive> <dir>           keeps what you write into the folder; --remember
+cram mount --restore | --list | --forget <dir>    records the mount so --restore brings it back
+                                                  after a reboot, --list shows what would come
+                                                  back, and --forget drops one.
 cram rec <create|verify|repair> <file> …          Reed-Solomon recovery sidecar (.cramrec)
 cram sign <file> -k <keyfile>                     write a detached ed25519 signature (.cramsig)
 cram verify <file> [--key <hex>]                  verify a signature (pin --key to require a signer)
@@ -385,8 +426,7 @@ cram --version                                    version + which optional featu
   every entry is re-extracted as normal.
 - `--encrypt-names` (7z and `.cram` only) hides the file listing as well as the contents.
 - `--no-solid` (7z only) writes one independently-decodable pack per entry rather than packing
-  members together. That gives up most of the ratio — a shared dictionary across many similar small
-  files is where solid compression earns its name — and buys a cheaper read of one member out of a
+  members together. That gives up most of the ratio and buys a cheaper read of one member out of a
   large archive. Solid is the default; `--solid` states it explicitly for a script that would rather
   not rely on a default.
 - `--overwrite`, alias `-y`, lets `cram a`, `cram conv` and `cram make-sfx` write over a file that
@@ -402,15 +442,13 @@ cram --version                                    version + which optional featu
 
 ### Photos: ~23% smaller, and still byte-for-byte the same files
 
-Creating a `.cram` losslessly recompresses JPEGs. A photo's data is already entropy-coded, which is
-why zip and 7z gain essentially nothing on a photo library. Measured 2026-08-04 on one folder of 34 phone photos
-(26.1 MB, 8 and 12 megapixel JPEGs): ZIP and 7z both produced output *fractionally larger* than the
-originals, `tar.xz` managed 2.7%, and the same folder as a `.cram` was **23.6% smaller** with every
-file extracting byte-identical. That is a single folder, not a benchmark, and the harness is not in
-this repository; `cram a` prints the real ratio for your own files.
-
-That is one sample, not a benchmark. Expect roughly this range on ordinary photos, but the exact
-figure depends on the images; `cram a` prints the real ratio for your own files.
+Cram can repack JPEGs losslessly on the way into a `.cram`. A photo's data is already entropy-coded,
+which is why zip and 7z gain essentially nothing on a photo library. Measured 2026-08-04 on one
+folder of 34 phone photos (26.1 MB, 8 and 12 megapixel JPEGs): ZIP and 7z both produced output
+*fractionally larger* than the originals, `tar.xz` managed 2.7%, and the same folder as a `.cram`
+was **23.6% smaller** with every file extracting byte-identical. That is a single folder, not a
+benchmark, and the harness is not in this repository; `cram a` prints the real ratio for your own
+files.
 
 Nothing is traded away for it. The JPEG's entropy coding is redone with a stronger coder, and
 extraction reconstructs the **original file byte-for-byte**, same bytes, same EXIF, same checksum.
@@ -418,7 +456,9 @@ It is not "visually lossless"; it is the file you put in. Every candidate is ver
 *before* it is stored, and anything that fails verification is stored untouched, so the worst case is
 that a file simply isn't shrunk.
 
-It is on by default; `cram a --no-recompress` turns it off. Archives that use it declare format v2
+It runs at `--small` and `--tiny`, or at any level with `--recompress`; `--no-recompress` overrides
+it. **It is off at the default `--auto`**, so reaching the figure above takes one of those flags.
+Archives that use it declare format v2
 (see [docs/CRAM_FORMAT.md](docs/CRAM_FORMAT.md)), which older readers refuse outright rather than
 misread, and the standalone `cram-extract` recovery tool reverses it too, so a photo archive stays
 recoverable with the small independent decoder.
@@ -444,7 +484,7 @@ per-connection resume and the extract-while-downloading are the parts you cannot
 browser.
 
 **It will not work for a download that needs your session.** If the file sits behind a login, the
-URL alone is not enough — the cookies are, and the browser will not hand those to another program.
+URL alone is not enough; the cookies are, and the browser will not hand those to another program.
 A Firefox add-on does the hand-off properly, cookies included:
 **[`cram-handoff-latest.xpi`](https://github.com/lukr54/cram/releases/latest/download/cram-handoff-latest.xpi)**.
 
@@ -452,7 +492,7 @@ A Firefox add-on does the hand-off properly, cookies included:
 registers, so the command line on its own is not enough for this one feature. Install Studio first,
 then in its Downloads pane tick *Accept downloads from your browser*. Click the link above in
 Firefox and it will offer to install; afterwards, restart Firefox fully. A **Cram** button appears in
-the toolbar and turns the automatic hand-off on and off — the right-click *Download with Cram* menu
+the toolbar and turns the automatic hand-off on and off. The right-click *Download with Cram* menu
 works either way.
 
 It is signed by Mozilla (id `cram-handoff@nexalit.fr`, version 1.0.0) but distributed **unlisted**,
@@ -504,8 +544,8 @@ finds a bridge.
 
 The hash is now a **shortlist**. A proposed pair is confirmed against the pixels before anything is
 grouped: same aspect ratio within 10%, then a mean absolute difference no greater than 0.007 over a
-64x64 **colour** render. Colour is the point — throwing away chroma is what makes a hash robust, and
-it is also what makes two unrelated dark terminals look identical. Only images that reached a
+64x64 **colour** render. Throwing away chroma is what makes a hash robust, and it is also what makes
+two unrelated dark terminals look identical. Only images that reached a
 candidate pair are decoded again, so the cost is bounded by what the hash proposed rather than by
 the size of the scan; a file that has become unreadable since the first pass falls back to the
 hash's opinion rather than vanishing from the report. So `--similar-distance` (0 = identical hash,
@@ -600,8 +640,8 @@ section is a performance claim; for those see [`BENCHMARKS.md`](BENCHMARKS.md).
   write machinery.
 - **An archive holding one large file is still parallel.** Otherwise the unit of work is the entry
   and there is only one, so a machine with twenty-four cores uses one. A `.cram` entry is cut at its
-  pack boundaries — the seams where the pieces genuinely are independent — and the pieces decode
-  concurrently.
+  pack boundaries, which are the seams where the pieces genuinely are independent, and the pieces
+  decode concurrently.
 - **`.cram`** applies content-defined chunking, then global BLAKE3-keyed dedup across every input in
   one archive, then compressed packs and a footer index. Dedup is global: identical data anywhere in
   the inputs is stored once, with no dictionary-window limit. Optional encryption is Argon2id +
@@ -682,14 +722,14 @@ sign or write a recovery record. Studio follows the system light and dark theme.
 Duplicate results open as a gallery when they are photos or video, because a set of images cannot be
 judged from a list of paths: thumbnails, per-file or whole-row selection, and a full-size viewer
 that steps through a set with the arrows so two near-identical shots land in the same place on
-screen. Studio can also delete duplicates, which the command line deliberately never does — to the
-Recycle Bin, behind a button that has to be held. Everything the CLI reports is the same underneath;
+screen. Studio can also delete duplicates, which the command line deliberately never does, sending
+them to the Recycle Bin behind a button that has to be held. Everything the CLI reports is the same underneath;
 what Studio adds is being able to see it.
 
 **Studio is proprietary and sold under its own EULA.** The MIT OR Apache-2.0 licence on this page
 covers the engine and the CLI in this repository and nothing else. The Studio installer ships as an
-asset on this repository's Releases page —
-[`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) —
+asset on this repository's Releases page,
+[`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe),
 and that installer is **not** covered by those licences. A proprietary `.exe` on the Releases page
 of an MIT/Apache repository is deliberate, not an oversight.
 
@@ -719,7 +759,10 @@ largely machine-written. I set the direction, made the design decisions, ran and
 benchmarks, and I am responsible for anything wrong in it.
 
 An earlier commit removed em-dashes across the whole tree, including from `.gitignore` and CI
-comments. That reads as covering tracks, and it is fair to read it that way.
+comments. That reads as covering tracks, and it is fair to read it that way. It did not hold either:
+they came back as the code and the notes grew, and a count today finds 451 of them across 50 files,
+none in this README. So the purge was both a tell and a failure, which is worse than leaving them
+alone would have been.
 
 None of the above changes what can be checked independently: the benchmark corpus is published and
 rebuilds byte-identically, the numbers reproduce on your own hardware, the `.cram` format is

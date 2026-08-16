@@ -38,7 +38,7 @@ that read them stay buildable, and the specification to write a new reader is pu
 
 ## Support
 
-`1.0.x` is the supported line. A fix ships in the next patch release; between releases it is on
+`1.1.x` is the supported line. A fix ships in the next release; between releases it is on
 `main` and available by building from source.
 
 Security reports go through [GitHub's private advisory
@@ -69,11 +69,13 @@ and of the Studio installer, and macOS keeps a downloaded binary quarantined unt
 cleared. It is the first thing anybody downloading Cram encounters. This is a certificate and a
 build-pipeline change rather than a code problem, which is why it is first.
 
-**Decode each pack once.** `.cram` extraction currently decompresses 1.48 packs for every pack it
-needs, measured on the 42,151-file benchmark corpus against a floor of 1.0. Two workers that miss
-the cache on the same pack both decode it and one result is thrown away, which is roughly 1 GiB of
-wasted decompression on a 3.3 GB archive. The fix is single-flight: the second miss waits on the
-first decode instead of repeating it. It costs CPU, not correctness.
+**Group a straddling entry by every pack it touches.** Single-flight pack decoding shipped in
+commit `c736e25`: `CramReader::get_pack` now holds a pack's own lock across the decode, so a second
+worker that wants the same pack waits for those bytes instead of decompressing its own copy. What is
+left is narrower ([`docs/PERFORMANCE_FINDINGS.md`](docs/PERFORMANCE_FINDINGS.md) §13): an entry that
+straddles a pack boundary is grouped by its *first* pack, so the worker that owns pack N pulls in
+pack N+1, whose own owner may have to decode it again if the cache evicted it meanwhile. It costs
+CPU, not correctness, and matters most at the smaller pack sizes `--fast` and `--auto` use.
 
 **Windows benchmark numbers.** Every figure in [`BENCHMARKS.md`](BENCHMARKS.md) was measured on
 Linux, and Windows is the platform Cram is built for first. The file-open path is known to differ
@@ -106,7 +108,7 @@ refuses anything over 2 GiB. tar and RAR have no random-access boundary at all, 
 
 7z is no longer in that category. `read_range` now starts at the LZMA2 segment holding the range
 rather than at the start of the block, so on a block too large to cache a ranged read costs decoding
-from the nearest segment — on the benchmark corpus 128 MiB rather than the whole 2.8 GB — instead of
+from the nearest segment — 128 MiB rather than the whole 2.3 GB archive — instead of
 the entire block every time. Nothing is held while it does: only the dictionary window stays
 resident, so a segment far larger than memory costs its window, not its length.
 
@@ -117,11 +119,17 @@ end of a segment pays the decode from that segment's start, so a mount may want 
 last-decoded window, read ahead, or simply accept the cost.
 
 The shape for it exists: `RandomAccessReader::entry_splits` reports where one entry may be cut into
-independently-decodable pieces, and `.cram` implements it against its pack boundaries.
+independently-decodable pieces. `.cram` implements it against its pack boundaries, and so does 7z
+(`formats/sevenz.rs`, already used by the parallel extraction path to split one large solid entry
+across its LZMA2 segments) — which is exactly what a lazy 7z mount needs, not a second
+implementation of the archive side.
 
-**Streaming `cram conv`.** Conversion holds one whole entry in memory, so a `.cram` containing a
-single file over 512 MiB fails to convert even though `cram x` extracts it fine. Extraction streams
-each entry to disk; conversion should too.
+**Streaming `.cram` reads.** `cram conv` already streams what it writes, 4 MiB at a time
+(`engine/convert.rs`'s `PIPE_CHUNK`). What refuses a large file sits upstream of that: reading a
+`.cram` sequentially, `CramReader::next_entry` buffers a whole entry body before handing it over, and
+refuses anything past its 512 MiB `MAX_INMEM_ENTRY` ceiling. `cram x` extracts the same file fine
+because extraction reads `.cram` through its random-access path instead. The fix is a streaming
+`next_entry` for `.cram`.
 
 **Corpora larger than memory.** Every published measurement fits in the benchmark machine's page
 cache, so none is bounded by re-reading source data from disk. A 200 GB backup is a different

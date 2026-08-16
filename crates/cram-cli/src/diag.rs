@@ -19,11 +19,17 @@ fn version_line() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// The optional features this binary was built with, for the report header.
+///
+/// **Must list every feature `cram --version` does.** A bug report is read against the build that
+/// produced it, and `mimalloc` swaps the global allocator, so a report that omits it hides the one
+/// thing that changes every allocation in the process.
 fn features_line() -> String {
     let enabled: Vec<&str> = [
         ("zstd-c", cfg!(feature = "zstd-c")),
         ("download", cfg!(feature = "download")),
         ("phash", cfg!(feature = "phash")),
+        ("mimalloc", cfg!(feature = "mimalloc")),
     ]
     .iter()
     .filter(|(_, on)| *on)

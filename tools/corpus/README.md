@@ -104,7 +104,16 @@ follows is written down in its header; the ones worth knowing before reading a r
   is the standard way these tables mislead.
 - `sync` is inside the timed region for extraction. Without it an extraction stops the clock with
   gigabytes still in the page cache and whatever runs next pays for the writes.
-- Every tool runs under a memory cap with swap denied, so one that wants more than the machine has
-  is killed and recorded as such instead of taking the host down with it.
+- The memory cap is a fixed `MEMCAP` (default 20G) with swap denied, not "however much RAM the
+  machine has" — a 20G cap and a 23 GiB machine are two different ceilings. It is applied only when
+  the `systemd-run --user` enforcement probe passes (`CAPPED=yes`); if the probe fails, the run goes
+  ahead uncapped. A tool that wants more than `MEMCAP` is killed and recorded as such. That cap, not
+  the machine's actual RAM, is what produced an earlier published "7-Zip killed at 20 GB" row.
 - Extraction is measured to disk *and* to tmpfs. The first is the real-world number; the second
   removes the write wall and leaves the decoder. They answer different questions.
+- `extract()` never warms the archive; only `create()` calls `warm()`, and that warms the corpus
+  being packed, not the archive being unpacked. An archive the OS has not already cached pays for its
+  own disk read inside the timed decode: unwarmed, decode rows on this corpus have spread 17-140%
+  between repetitions. Warm it by hand (`cat keep.cram > /dev/null`, and likewise for `keep.7z` /
+  `keep.rar`) before trusting a single decode number, or read the figure as "archive read plus
+  decode" rather than "decode".

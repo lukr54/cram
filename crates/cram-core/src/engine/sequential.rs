@@ -1,7 +1,11 @@
 //! The sequential extraction path, one entry at a time via [`ArchiveReader::next_entry`]. Used for
-//! non-random-access formats (RAR, tar, raw single-stream, solid 7z): the reader yields each entry
+//! non-random-access formats (RAR, tar, raw single-stream): the reader yields each entry
 //! as a stream, and the engine owns path resolution, directory creation, progress and cancellation
 //!, the same write machinery the parallel path uses, so every backend inherits it.
+//!
+//! Solid 7z used to be on that list and is not any more. `SevenZReader` returns `Some` from
+//! `as_random_access`, so a solid block reaches the parallel path instead, coalesced into one work
+//! item per block rather than one per entry.
 
 use std::collections::HashSet;
 use std::fs;
@@ -32,6 +36,11 @@ use crate::reader::ArchiveReader;
 /// exactly as long — 13.30 s against 13.42, in 49 MB instead of 84 — so that CPU gates nothing. At
 /// 141% CPU this path is bound by its single decode thread, and a flat profile's sample share is not
 /// a wall-time attribution when more than one thread is running.
+///
+/// **Every wall-clock figure above dates from the change that introduced this buffer and has not
+/// been re-measured.** The same kernel-tree `.tar.gz` extraction is 2.63 s on the 16 August 2026 run
+/// — one machine, medians of 3, `/dev/shm` destination with the archive read into page cache first
+/// — so what is written here is the shape of each decision, not the cost of this path today.
 const WRITE_BUF: usize = 1024 * 1024;
 
 /// Largest entry taken into a batch rather than streamed straight to disk. Bigger entries are
@@ -164,6 +173,15 @@ pub fn run(
     // per-entry parallel path writes them in 1.48 s at 234% CPU where this path took 2.32 s at 130%,
     // and GNU tar takes 1.77 s. Widening it: 2.94 s at one writer, 1.90 at two, 1.52 at eight,
     // 1.44 at sixteen. So small entries accumulate into a bounded batch and go out across a pool.
+    //
+    // **`writers` is capped at 8 by `hw::derive_plan`, and the sixteen-writer point above is not an
+    // argument for raising it.** A second sweep of the same knob on the same corpus lives beside
+    // that cap in `hw.rs` and disagrees with this one: 1.43 s at eight where this says 1.52, and a
+    // GNU tar control of 1.69 s rather than 1.77. The 16 August 2026 run reproduces 1.69 exactly,
+    // which makes this the older of the two sweeps. That run also extracts a plain `.tar` in 1.19 s
+    // — one machine, medians of 3, `/dev/shm`, archive read into page cache first — so both sweeps
+    // are stale in absolute terms. Whether 8 is still the knee takes one re-run to settle; until it
+    // happens, neither sweep is guidance for moving the cap.
     let pool = (writers > 1)
         .then(|| {
             rayon::ThreadPoolBuilder::new()

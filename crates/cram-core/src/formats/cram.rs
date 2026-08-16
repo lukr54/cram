@@ -4,9 +4,13 @@
 //! `.cram` splits every file body into **content-defined chunks** (FastCDC v2020), identifies each
 //! chunk by its **BLAKE3 hash**, and stores each *unique* chunk exactly once, so identical files,
 //! or files that merely share regions (versioned assets, repacked game data), collapse to a single
-//! copy. Unique chunks are grouped into **solid packs** (~8 MiB) compressed as a whole (XZ/LZMA2,
-//! pure-Rust; a pack that doesn't shrink is stored raw), and a **footer index** maps entries → chunk
-//! lists and chunks → (pack, offset, length). Because chunks are individually addressable, `.cram`
+//! copy. Unique chunks are grouped into **solid packs**, each compressed as a whole, and a **footer
+//! index** maps entries → chunk lists and chunks → (pack, offset, length). Pack size follows the
+//! effort level (`pack_target_for`): 8 MiB at `--fast`, 16 MiB at the default `--auto`, 32 MiB at
+//! `--best`, and the format's 64 MiB ceiling less one maximum chunk at `--small` / `--tiny`. The
+//! pack codec is zstd on a `zstd-c` build and XZ/LZMA2 on a pure-Rust one; `--small` runs both over
+//! every pack and keeps whichever is smaller, and a pack that does not shrink is stored raw.
+//! Because chunks are individually addressable, `.cram`
 //! implements [`RandomAccessReader`], extraction fans out on the parallel per-entry engine, and
 //! [`read_range`](RandomAccessReader::read_range) is the on-access / mount primitive.
 //!
@@ -207,9 +211,12 @@ pub(crate) const CHUNK_MAX: u32 = 256 * 1024;
 ///
 /// The pack is the compressor's whole world, so it is the archive's match window, and raising it is
 /// the only lever `.cram` has against a solid-block LZMA archive that matches across hundreds of
-/// megabytes. Measured on the kernel tree at `--best`, 8 -> 32 MiB takes the archive from 172.37 MB
-/// to 164.61 MB, which is smaller than `7z -mx=5` produces, and drives pack decodes to exactly 1.00
-/// per pack so verify and extract roughly triple in speed.
+/// megabytes. Widening 8 -> 32 MiB at `--best` took 4.50% off the archive in the sweep this constant
+/// came from, and drove pack decodes to exactly 1.00 per pack so verify and extract roughly tripled
+/// in speed. That sweep's absolute sizes (172.37 MB -> 164.61 MB) fit no kernel tree this project
+/// measures today and its corpus was not recorded, so the shape is carried forward and the numbers
+/// are unverified. What is measured: on the 1,920,837,858-byte kernel tree of 16 August 2026,
+/// `--small` writes 450,691,514 bytes against `7z -mx=5`'s 452,190,211, 0.33% smaller.
 ///
 /// **Level, not hardware.** This value shapes the bytes on disk, and an unencrypted `.cram` is
 /// guaranteed byte-for-byte identical from the same inputs (`tests/reproducible.rs`) so that it can

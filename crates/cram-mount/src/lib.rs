@@ -3,10 +3,15 @@
 //! open files on demand, with content materialized lazily via `RandomAccessReader::read_range`, no
 //! up-front extraction.
 //!
-//! Read-only. The five ProjFS callbacks map to the archive: directory enumeration comes from the
-//! entry list; placeholder metadata (size/dir-flag) from the entry; file data from `read_range`.
-//! ProjFS invokes callbacks on its own threads, so the reader is shared `&` (it is `Send + Sync`)
-//! and the active-enumeration map is behind a `Mutex`.
+//! Read-only by default. [`mount_with`] takes a `writable` flag that keeps whatever is written into
+//! the folder as a layer over the archive; nothing is ever written back into the archive itself.
+//! [`registry`] holds the list of mounts to bring back after a reboot, which only `--remember` adds
+//! to.
+//!
+//! The five ProjFS callbacks map to the archive: directory enumeration comes from the entry list;
+//! placeholder metadata (size/dir-flag) from the entry; file data from `read_range`. ProjFS invokes
+//! callbacks on its own threads, so the reader is shared `&` (it is `Send + Sync`) and the
+//! active-enumeration map is behind a `Mutex`.
 //!
 //! Uses the MIT/Apache `windows` crate's ProjFS bindings (no GPL `windows-projfs`); the binding
 //! links on the mingw toolchain. Non-Windows targets get a stub `mount` that errors.
@@ -68,10 +73,10 @@ impl Mount {
     }
 }
 
-/// Mount `archive` (any random-access format, `.cram` or ZIP) as a virtual folder at `root`. The
-/// format is sniffed from the file; a sequential-only container (tar/7z/rar/raw) is rejected with
-/// `ArchiveError::UnsupportedFormat`. Returns a [`Mount`] guard; the folder stays live until it is
-/// dropped.
+/// Mount `archive` as a virtual folder at `root`, read-only. The format is sniffed from the file:
+/// `.cram`, ZIP and ISO 9660 serve ranges straight from disk, and tar / 7z / RAR / a bare compressed
+/// stream are decoded once into a bounded in-memory cache (2 GiB uncompressed) and refused above it.
+/// Returns a [`Mount`] guard; the folder stays live until it is dropped.
 ///
 /// `root` is created if absent. A `root` that already holds anything is **refused**: the mount hides
 /// the folder's contents while it runs and unmounting cannot restore them. Dropping the [`Mount`]

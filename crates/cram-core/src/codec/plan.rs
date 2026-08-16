@@ -41,15 +41,17 @@ pub fn plan_codec(fmt: Format, _entries: &[Entry]) -> PlanCodec {
 ///
 /// A backend that groups entries into shared units knows a number this function cannot see, and
 /// answers it from [`RandomAccessReader::decode_units`](crate::reader::RandomAccessReader::decode_units);
-/// callers must prefer that and fall back here. `.cram` reports its pack count that way. Answering
-/// `1` for it here used to make the CPU-bound plan `min(1, cores)`, which is how `cram t` ended up
-/// verifying on a single thread.
+/// callers must prefer that and fall back here. `.cram` reports its pack count that way and 7z its
+/// block count, split further where an LZMA2 segment map exists. Answering `1` for `.cram` here used
+/// to make the CPU-bound plan `min(1, cores)`, which is how `cram t` ended up verifying on a single
+/// thread.
 pub fn block_count(fmt: Format, entries: &[Entry]) -> usize {
     match fmt.container {
         // ZIP and ISO expose per-file random access → one independent unit per file.
         Container::Zip | Container::Iso => entries.iter().filter(|e| !e.is_dir()).count().max(1),
-        // TODO(7z): independent unit = folder count, which needs the backend's folder map. Treat as
-        // one stream until then.
+        // 7z's independent unit is a solid block, or an LZMA2 segment inside one, and the backend
+        // counts them in `SevenZRandomAccess::decode_units`, which callers reach first. tar, RAR and
+        // a bare stream have no unit boundary at all, so one stream is the honest answer here.
         _ => 1,
     }
 }

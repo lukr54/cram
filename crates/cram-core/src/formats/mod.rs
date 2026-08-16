@@ -1,5 +1,8 @@
-//! Format dispatch: turn a sniffed [`Format`] into a concrete reader/writer. Only ZIP read is wired
-//! for the core; the tar/rar/7z/raw backends slot in here as they land.
+//! Format dispatch: turn a sniffed [`Format`] into a concrete reader/writer.
+//!
+//! [`open`] dispatches all seven containers: ZIP, RAR, 7z, tar, raw (a bare compressed stream),
+//! `.cram` and ISO 9660. [`create`] dispatches the four writable ones (ZIP, tar, 7z, `.cram`) over
+//! the extensions listed in [`CREATE_TARGETS`]; RAR and ISO are read-only.
 
 use std::path::Path;
 use std::sync::Arc;

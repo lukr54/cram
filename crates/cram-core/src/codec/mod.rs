@@ -31,10 +31,19 @@ use crate::format::Codec as StreamCodec;
 /// | 1 MiB | 5.97 s | 4.49 s | 114% |
 ///
 /// 16 KiB is the only value that beats 4 KiB on **both**; past it, extraction pays for what decoding
-/// gains and the falling CPU says why. Worth 2.4% and no more — brotli stays behind `brotli -dc`
-/// because our whole read pipeline is, not because the decoder is: measured against the C CLI on an
-/// identical stream, this crate takes 0.55 s to its 0.48. No buffer size fixes the remainder, and
-/// neither would a C backend.
+/// gains and the falling CPU says why. Worth 2.4% and no more.
+///
+/// **The sweep predates the parallel tar-decode work and has not been re-run**, so read its shape,
+/// not its absolutes. The same kernel-tree `.tar.br` extraction measures 2.91 s on the 16 August 2026
+/// run, below every `cram x` cell above.
+///
+/// The conclusion that used to hang off this table — that brotli stays behind `brotli -dc` because
+/// the whole read pipeline does — is no longer true. Same run, same tree, `/dev/shm` destination
+/// with the archive warmed, medians of 3: cram 2.91 s against `brotli -dc | tar`'s 3.71, **1.27x
+/// ahead**. That is the narrowest winning margin in that run's tar-extraction table, so it is the
+/// codec to watch, and one machine on one afternoon is what it rests on. The decoder-against-C-CLI
+/// figure the old argument used (0.55 s to its 0.48 on an identical stream) is not in that run and
+/// has not been re-measured.
 const BROTLI_BUF: usize = 16 * 1024;
 
 pub mod plan;

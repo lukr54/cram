@@ -2,8 +2,11 @@
 //!
 //! ```text
 //! cram l  <archive>                            list entries
-//! cram x  <archive> [-o <dir>] [-p <pw>]       extract (parallel per-entry for ZIP) [--skip]
-//! cram a  <archive> <input...> [-p <pw>]       create [--fast|--auto|--small|--tiny|--store] [--encrypt-names]
+//! cram x  <archive> [-o <dir>] [-p <pw>]       extract (parallel per-entry where the container
+//!                                              offers random access) [--skip]
+//! cram a  <archive> <input...> [-p <pw>]       create [--fast|--auto|--small|--tiny|--store]
+//!                                              [--encrypt-names] [--solid|--no-solid]
+//!                                              [--recompress|--no-recompress]
 //!                                              [--overwrite] to replace an existing <archive>
 //! cram t  <archive> [-p <pw>]                  test integrity (decode + checksums, no extract)
 //! cram conv <in> <out> [-p <pw>] [--encrypt <pw>]   convert to <out>'s format
@@ -12,7 +15,9 @@
 //! cram dedup <folder|file…> [--similar]        find duplicate files across folders/drives; reports
 //!                                              unless --link / --quarantine --apply reclaim the
 //!                                              space. --similar also flags alike images.
-//! cram mount [--selftest] [-p <pw>] <archive> <dir>   mount as a virtual folder (ProjFS)
+//! cram mount [--writable] [--remember] [--selftest] [-p <pw>] <archive> <dir>
+//!                                              mount as a virtual folder (ProjFS)
+//! cram mount --restore | --list | --forget <dir>     the remembered-mount list
 //! cram rec <create|verify|repair> <file> …     Reed-Solomon recovery sidecar
 //! cram sign|verify|keygen …                    ed25519 signing
 //! cram make-sfx <archive.cram> <out.exe>       build a self-extracting executable
@@ -20,6 +25,8 @@
 //!                                              SHA-256 and replace this install [--features download]
 //! cram shell <install|uninstall|status>        add/remove Cram on Explorer's right-click menu
 //!                                              (Windows; the handler is the cram-shell crate)
+//! cram diag <status|on|off|report|where>       the recording setting, and the report a user
+//!                                              attaches to a bug report
 //! ```
 //!
 //! Archive verbs are handled here (calling cram-core's engine); the sidecar/mount tools delegate to
@@ -30,8 +37,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 /// Create is allocation-heavy — a pack buffer per lane, a chunk buffer per file, and a small `Vec`
-/// per chunk of every file — so the allocator is on the hot path rather than beside it, and the
-/// system one is what the workspace measured against.
+/// per chunk of every file — so the allocator is on the hot path rather than beside it. The
+/// published measurements are made on the shipping feature set, which includes this, so they are
+/// mimalloc's numbers and not the system allocator's.
 ///
 /// Behind a feature because it is a C dependency and the default build has to stay compilable on a
 /// bare mingw toolchain. On in the shipped binary, which already links C for UnRAR and zstd, so it
@@ -357,10 +365,13 @@ usage: cram <command> …
        few times the time of --auto
        --tiny is --small plus, for a .zip only, zopfli in place of the usual DEFLATE
        encoder. Same format -- every unzip reads it -- searched much harder, for a few
-       percent off at many times the time. Other formats treat it exactly as --small
+       percent off at many times the time. 7z and tar treat it as --small. A .cram takes
+       --small's pack size and preset but skips its per-pack codec search, so --small is
+       the one to ask for there
        --store writes the bytes uncompressed (dedup still runs). It is NOT the fast option:
-       it ties --fast on create and extracts slower, because it moves several times the
-       bytes. Use it when something will read parts of the archive without decompressing
+       measured against --fast on four corpora it is 5% slower on one and 24-44% slower on
+       the other three, and it moves several times the bytes. Use it when something will
+       read parts of the archive without decompressing
        --recompress losslessly recompresses JPEGs, ~23% off each one with the exact
        originals restored on extract. It is slow -- roughly 4x the create time -- so it
        is on only with --small/--tiny or when asked for by name; --no-recompress overrides
@@ -1466,23 +1477,6 @@ fn thousands(n: u64) -> String {
     out
 }
 
-/// Positional inputs for `create` = every arg after the archive that isn't a flag or a flag value.
-///
-/// A `--` ends option parsing (everything after it is an input, the Unix convention), and a
-/// `-`-prefixed arg that is NOT a known create flag but names an existing path is treated as an
-/// input: rejecting every `-`-prefixed arg as an option would silently drop any file whose name
-/// starts with `-` from the archive, which is data loss with no warning. Unknown dash-args that name
-/// nothing get a loud warning.
-/// Whether to spend a Lepton pass on JPEGs.
-///
-/// It is worth having and it is a bad default. Measured three times -- on a photo folder, on a
-/// 5.15 GB mixed corpus, and again at `--store` -- it costs about four times the create time to
-/// save around 1.4% of the archive, because the 23% it takes off a JPEG only applies to the JPEG
-/// share of the bytes, and that is small on anything but a photo library. Off by default takes
-/// create from 53 s to 12 s on the mixed corpus while still finishing 9.6% smaller than `7z -mx=5`.
-///
-/// So: on when `--best` asks for every last byte, on when `--recompress` asks for it by name, off
-/// otherwise. `--no-recompress` still wins over both, because an explicit no should always work.
 /// The effort a user asked for. Three names on the surface -- `--fast`, `--auto`, `--small` -- over
 /// the five the engine knows, because a ladder people have to read a table to understand is a ladder
 /// they set wrong.
@@ -1491,10 +1485,10 @@ fn thousands(n: u64) -> String {
 /// `--best` and `--cold` are still accepted so nobody hits a wall, and are deliberately undocumented.
 ///
 /// `--store` is not on this ladder. It reads like the fast end and measurably is not: on the kernel
-/// tree it ties `--fast` on create while writing 3.4x the bytes, and then extracts 2.6x slower
-/// because it is hauling all of them back off the disk. What it is actually for is reading *parts*
-/// of an archive without decompressing anything, which is a mount property, so it stays a flag
-/// rather than a rung.
+/// tree it takes 2.44 s against `--fast`'s 1.96 while writing 3.4x the bytes, and the create gap runs
+/// from 5% on the Cram corpus to 44% on Silesia (16 August 2026, Ryzen 9 5900X, 24 threads, medians
+/// of 2). What it is actually for is reading *parts* of an archive without decompressing anything,
+/// which is a mount property, so it stays a flag rather than a rung.
 fn level_for(args: &[String]) -> Level {
     // `--tiny` is checked first so `--small --tiny` means the smaller of the two rather than
     // whichever happens to be tested earlier.
@@ -1509,6 +1503,18 @@ fn level_for(args: &[String]) -> Level {
     }
 }
 
+/// Whether to spend a Lepton pass on JPEGs.
+///
+/// It is worth having and it is a bad default. Measured three times -- on a photo folder, on a
+/// 5.15 GB mixed corpus, and again at `--store` -- it costs about four times the create time to
+/// save around 1.4% of the archive, because the 23% it takes off a JPEG only applies to the JPEG
+/// share of the bytes, and that is small on anything but a photo library. Off by default takes
+/// create from 53 s to 12 s on the mixed corpus while still finishing 9.6% smaller than `7z -mx=5`.
+/// Those figures are carried forward from an earlier run on a corpus outside the 16 August 2026
+/// set, and were not re-measured with it.
+///
+/// So: on at `--small` and `--tiny`, on when `--recompress` asks for it by name, off otherwise.
+/// `--no-recompress` still wins over both, because an explicit no should always work.
 fn recompress_choice(args: &[String]) -> bool {
     if has(args, "--no-recompress") {
         return false;
@@ -1516,6 +1522,13 @@ fn recompress_choice(args: &[String]) -> bool {
     has(args, "--recompress") || matches!(level_for(args), Level::Cold | Level::Tiny)
 }
 
+/// Positional inputs for `create` = every arg after the archive that isn't a flag or a flag value.
+///
+/// A `--` ends option parsing (everything after it is an input, the Unix convention), and a
+/// `-`-prefixed arg that is NOT a known create flag but names an existing path is treated as an
+/// input: rejecting every `-`-prefixed arg as an option would silently drop any file whose name
+/// starts with `-` from the archive, which is data loss with no warning. Unknown dash-args that name
+/// nothing get a loud warning.
 fn create_inputs(args: &[String]) -> Vec<PathBuf> {
     const CREATE_FLAGS: &[&str] = &[
         "--small",

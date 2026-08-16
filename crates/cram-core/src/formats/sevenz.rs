@@ -1,5 +1,5 @@
-//! 7z backend, **read-only** for now (create lands with the writer phase), via the pure-Rust
-//! `sevenz-rust2` decoder (LZMA/LZMA2 always; BZip2/PPMd/Deflate/LZ4/AES-256 behind features).
+//! 7z **read** backend, via the pure-Rust `sevenz-rust2` decoder (LZMA/LZMA2 always;
+//! BZip2/PPMd/Deflate/LZ4/AES-256 behind features). Creating a `.7z` is [`super::sevenz_write`].
 //!
 //! 7z is solid/blocked: entries in a block share one decode stream, so there is no cheap *per-entry*
 //! random access. There is per-*unit* random access, which is what this backend offers, and the two

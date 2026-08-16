@@ -1,13 +1,17 @@
 //! 7z writer backend, the create counterpart to [`super::sevenz`], via `sevenz-rust2`'s encoder
-//! (the `compress` feature). Uses `push_archive_entry` (one independently-decodable pack per entry,
-//! *non-solid*): this both fits the incremental [`ArchiveWriter`] contract (stream one entry at a
-//! time) and matches Cram's strategy of authoring parallel-extractable layouts.
+//! (the `compress` feature).
 //!
-//! **Adaptive per-entry store:** because each entry is its own pack, the content-method chain can
-//! change between entries. `push_archive_entry` records whatever `set_content_methods` holds at the
-//! time of the call into that entry's folder, so an incompressible entry (per the probe's
-//! [`WriteHint`]) is written with a COPY chain while the rest use LZMA2, heterogeneous folders in
-//! one 7z are standard and both 7-Zip and our own reader handle them.
+//! **Solid is the default.** Entries are grouped into blocks of 128 MiB of source bytes
+//! (`SOLID_BLOCK_BYTES`) and each block is compressed as one stream, so a dictionary is shared
+//! across the files in it. `cram a --no-solid` (and the older `CRAM_7Z_SOLID=0`) falls back to
+//! `push_archive_entry`, one independently-decodable pack per entry: cheaper to pull a single member
+//! out of, and 23% larger on the tree recorded at `SOLID_BLOCK_BYTES`. An entry too large for a
+//! block is streamed as its own pack under either setting.
+//!
+//! **Adaptive store survives the grouping.** A pack carries one method chain, so a block cannot mix
+//! COPY and LZMA2 entries; when the probe's [`WriteHint`] flips verdict the open block is flushed and
+//! a new one starts. An incompressible run is written with a COPY chain while the rest use LZMA2,
+//! heterogeneous folders in one 7z are standard and both 7-Zip and our own reader handle them.
 //!
 //! Encryption is 7z's real strength and both create forks are honored:
 //!   - **AES-256** content encryption (`AesEncoderOptions`), 7-Zip's own scheme: ONE random salt

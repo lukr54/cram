@@ -6,11 +6,15 @@
 //! and hands `(metadata, bytes)` over a bounded channel; natural backpressure, no self-ref, no
 //! unsafe. Listing (`entries`) uses a separate header-only pass so the file tree is known up front.
 //!
-//! Limitation (noted): a compressed tar is decoded twice for extraction, once for the metadata
-//! pass, once by the worker. tar isn't the hot path (ZIP is); a single-pass optimization can come
-//! later. Each entry's body is **streamed** over the channel in bounded chunks (never buffered whole
-//!, a hostile header size / compression bomb would otherwise OOM the worker), with backpressure so
-//! only ~1 chunk is in flight.
+//! **The double decode is gone.** A compressed tar used to be decoded twice for an extraction, once
+//! for the metadata pass and once by the worker. [`ArchiveReader::entries_are_cheap`] returns false
+//! here for every codec but `None`, and the engine skips the listing when it plans an extraction, so
+//! only the worker's pass is left. `cram l` still pays for a pass of its own, because a listing is
+//! what it was asked for.
+//!
+//! Each entry's body is **streamed** over the channel in bounded chunks, never buffered whole, since
+//! a hostile header size or a compression bomb would otherwise OOM the worker. Backpressure comes
+//! from the bounded channel: `STREAM_DEPTH` allows 16 chunks in flight, so 16 MiB.
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -29,7 +33,8 @@ use crate::secret::PasswordProvider;
 
 /// Bytes per streamed body chunk. Bounds the worker's in-flight buffer, so an entry with a huge
 /// (untrusted) tar header size or a compression-bombed body is streamed to the destination rather
-/// than buffered whole in RAM. Reused each read; only ~1 chunk is in flight (bounded channel).
+/// than buffered whole in RAM. Reused each read; the bounded channel holds the worker to
+/// [`STREAM_DEPTH`] chunks in flight, so 16 MiB.
 const STREAM_CHUNK: usize = 1024 * 1024;
 
 /// Messages the decode worker may run ahead by.

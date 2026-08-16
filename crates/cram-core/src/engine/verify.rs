@@ -3,10 +3,10 @@
 //! Nothing is written to disk, bodies stream through a hashing sink, so even a decompression-bombed
 //! entry is bounded (counted and discarded, never buffered whole).
 //!
-//! Dispatch mirrors [`extract`](super::extract): **random-access** formats (ZIP, `.cram`) fan out
-//! across a rayon pool, each task streaming one entry through
-//! [`RandomAccessReader::copy_entry`](crate::reader::RandomAccessReader::copy_entry) on its own file
-//! handle; everything else uses the sequential `ArchiveReader::next_entry` stream. Using
+//! Dispatch mirrors [`extract`](super::extract): **random-access** formats (ZIP, ISO 9660, `.cram`,
+//! and a 7z whose blocks are usable) fan out across a rayon pool, each task streaming one entry
+//! through [`RandomAccessReader::copy_entry`](crate::reader::RandomAccessReader::copy_entry) on its
+//! own file handle; everything else uses the sequential `ArchiveReader::next_entry` stream. Using
 //! `copy_entry` for `.cram` matters, `next_entry` materializes a whole entry body in memory and
 //! refuses one past its in-RAM cap, so a large (multi-GiB) but perfectly healthy `.cram` entry would
 //! otherwise be reported as a failure even though `cram x` extracts it fine.
@@ -239,8 +239,9 @@ pub fn verify(
     let fmt = sniff::sniff_path(path)?;
     let mut reader = formats::open(path, fmt, pw)?;
 
-    // Random-access (ZIP, `.cram`) → parallel per-entry over its own handles. Everything else →
-    // the sequential `next_entry` stream, which is one front-to-back decode and cannot fan out.
+    // Random-access (ZIP, ISO, `.cram`, and a 7z that offered usable blocks) → parallel per-entry
+    // over its own handles. Everything else → the sequential `next_entry` stream, which is one
+    // front-to-back decode and cannot fan out.
     if reader.as_random_access().is_some() {
         let workers = {
             let units = reader.as_random_access().and_then(|ra| ra.decode_units());

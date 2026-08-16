@@ -22,7 +22,7 @@ features are.
 **1.0.0 was the first release** (6 August 2026) and 1.1.0 is current (12 August 2026). Only the
 newest minor line is supported: there is one maintainer and no backport branch, so a fix ships in
 the next release rather than being carried backwards. Between releases it is on `main` and available
-by building from source.
+by building from source, as soon as it is ready and pushed.
 
 `cram --version` reports the version and which optional features the binary carries. That matters
 in a report: a `zstd-c` build writes different `.cram` bytes than the pure-Rust default, so the two
@@ -79,6 +79,7 @@ Anything below, reachable by feeding Cram a file you control:
 |---|---|---|
 | **Format parsers** | [`crates/cram-core/src/formats/`](crates/cram-core/src/formats/) | ZIP, 7z, tar (+gzip/xz/zstd/bz2/lz4/brotli), ISO 9660, RAR, `.cram`, a crafted archive that panics, corrupts memory, hangs unboundedly, or executes code |
 | **LZMA2 segment walker** | [`formats/lzma2seg.rs`](crates/cram-core/src/formats/lzma2seg.rs) | it reads attacker-controlled chunk framing to decide where a decoder may start. A wrong cut hands a worker a byte range that decodes to plausible garbage, so it refuses anything it does not recognise rather than guessing; a hostile length is bounded by a chunk ceiling and by the pack stream's own extent, and the walk seeks over payload rather than reading it, so it allocates nothing an archive can influence |
+| **Multi-stream scanner** | [`codec/multi.rs`](crates/cram-core/src/codec/multi.rs) | it scans attacker-controlled `.tar.bz2`/`.tar.xz` bytes for the stream-boundary magic that decides where the parallel decoder may split, reachable from `cram l`; the scan is bounded (`SCAN_WIN` windows, giving up after 64 MiB with no second stream found) rather than reading the whole file, and `CRAM_PARALLEL_DECODE=0` disables the path entirely |
 | **Path-traversal guard** | [`model.rs`](crates/cram-core/src/model.rs) (`EntryPath::from_raw`), and the independent `sanitize` in [`cram-extract/src/main.rs`](crates/cram-extract/src/main.rs) | any entry name that causes a write **outside** the chosen output directory, or onto a Windows device |
 | **Extraction path** | [`engine/`](crates/cram-core/src/engine/) | a partial or wrong extraction reported as a **success**; overwriting files the user did not select |
 | **Crypto** | [`formats/cram.rs`](crates/cram-core/src/formats/cram.rs), [`cram-sign`](crates/cram-sign/src/lib.rs) | `.cram` Argon2id + AES-256-GCM, ZIP/7z AES-256, and `cram verify` accepting a `.cramsig` that a given key never produced |
@@ -140,9 +141,11 @@ turns a failed entry into a reported failure and carries on, and again by the dr
 the next entry. An LZMA2 stream does not return from that second read. Every read of a 7z block or
 segment therefore goes through a guard that stops touching the source after its first failure, and
 the unit is failed rather than continued, since nothing after a fault in a solid stream is
-recoverable anyway. Found by the fuzz harness (below) on a 2,208-byte archive that made `cram t` spin
-forever; `tests/data/hostile-7z-read-after-error.7z` is that archive, and the regression test asserts
-termination rather than any particular error.
+recoverable anyway. Found by the fuzz harness
+([`crates/cram-core/tests/fuzz_parsers.rs`](crates/cram-core/tests/fuzz_parsers.rs)) on a 2,208-byte
+archive that made `cram t` spin forever;
+[`crates/cram-core/tests/data/hostile-7z-read-after-error.7z`](crates/cram-core/tests/data/hostile-7z-read-after-error.7z)
+is that archive, and the regression test asserts termination rather than any particular error.
 
 **A damaged archive fails honestly.** Extraction is best-effort: intact entries are recovered and
 damaged ones are listed by name, and the process still exits **non-zero**, so a script chaining on
@@ -151,8 +154,9 @@ damaged ones are listed by name, and the process still exits **non-zero**, so a 
 **RAR is isolated in the CLI.** RAR is decoded by the UnRAR C++ engine, the one non-Rust component in
 a default build, and a crafted RAR can fault the process rather than raise a catchable Rust error.
 When a `cram` command names a RAR file, the CLI re-runs itself in a child process, so a fault kills
-only that child and the parent reports an error. Everything else in a default build is Rust. One
-optional feature adds more C: `zstd-c` links C libzstd. It is off by default but **on in the shipped
+only that child and the parent reports an error. Everything else in a default build is Rust. Two
+optional features add more C: `zstd-c` links C libzstd, and `mimalloc` replaces the global allocator
+that every allocation in the process goes through. Both are off by default but **on in the shipped
 binary**, and `cram --version` prints which optional features a binary was built with; worth including
 in a report.
 
