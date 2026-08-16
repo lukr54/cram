@@ -283,7 +283,14 @@ pub fn extract(
         let ra = reader.as_random_access().unwrap();
         parallel::run(ra, dest, plan.workers, opts.skip_existing, sink, &created)
     } else {
-        sequential::run(reader.as_mut(), dest, opts.skip_existing, sink, &created)
+        sequential::run(
+            reader.as_mut(),
+            dest,
+            plan.writers,
+            opts.skip_existing,
+            sink,
+            &created,
+        )
     };
 
     // Only on cancellation. A run that failed part-way leaves its output alone: the user did not ask

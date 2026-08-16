@@ -3,13 +3,17 @@
 //! as a stream, and the engine owns path resolution, directory creation, progress and cancellation
 //!, the same write machinery the parallel path uses, so every backend inherits it.
 
+use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use rayon::prelude::*;
+
 use crate::engine::{restore_mtime, skip, ProgressWriter};
 use crate::error::{ArchiveError, Report, Result};
+use crate::model::Entry;
 use crate::progress::ProgressSink;
 use crate::reader::ArchiveReader;
 
@@ -29,6 +33,88 @@ use crate::reader::ArchiveReader;
 /// 141% CPU this path is bound by its single decode thread, and a flat profile's sample share is not
 /// a wall-time attribution when more than one thread is running.
 const WRITE_BUF: usize = 1024 * 1024;
+
+/// Largest entry taken into a batch rather than streamed straight to disk. Bigger entries are
+/// written inline as they always were: they are few, they already saturate a single write stream,
+/// and holding one in memory to hand it to a pool would be paying memory for nothing.
+const BATCH_ENTRY_MAX: usize = 4 << 20;
+
+/// Decoded bytes a batch may hold before the pool writes it, and the entry count that also closes
+/// it. The bound is what keeps this from being "buffer the archive": 32 MiB and 4,096 entries,
+/// whichever comes first.
+const BATCH_BYTES: usize = 32 << 20;
+const BATCH_ENTRIES: usize = 4096;
+
+/// One decoded entry waiting for the writer pool.
+struct Pending {
+    entry: Entry,
+    outpath: PathBuf,
+    bytes: Vec<u8>,
+}
+
+/// Write one buffered entry. Runs on the pool, so it touches only `Sync` state — `CreatedLog` takes
+/// its own locks and [`ProgressSink`] is `Sync` by declaration.
+///
+/// No `BufWriter`: the whole entry is one `write_all`, which is strictly fewer calls than streaming
+/// it through a copy buffer would be.
+fn write_pending(
+    p: &Pending,
+    created: &super::unwind::CreatedLog,
+    sink: &dyn ProgressSink,
+) -> io::Result<u64> {
+    if sink.is_cancelled() {
+        return Err(io::Error::other("cancelled"));
+    }
+    sink.on_entry_start(&p.entry);
+    if let Some(parent) = p.outpath.parent() {
+        created.ensure_dir(parent)?;
+    }
+    let mut file = created.create_file(&p.outpath)?;
+    file.write_all(&p.bytes)?;
+    super::restore_mtime_open(&file, p.entry.modified);
+    let n = p.bytes.len() as u64;
+    sink.on_bytes(n);
+    sink.on_file_done(&p.entry);
+    Ok(n)
+}
+
+/// Write a batch across the pool and fold the outcomes into `report` **in archive order**.
+///
+/// `par_iter().collect()` preserves index order, so which entry failed and in what sequence is the
+/// same as it would have been written one at a time. Only the writing overlaps.
+fn flush_batch(
+    batch: &mut Vec<Pending>,
+    held: &mut HashSet<PathBuf>,
+    pool: Option<&rayon::ThreadPool>,
+    created: &super::unwind::CreatedLog,
+    sink: &dyn ProgressSink,
+    report: &mut Report,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let run = || -> Vec<io::Result<u64>> {
+        batch
+            .par_iter()
+            .map(|p| write_pending(p, created, sink))
+            .collect()
+    };
+    let results = match pool {
+        Some(p) => p.install(run),
+        None => run(),
+    };
+    for (p, r) in batch.drain(..).zip(results) {
+        match r {
+            Ok(n) => {
+                crate::diag::diag().entry(p.entry.name(), Some(n), "ok");
+                report.extracted += 1;
+                report.bytes += n;
+            }
+            Err(e) => report.push_failure(p.entry.name(), e),
+        }
+    }
+    held.clear();
+}
 
 /// Copy `from` into `to` through a caller-owned buffer.
 ///
@@ -60,6 +146,7 @@ fn copy_through<R: io::Read + ?Sized, W: io::Write + ?Sized>(
 pub fn run(
     reader: &mut dyn ArchiveReader,
     dest: &Path,
+    writers: usize,
     skip_existing: bool,
     sink: &dyn ProgressSink,
     created: &super::unwind::CreatedLog,
@@ -71,6 +158,26 @@ pub fn run(
     let mut dir_times: Vec<(PathBuf, SystemTime)> = Vec::new();
     // Once, for the whole extraction. See [`WRITE_BUF`].
     let mut copy_buf = vec![0u8; WRITE_BUF];
+
+    // Decoding a tar is one pass and stays one thread; *writing* what it decodes does not have to
+    // be. Measured on the kernel tree, the same 94,778 files with no decoding on either side: the
+    // per-entry parallel path writes them in 1.48 s at 234% CPU where this path took 2.32 s at 130%,
+    // and GNU tar takes 1.77 s. Widening it: 2.94 s at one writer, 1.90 at two, 1.52 at eight,
+    // 1.44 at sixteen. So small entries accumulate into a bounded batch and go out across a pool.
+    let pool = (writers > 1)
+        .then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(writers)
+                .build()
+                .ok()
+        })
+        .flatten();
+    let mut batch: Vec<Pending> = Vec::new();
+    let mut batch_bytes = 0usize;
+    // Destinations already in the batch. Two entries can name one file — legal in tar, and the
+    // second must win as it would writing one at a time — so a repeat closes the batch first
+    // rather than racing against its predecessor on the pool.
+    let mut held: HashSet<PathBuf> = HashSet::new();
 
     loop {
         sink.wait_if_paused();
@@ -113,6 +220,86 @@ pub fn run(
             report.skipped += 1;
             continue;
         }
+        // Take the entry whole if it is small enough, and hand it to the pool. Read one byte past
+        // the ceiling so "it ended" and "there is more" are distinguishable without trusting the
+        // declared size, which is attacker-controlled; anything larger falls through to the
+        // streaming path below with these bytes as its head.
+        if pool.is_some() {
+            let cap = usize::try_from(entry.size)
+                .unwrap_or(BATCH_ENTRY_MAX)
+                .min(BATCH_ENTRY_MAX);
+            let mut bytes = Vec::with_capacity(cap);
+            match es
+                .body
+                .by_ref()
+                .take(BATCH_ENTRY_MAX as u64 + 1)
+                .read_to_end(&mut bytes)
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    report.push_failure(entry.name(), e);
+                    continue;
+                }
+            }
+            if bytes.len() <= BATCH_ENTRY_MAX {
+                // The body ended inside the ceiling, so this is the whole entry.
+                if es.meta_final && bytes.len() as u64 != entry.size {
+                    report.push_failure(
+                        entry.name(),
+                        io::Error::other(format!(
+                            "decoded {} bytes but the archive declared {}",
+                            bytes.len(),
+                            entry.size
+                        )),
+                    );
+                    continue;
+                }
+                if held.contains(&outpath) {
+                    flush_batch(
+                        &mut batch,
+                        &mut held,
+                        pool.as_ref(),
+                        created,
+                        sink,
+                        &mut report,
+                    );
+                    batch_bytes = 0;
+                }
+                held.insert(outpath.clone());
+                batch_bytes += bytes.len();
+                batch.push(Pending {
+                    entry,
+                    outpath,
+                    bytes,
+                });
+                if batch_bytes >= BATCH_BYTES || batch.len() >= BATCH_ENTRIES {
+                    flush_batch(
+                        &mut batch,
+                        &mut held,
+                        pool.as_ref(),
+                        created,
+                        sink,
+                        &mut report,
+                    );
+                    batch_bytes = 0;
+                }
+                continue;
+            }
+            // Too big for the batch. Everything queued must land before it does, so the archive
+            // order of any colliding destination is preserved, and then it streams as it always did
+            // — with `bytes` already read, so it is prepended to the rest of the body.
+            flush_batch(
+                &mut batch,
+                &mut held,
+                pool.as_ref(),
+                created,
+                sink,
+                &mut report,
+            );
+            batch_bytes = 0;
+            es.body = Box::new(io::Cursor::new(bytes).chain(es.body));
+        }
+
         sink.on_entry_start(&entry);
 
         // Parent-dir creation and file open are non-fatal per entry (matches the parallel path): a
@@ -172,6 +359,17 @@ pub fn run(
             }
         }
     }
+
+    // Whatever is still queued, before the directory mtimes below — those are only correct once
+    // every child is on disk.
+    flush_batch(
+        &mut batch,
+        &mut held,
+        pool.as_ref(),
+        created,
+        sink,
+        &mut report,
+    );
 
     // Final pass: stamp directory mtimes now that every child has been written.
     for (path, t) in dir_times {
