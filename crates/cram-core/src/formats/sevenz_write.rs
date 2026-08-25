@@ -38,8 +38,8 @@ use std::time::Instant;
 
 use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_rust2::{
-    prepare_pack, ArchiveEntry, ArchiveWriter as SzWriter, EncoderConfiguration, EncoderMethod,
-    Error as SzError, Password, PreparedPack, SourceReader,
+    prepare_block, ArchiveEntry, ArchiveWriter as SzWriter, EncoderConfiguration, EncoderMethod,
+    Error as SzError, Password, PreparedBlock, SourceReader,
 };
 
 use crate::error::{ArchiveError, Result};
@@ -306,7 +306,7 @@ pub struct SevenZArchiveWriter {
     packs_written: usize,
     /// Packs compressing on the pool, in submission order. Drained from the front, which is what
     /// keeps the archive's packs in the order the walk produced them.
-    pending_packs: VecDeque<Receiver<Result<PreparedPack>>>,
+    pending_packs: VecDeque<Receiver<Result<PreparedBlock>>>,
     /// How many packs may compress at once — the whole parallelism budget, since each pack now
     /// encodes single-threaded and concurrency comes from having several in flight.
     ///
@@ -457,7 +457,7 @@ impl SevenZArchiveWriter {
     /// compresses straight into the output stream, so packs could never overlap and every thread had
     /// to come from LZMA2 chunking *within* one pack — capped at pack size ÷ dictionary, and costing
     /// ratio because a match cannot cross a chunk boundary. Whole packs in parallel lifts both
-    /// limits at once, and needs `prepare_pack`, which this build patches into `sevenz-rust2`.
+    /// limits at once, and needs `prepare_block`, which sevenz-rust2 has offered since 0.22.0.
     fn flush_block(&mut self) -> Result<()> {
         if self.block.is_empty() {
             return Ok(());
@@ -481,7 +481,7 @@ impl SevenZArchiveWriter {
         rayon::spawn_fifo(move || {
             // FIFO for the same reason as the ZIP writer: the appending thread blocks on the OLDEST
             // pack, and a LIFO queue runs that one last.
-            let _ = tx.send(prepare_pack(methods, entries, readers).map_err(map_sz));
+            let _ = tx.send(prepare_block(methods, entries, readers).map_err(map_sz));
         });
         self.pending_packs.push_back(rx);
         Ok(())
@@ -495,7 +495,7 @@ impl SevenZArchiveWriter {
         let pack = rx
             .recv()
             .map_err(|_| ArchiveError::Backend("7z: pack compression worker died".into()))??;
-        self.writer()?.push_prepared_pack(pack).map_err(map_sz)?;
+        self.writer()?.push_prepared_block(pack).map_err(map_sz)?;
         self.packs_written += 1;
         Ok(true)
     }

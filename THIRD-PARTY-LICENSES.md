@@ -449,8 +449,8 @@ Applies to:
 ## Apache License 2.0
 
 Applies to:
-- `lzma-rust2` 0.16.5
-- `sevenz-rust2-cram` 0.21.3
+- `lzma-rust2` 0.20.0
+- `sevenz-rust2` 0.22.2
 
 ```text
                                  Apache License
@@ -5685,13 +5685,13 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ## MIT License
 
 Applies to:
-- `cram-cli` 1.2.0
-- `cram-core` 1.2.0
-- `cram-extract` 1.2.0
-- `cram-mount` 1.2.0
-- `cram-recovery` 1.2.0
-- `cram-shell` 1.2.0
-- `cram-sign` 1.2.0
+- `cram-cli` 1.3.0
+- `cram-core` 1.3.0
+- `cram-extract` 1.3.0
+- `cram-mount` 1.3.0
+- `cram-recovery` 1.3.0
+- `cram-shell` 1.3.0
+- `cram-sign` 1.3.0
 - `rdm-core` 0.1.0
 - `brotli-decompressor` 5.0.3
 - `default-boxed-derive` 0.2.0
@@ -6425,7 +6425,7 @@ SOFTWARE.
 ## MIT License
 
 Applies to:
-- `lz4_flex` 0.13.1
+- `lz4_flex` 0.14.0
 
 ```text
 The MIT License (MIT)

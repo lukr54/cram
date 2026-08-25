@@ -9,8 +9,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-**Ships as 1.2.0.** The manifests are already at 1.2.0; this heading and its link reference get the
+**Ships as 1.3.0.** The manifests are already at 1.3.0; this heading and its link reference get the
 version and the date when the tag is cut.
+
+### Changed
+
+- **The vendored `sevenz-rust2` fork is gone.** Cram depended on `sevenz-rust2-cram`, a published
+  copy of upstream 0.21.3 carrying two additions it needed: preparing a solid block off the writer
+  thread, and an accessor for a coder's properties. Both were offered upstream, reviewed, and
+  merged; upstream shipped them in 0.22.0. Cram now depends on plain `sevenz-rust2` 0.22 and the
+  fork is retired.
+
+  Dropping four upstream releases in one step also picks up fixes the fork never had. The one worth
+  naming: coder stream counts read from a 7z block header are attacker-controlled and were summed
+  without an overflow check, so a malformed archive could wrap past the bound that limits them.
+  Cram reads archives it did not create, so this was reachable. Upstream fixed it in 0.21.4;
+  the fork was pinned below that. Also included are a PPMd memory-limit check that compared bytes
+  against a kilobyte limit (0.22.1), and batched AES-CBC decryption for encrypted `.7z` (0.21.5).
+
+- `lzma-rust2` 0.16 → 0.20 and `lz4_flex` 0.13 → 0.14, which is what keeps one copy of each in the
+  build now that `sevenz-rust2` 0.22 has moved. `cram-extract` was pinned to `lzma-rust2` 0.16
+  separately and is bumped with it, so the standalone decoder and `cram` no longer ship different
+  versions of the same XZ decoder.
+
+No flag changed, no `.cram` archive reads differently, and nothing in the CLI moved.
+
+---
+
+## [1.2.0] - 2026-08-16
 
 `cram-core`'s Rust API did break in this cycle — `hw::load_profile` and `hw::save_profile` changed
 signature and `hw::Wall` is new — and an earlier reading of the workspace policy would have made
@@ -807,4 +833,5 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 [1.0.0]: https://github.com/lukr54/cram/releases/tag/v1.0.0
 [1.0.2]: https://github.com/lukr54/cram/releases/tag/v1.0.2
 [1.1.0]: https://github.com/lukr54/cram/releases/tag/v1.1.0
-[Unreleased]: https://github.com/lukr54/cram/compare/v1.1.0...HEAD
+[1.2.0]: https://github.com/lukr54/cram/releases/tag/v1.2.0
+[Unreleased]: https://github.com/lukr54/cram/compare/v1.2.0...HEAD

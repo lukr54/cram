@@ -22,7 +22,7 @@ path = "src/bin/calibrate.rs"
 [dependencies]
 rayon = "1.10"
 flate2 = "1.0"                                                          # DEFLATE (pure Rust)
-lzma-rust2 = { version = "0.16", features = ["encoder", "xz", "std"] }  # XZ/LZMA (pure Rust)
+lzma-rust2 = { version = "0.20", features = ["encoder", "xz", "std"] }  # XZ/LZMA (pure Rust)
 num_cpus = "1.16"                                                       # physical core count
 thiserror = "2"                                                         # typed errors
 zeroize = "1"                                                           # wipe passwords from memory on drop (pure Rust)
@@ -53,13 +53,12 @@ tar = "0.4"                                                            # tar con
 # whole build's DEFLATE (incl. the ZIP spine above) onto buggy zlib-rs 0.6.6. DEFLATE inside a .7z is
 # rare (7z uses LZMA/LZMA2), so dropping it is worth keeping every DEFLATE path on miniz_oxide.
 #
-# The dependency is renamed rather than forked in place: `sevenz-rust2-cram` is upstream 0.21.3 plus
-# two additions (off-thread pack preparation, and a `Coder::properties` accessor), both offered
-# upstream as pull requests. Its lib is still `sevenz_rust2`, so `use sevenz_rust2::…` is unchanged
-# throughout and switching back is one line here. A crate published to crates.io cannot depend on a
-# git dependency or a `[patch.crates-io]` entry, which is the only reason the fork is published at
-# all -- see its NOTICE.
-sevenz-rust2 = { package = "sevenz-rust2-cram", version = "0.21.3", default-features = false, features = [
+# This was a published fork (`sevenz-rust2-cram`) from 2026-08-13 to 2026-08-25, carrying two
+# additions we needed: off-thread block preparation, and a `Coder::properties` accessor. Both were
+# offered upstream and both were merged; 0.22.0 shipped them. The fork is gone and this is plain
+# upstream again. Do not re-fork without trying a pull request first -- that round trip took twelve
+# days and ended with the code in everyone's hands rather than only ours.
+sevenz-rust2 = { version = "0.22", default-features = false, features = [
     "aes256",
     "bzip2",
     "compress",
@@ -70,7 +69,7 @@ sevenz-rust2 = { package = "sevenz-rust2-cram", version = "0.21.3", default-feat
 # Niche whole-stream decoders for `.zst`/`.bz2`/`.lz4`/`.br` (+ their `.tar.*`), all pure Rust:
 ruzstd = "0.8"       # zstd DECODE (pure Rust; a C zstd *encoder* is a later feature-gated add)
 bzip2 = "0.6"        # bzip2, default backend is pure-Rust libbz2-rs-sys (no C bzip2-sys)
-lz4_flex = "0.13"    # lz4 frame decode (pure Rust); pinned to dedupe with sevenz-rust2's copy
+lz4_flex = "0.14"    # lz4 frame decode (pure Rust); tracks sevenz-rust2 0.22's copy so only one is built
 brotli = "8"         # brotli decode (pure Rust)
 
 # --- the native `.cram` content-defined-dedup format ---
