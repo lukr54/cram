@@ -9,8 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-**Ships as 1.3.0.** The manifests are already at 1.3.0; this heading and its link reference get the
-version and the date when the tag is cut.
+## [1.3.0] - 2026-08-25
 
 ### Changed
 
@@ -834,4 +833,5 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 [1.0.2]: https://github.com/lukr54/cram/releases/tag/v1.0.2
 [1.1.0]: https://github.com/lukr54/cram/releases/tag/v1.1.0
 [1.2.0]: https://github.com/lukr54/cram/releases/tag/v1.2.0
-[Unreleased]: https://github.com/lukr54/cram/compare/v1.2.0...HEAD
+[1.3.0]: https://github.com/lukr54/cram/releases/tag/v1.3.0
+[Unreleased]: https://github.com/lukr54/cram/compare/v1.3.0...HEAD

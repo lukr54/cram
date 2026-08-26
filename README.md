@@ -105,7 +105,7 @@ loses. Those rows are in the same tables as the ones above.
 
 ## Download
 
-Cram 1.1.0, from the [releases page](https://github.com/lukr54/cram/releases/latest):
+Cram 1.3.0, from the [releases page](https://github.com/lukr54/cram/releases/latest):
 
 | | |
 |---|---|
@@ -231,7 +231,7 @@ and work on **any file**, not just Cram's own formats. The self-extracting `.exe
 ### Windows
 
 [`cram-latest-x86_64-pc-windows-gnu.zip`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-pc-windows-gnu.zip),
-or the versioned `cram-v1.1.0-x86_64-pc-windows-gnu.zip` from the
+or the versioned `cram-v<version>-x86_64-pc-windows-gnu.zip` from the
 [releases page](https://github.com/lukr54/cram/releases/latest). Both are the same bytes; the
 version-free name exists so a `releases/latest/download/…` link keeps working across releases, and
 every platform now has one. `SHA256SUMS.windows` covers the versioned name, which is the one
