@@ -9,6 +9,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `.zip` whose entries use Zstandard (method 93) can now be read.** Every such entry previously
+  failed with `compression method not supported: 93` while the rest of the archive extracted around
+  it, so a real archive came out partially populated with thousands of individual errors rather than
+  one clear refusal. Repackers have largely moved to zstd-in-zip because it is much faster than
+  DEFLATE at a similar ratio, so this is common in the wild rather than exotic. It had never worked
+  in any release.
+
+  The exclusion was deliberate and its reason had expired: the ZIP dependency took pure-Rust features
+  only so the default build needs no C toolchain, and that was written before Cram linked C zstd at
+  all. It does now, and the `zip` crate wants the same crate at the same version, so reading method
+  93 rides on the existing `zstd-c` feature and costs the shipped binaries nothing. **A default
+  `cargo install cram-cli` build is unchanged and still has no C dependency**, so it still cannot
+  read these archives.
+
 ## [1.3.0] - 2026-08-25
 
 ### Changed

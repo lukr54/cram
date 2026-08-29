@@ -29,7 +29,8 @@ zeroize = "1"                                                           # wipe p
 filetime = "0.2"                                                        # restore entry mtimes on extract (pure Rust; correct dir handling on Windows)
 crc32fast = "1"                                                         # CRC32 for `cram test` integrity verification (pure Rust)
 time = "0.3"                                                            # ZIP DOS-datetime <-> SystemTime (already compiled via zip's `time` feature)
-# ZIP read (spine), pure-Rust features only (no C bzip2/zstd) to stay mingw-clean.
+# ZIP read (spine). Pure-Rust features only here, so the default build stays mingw-clean with no C
+# dependency; zstd (method 93) is added by the `zstd-c` feature below, which already links that crate.
 # NOTE: use `deflate-flate2` (flate2's default miniz_oxide backend), NOT the `deflate` meta-feature, 
 # that meta pulls `deflate-flate2-zlib-rs`, and zlib-rs 0.6.6 has an integer-overflow panic in inflate
 # that crashes on real-world DEFLATE streams (e.g. large game-repack .zip payloads). miniz_oxide is the
@@ -141,7 +142,13 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "h
 default = []
 download = ["dep:rdm-core", "dep:tokio", "dep:reqwest", "dep:sha2", "dep:futures-util"]
 # Opt-in C backends. Gated so the default build is 100% pure-Rust / always-builds.
-zstd-c = ["dep:zstd"]
+#
+# `zip/zstd` rides along because it needs the same crate at the same version (`zstd ^0.13.3`), so on
+# a build that already has `zstd-c` it costs nothing and buys reading ZIP method 93. Repackers have
+# largely moved to zstd-in-zip, and until 1.3.1 those archives failed per entry with "compression
+# method not supported: 93" while the rest of the archive extracted around them. It stays behind
+# this feature rather than going in unconditionally so the default build has no C dependency.
+zstd-c = ["dep:zstd", "zip/zstd"]
 # Perceptual image hashing for `cram dedup --similar`. Pure Rust, but a large dependency tree, so it is
 # opt-in for anyone embedding the engine; the shipped CLI enables it.
 phash = ["dep:image"]
