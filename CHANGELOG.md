@@ -9,6 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-01
+
 ### Fixed
 
 - **A `.zip` whose entries use Zstandard (method 93) can now be read.** Every such entry previously
@@ -850,4 +852,5 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 [1.1.0]: https://github.com/lukr54/cram/releases/tag/v1.1.0
 [1.2.0]: https://github.com/lukr54/cram/releases/tag/v1.2.0
 [1.3.0]: https://github.com/lukr54/cram/releases/tag/v1.3.0
-[Unreleased]: https://github.com/lukr54/cram/compare/v1.3.0...HEAD
+[1.3.1]: https://github.com/lukr54/cram/releases/tag/v1.3.1
+[Unreleased]: https://github.com/lukr54/cram/compare/v1.3.1...HEAD
