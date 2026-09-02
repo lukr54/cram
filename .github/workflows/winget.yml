@@ -1,0 +1,27 @@
+# Submits a winget manifest update to microsoft/winget-pkgs whenever a release is published, so
+# `winget install Nexalit.Cram` tracks the latest version without a hand-authored PR. It fires on the
+# `released` event, which GitHub emits when `release-publish` in ci.yml takes the release out of
+# draft — after all three platform artifacts have uploaded, so the versioned Windows zip the manifest
+# points at is already present.
+name: Publish to winget
+
+on:
+  release:
+    types: [released]
+
+jobs:
+  winget:
+    name: Submit Nexalit.Cram to winget-pkgs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update the winget manifest
+        uses: vedantmgoyal9/winget-releaser@main
+        with:
+          identifier: Nexalit.Cram
+          # The VERSIONED Windows zip, not the cram-latest copy. winget pins an exact versioned URL
+          # and SHA per submission; a /releases/latest/ URL would point at whatever ships next and go
+          # stale. This regex matches cram-v<ver>-x86_64-pc-windows-gnu.zip and excludes cram-latest-…
+          installers-regex: '^cram-v.*-x86_64-pc-windows-gnu\.zip$'
+          # Classic PAT with public_repo scope, stored as a repo secret. The workflow's own
+          # GITHUB_TOKEN cannot open a PR against microsoft/winget-pkgs; this one can.
+          token: ${{ secrets.WINGET_TOKEN }}
