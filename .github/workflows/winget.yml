@@ -8,6 +8,13 @@ name: Publish to winget
 on:
   release:
     types: [released]
+  # Manual trigger, to backfill a release that published before this workflow existed (the auto
+  # trigger only fires on the `released` event, which is one-shot per release).
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "Release tag to submit to winget (e.g. v1.3.1)"
+        required: true
 
 jobs:
   winget:
@@ -22,6 +29,9 @@ jobs:
           # and SHA per submission; a /releases/latest/ URL would point at whatever ships next and go
           # stale. This regex matches cram-v<ver>-x86_64-pc-windows-gnu.zip and excludes cram-latest-…
           installers-regex: '^cram-v.*-x86_64-pc-windows-gnu\.zip$'
+          # On a release event this is empty and the action reads github.event.release.tag_name; on a
+          # manual run it is the tag typed above.
+          release-tag: ${{ inputs.release-tag }}
           # Classic PAT with public_repo scope, stored as a repo secret. The workflow's own
           # GITHUB_TOKEN cannot open a PR against microsoft/winget-pkgs; this one can.
           token: ${{ secrets.WINGET_TOKEN }}
