@@ -495,7 +495,7 @@ Firefox and it will offer to install; afterwards, restart Firefox fully. A **Cra
 the toolbar and turns the automatic hand-off on and off. The right-click *Download with Cram* menu
 works either way.
 
-It is signed by Mozilla (id `cram-handoff@nexalit.fr`, version 1.0.0) but distributed **unlisted**,
+It is signed by Mozilla (id `cram-handoff@nexalit.fr`, version 1.1.0) but distributed **unlisted**,
 so it has no page on addons.mozilla.org: this release is the only place to get it. Its checksum is
 published as `SHA256SUMS.addon`, and Firefox checks Mozilla's signature on install regardless.
 
