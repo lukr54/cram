@@ -752,6 +752,12 @@ together; every source file carries a module-level doc comment for the local det
 Cram parses untrusted input. To report a vulnerability, follow
 [SECURITY.md](SECURITY.md), please do not open a public issue for one.
 
+## Acknowledgements
+
+- **Anish Bhowmick ([@anish833](https://github.com/anish833))** found and reported that extraction
+  wrote through a symbolic link already in the destination, overwriting a file outside the output
+  directory. Fixed in [1.3.2](CHANGELOG.md#132---2026-10-12).
+
 ## How this was built
 
 Cram was built with heavy use of an LLM. The code, most of the documentation and this README were
