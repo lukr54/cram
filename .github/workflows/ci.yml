@@ -415,9 +415,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - name: Take the release out of draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+      # winget.yml cannot listen for the `released` event: an event caused by GITHUB_TOKEN starts no
+      # workflow, so the un-draft above never reaches it, and 1.3.1 and 1.3.2 were both submitted by
+      # hand. workflow_dispatch is the documented exception, so start it explicitly.
+      - name: Submit the release to winget
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # No --ref: the run uses winget.yml from the default branch, so a fix to it made after
+        # tagging still applies.
+        run: gh workflow run winget.yml -f release-tag="$GITHUB_REF_NAME"

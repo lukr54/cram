@@ -1,15 +1,15 @@
-# Submits a winget manifest update to microsoft/winget-pkgs whenever a release is published, so
-# `winget install Nexalit.Cram` tracks the latest version without a hand-authored PR. It fires on the
-# `released` event, which GitHub emits when `release-publish` in ci.yml takes the release out of
-# draft — after all three platform artifacts have uploaded, so the versioned Windows zip the manifest
-# points at is already present.
+# Submits a winget manifest update to microsoft/winget-pkgs for each release, so `winget install
+# Nexalit.Cram` tracks the latest version without a hand-authored PR. `release-publish` in ci.yml
+# dispatches it right after taking the release out of draft, once all three platform artifacts have
+# uploaded, so the versioned Windows zip the manifest points at is already present.
+#
+# There is no `release: released` trigger. ci.yml un-drafts with GITHUB_TOKEN, and GitHub starts no
+# workflow from an event that token caused, so that trigger never fired once; workflow_dispatch is
+# the documented exception. Keeping both would also risk two PRs for one release. To submit a
+# release by hand: gh workflow run winget.yml -f release-tag=v<ver>
 name: Publish to winget
 
 on:
-  release:
-    types: [released]
-  # Manual trigger, to backfill a release that published before this workflow existed (the auto
-  # trigger only fires on the `released` event, which is one-shot per release).
   workflow_dispatch:
     inputs:
       release-tag:
@@ -29,8 +29,7 @@ jobs:
           # and SHA per submission; a /releases/latest/ URL would point at whatever ships next and go
           # stale. This regex matches cram-v<ver>-x86_64-pc-windows-gnu.zip and excludes cram-latest-…
           installers-regex: '^cram-v.*-x86_64-pc-windows-gnu\.zip$'
-          # On a release event this is empty and the action reads github.event.release.tag_name; on a
-          # manual run it is the tag typed above.
+          # The tag ci.yml dispatched with, or the one typed on a manual run.
           release-tag: ${{ inputs.release-tag }}
           # Classic PAT with public_repo scope, stored as a repo secret. The workflow's own
           # GITHUB_TOKEN cannot open a PR against microsoft/winget-pkgs; this one can.
