@@ -9,7 +9,7 @@ crate's own `LICENSE` file. This file is distributed alongside the executables; 
 
 Summary by licence:
 
-- **MIT License**, 250 crate(s)
+- **MIT License**, 251 crate(s)
 - **Unicode License v3**, 19 crate(s)
 - **Apache License 2.0**, 12 crate(s)
 - **BSD 3-Clause "New" or "Revised" License**, 8 crate(s)
@@ -1696,7 +1696,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ## ISC License
 
 Applies to:
-- `rustls-webpki` 0.103.13
+- `rustls-webpki` 0.103.15
 
 ```text
 Except as otherwise noted, this project is licensed under the following
@@ -2636,7 +2636,7 @@ DEALINGS IN THE SOFTWARE.
 
 Applies to:
 - `hyper-rustls` 0.27.9
-- `rustls` 0.23.42
+- `rustls` 0.23.45
 
 ```text
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
@@ -3882,6 +3882,43 @@ Applies to:
 
 ```text
 Copyright (c) 2018-2025 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+---
+
+## MIT License
+
+Applies to:
+- `getrandom` 0.3.4
+
+```text
+Copyright (c) 2018-2025 The rust-random Project Developers
+Copyright (c) 2014 The Rust Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
