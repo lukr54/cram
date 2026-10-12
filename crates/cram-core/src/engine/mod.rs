@@ -42,6 +42,7 @@ pub mod convert;
 pub mod create;
 pub mod dedup;
 pub mod estimate;
+pub(crate) mod overwrite;
 pub mod parallel;
 pub mod reclaim;
 pub mod sequential;

@@ -77,8 +77,12 @@ impl CreatedLog {
                 Ok(f)
             }
             // It was already there, so it is the user's and not ours to unwind — overwrite it
-            // without recording it, which is exactly what `note_file` decided by omission.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::File::create(p),
+            // without recording it, which is exactly what `note_file` decided by omission. Only if
+            // it is a regular file: `File::create` here followed a link planted at the path and
+            // truncated whatever it named. See `overwrite`.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                super::overwrite::open_existing(p)
+            }
             Err(e) => Err(e),
         }
     }

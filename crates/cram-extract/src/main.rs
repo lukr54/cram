@@ -638,7 +638,13 @@ impl Archive {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(io_err)?;
             }
-            let f = File::create(&path).map_err(io_err)?;
+            let f = match create_dest(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    out.failures.push((self.entries[i].name.clone(), io_err(e)));
+                    continue;
+                }
+            };
             let mut w = io::BufWriter::new(f);
             let mut outcome = self.write_entry(i, &mut w);
             if outcome.is_ok() {
@@ -686,6 +692,88 @@ fn printable(name: &str) -> String {
         }
     }
     out
+}
+
+/// Create an entry's file, or truncate the one already there, refusing anything at the path that is
+/// not a regular file.
+///
+/// `File::create` follows a symbolic link and truncates its target, so a link planted at
+/// `dest/name` turned an extraction into a write outside `dest` (reported against 1.3.1). The same
+/// guard as cram-core's `engine::overwrite`, written again here because this crate shares no code
+/// with it: `create_new` cannot follow a link, and the overwrite arm opens without following and
+/// checks the open handle before truncating. A directory link above the final component is still
+/// followed; cram never creates one, so one inside the destination is the user's own arrangement.
+fn create_dest(p: &Path) -> io::Result<File> {
+    match File::create_new(p) {
+        Ok(f) => return Ok(f),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let f = open_regular(p).map_err(|e| {
+        let what = match fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => "a symbolic link",
+            Ok(m) if !m.is_file() => "not a regular file",
+            _ => return e,
+        };
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("refusing to write through {what} already at this path ({e})"),
+        )
+    })?;
+    f.set_len(0)?;
+    Ok(f)
+}
+
+/// `O_NOFOLLOW` fails the open on a link; `O_NONBLOCK` fails it on a FIFO with no reader instead of
+/// hanging, and is cleared once the descriptor is known to be a regular file.
+#[cfg(unix)]
+fn open_regular(p: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let fd = f.as_raw_fd();
+    // SAFETY: `fd` is a valid descriptor owned by `f` for the duration of both calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
+/// Opens the reparse point itself. Links and junctions are refused; any other reparse point (a
+/// OneDrive placeholder) is reopened normally so its filter driver sees an ordinary write.
+#[cfg(windows)]
+fn open_regular(p: &Path) -> io::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(p)?;
+    let meta = f.metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(f);
+    }
+    drop(f);
+    fs::OpenOptions::new().write(true).open(p)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular(p: &Path) -> io::Result<File> {
+    if !fs::symlink_metadata(p)?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    fs::OpenOptions::new().write(true).open(p)
 }
 
 /// What one extraction produced. A per-entry failure is non-fatal (the run continues past it), so
@@ -1009,6 +1097,57 @@ mod tests {
         // Mangled (prefixed) so the file is kept under a safe name, not lost to the device.
         let p = sanitize("CON").unwrap();
         assert!(p.ends_with("_CON"));
+    }
+
+    /// The 1.3.1 report: a link planted at an entry's path must not be written through, a FIFO must
+    /// not hang the run, and a regular file is still overwritten and truncated.
+    #[cfg(unix)]
+    #[test]
+    fn create_dest_refuses_what_is_not_a_regular_file() {
+        let dir = std::env::temp_dir().join(format!("cram-extract-dest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let marker = dir.join("marker.txt");
+        fs::write(&marker, b"ORIGINAL_CONTENT").unwrap();
+        let link = dir.join("target.txt");
+        std::os::unix::fs::symlink(&marker, &link).unwrap();
+        assert!(create_dest(&link).is_err(), "a link is refused");
+        assert_eq!(fs::read(&marker).unwrap(), b"ORIGINAL_CONTENT");
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let dangling = dir.join("dangling.txt");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &dangling).unwrap();
+        assert!(
+            create_dest(&dangling).is_err(),
+            "a dangling link is refused"
+        );
+        assert!(
+            !dir.join("nowhere").exists(),
+            "and nothing is created behind it"
+        );
+
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(
+            create_dest(&fifo).is_err(),
+            "a FIFO is refused, not waited on"
+        );
+
+        let plain = dir.join("plain.txt");
+        fs::write(&plain, b"old and longer").unwrap();
+        create_dest(&plain).unwrap().write_all(b"new").unwrap();
+        assert_eq!(fs::read(&plain).unwrap(), b"new");
+
+        let fresh = dir.join("fresh.txt");
+        create_dest(&fresh).unwrap().write_all(b"x").unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"x");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

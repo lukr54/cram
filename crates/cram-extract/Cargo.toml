@@ -28,3 +28,8 @@ argon2 = "0.5"    # Argon2id key derivation
 # auditable, always-builds" character, it must be able to undo anything the writer does, or a photo
 # archive would not be recoverable with the tool that exists precisely for that.
 lepton_jpeg = "0.5"
+
+# `O_NOFOLLOW`, whose value differs per OS and architecture, for opening an existing destination
+# without writing through a link planted at it. Already in the workspace graph via cram-core.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

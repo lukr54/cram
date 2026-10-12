@@ -161,6 +161,83 @@ fn a_symlink_cycle_terminates() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A link already sitting in the destination must never be written through.
+///
+/// Reported against 1.3.1: `out/target.txt -> ../outside/marker.txt` planted before extraction, an
+/// archive carrying `target.txt`, and the marker outside the destination came back holding the
+/// archive's bytes. Overwriting a regular file that is already there stays the behaviour, so the
+/// same run checks both, in every format, because the engine reaches the write through both its
+/// parallel path (`.cram`, zip, 7z) and its sequential one (tar).
+#[test]
+fn an_existing_symlink_in_the_destination_is_not_written_through() {
+    let dir = scratch("dest-link");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("target.txt"), b"ARCHIVE_CONTENT").unwrap();
+    fs::write(src.join("plain.txt"), b"new plain").unwrap();
+
+    for (name, fmt) in [
+        ("p.cram", Format::cram(Codec::None)),
+        ("p.zip", Format::zip()),
+        ("p.tar", Format::tar(Codec::None)),
+        ("p.7z", Format::sevenz()),
+    ] {
+        let arc = dir.join(name);
+        engine::create::create(
+            &arc,
+            fmt,
+            &[src.join("target.txt"), src.join("plain.txt")],
+            CreateOptions::default(),
+            &NullSink,
+        )
+        .unwrap_or_else(|e| panic!("create {name}: {e}"));
+
+        let outside = dir.join(format!("outside-{name}"));
+        fs::create_dir_all(&outside).unwrap();
+        let marker = outside.join("marker.txt");
+        fs::write(&marker, b"ORIGINAL_CONTENT").unwrap();
+
+        let out = dir.join(format!("out-{name}"));
+        fs::create_dir_all(&out).unwrap();
+        unixfs::symlink(&marker, out.join("target.txt")).unwrap();
+        fs::write(out.join("plain.txt"), b"old plain, longer than the new one").unwrap();
+
+        let report = engine::extract(
+            &arc,
+            &out,
+            std::sync::Arc::new(cram_core::secret::NoPassword),
+            Default::default(),
+            &NullSink,
+        )
+        .unwrap_or_else(|e| panic!("extract {name}: {e}"));
+
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"ORIGINAL_CONTENT",
+            "{name}: the file behind the link was overwritten"
+        );
+        assert!(
+            fs::symlink_metadata(out.join("target.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{name}: the link itself is left as it was"
+        );
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "{name}: the refused entry is reported, not dropped: {:?}",
+            report.failed
+        );
+        assert_eq!(
+            fs::read(out.join("plain.txt")).unwrap(),
+            b"new plain",
+            "{name}: a regular file already there is still overwritten, and truncated"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A symlink named directly on the command line is refused too. `fs::metadata` follows links, so
 /// without an explicit check `cram a out.cram some-symlinked-dir` would archive the target's
 /// contents as though they were the link's own.

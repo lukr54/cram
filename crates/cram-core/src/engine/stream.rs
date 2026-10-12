@@ -18,7 +18,7 @@
 //! reaches the download frontier, the reader blocks until the watermark advances. Path safety,
 //! progress, cancellation, and skip-already-correct all carry over unchanged.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -141,7 +141,7 @@ fn extract_tar_stream(
                 continue;
             }
         }
-        let file = match File::create(&outpath) {
+        let file = match super::overwrite::create(&outpath) {
             Ok(f) => f,
             Err(e) => {
                 let _ = io::copy(&mut te, &mut io::sink());
@@ -277,7 +277,7 @@ fn extract_zip_stream(
                 continue;
             }
         }
-        let file = match File::create(&outpath) {
+        let file = match super::overwrite::create(&outpath) {
             Ok(f) => f,
             Err(e) => {
                 let _ = io::copy(&mut zf, &mut io::sink());

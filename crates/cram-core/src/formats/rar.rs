@@ -252,8 +252,10 @@ impl RarReader {
         .flatten()
         {
             let candidate = dir.join(&name);
-            // Prove it is writable by creating it, rather than inferring from permissions.
-            if File::create(&candidate).is_ok() {
+            // Prove it is writable by creating it, rather than inferring from permissions. Create
+            // it new: the fallback is the shared temp directory, where `File::create` would follow
+            // a link someone else left at this name and truncate what it points at.
+            if File::create_new(&candidate).is_ok() {
                 return Some(candidate);
             }
         }

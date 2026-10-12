@@ -9,6 +9,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Extraction no longer writes through a symbolic link already in the destination.** If
+  `out/target.txt` was a link to a file elsewhere and the archive carried `target.txt`, extracting
+  into `out` truncated the link's target and wrote the entry's bytes into it, outside the
+  destination. Every release from 1.0.0 to 1.3.1 did this, in `cram x`, in streamed extraction and
+  in `cram-extract`. An existing path is now overwritten only if it is a regular file; a link, a
+  FIFO or a device is left as it is and the entry is reported as a failure naming the cause. The
+  check is made on the opened handle, so there is no window between checking and writing. A
+  pre-existing FIFO also used to hang the extraction, and now fails the entry instead. The refusal
+  is tested on Linux; on Windows, where planting the link needs symlink privilege or Developer Mode,
+  the same test has not yet run. Reported by [@anish833](https://github.com/anish833).
+
+  Still followed, on purpose: a link to a directory above the final component (`out/sub ->
+  elsewhere`, entry `sub/x`). Cram never creates a link from an archive, so one inside the
+  destination was put there by the user or another program.
+
 ## [1.3.1] - 2026-09-01
 
 ### Fixed

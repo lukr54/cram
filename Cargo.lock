@@ -449,6 +449,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "lepton_jpeg",
+ "libc",
  "lzma-rust2",
  "ruzstd",
 ]
