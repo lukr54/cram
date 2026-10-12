@@ -105,7 +105,7 @@ loses. Those rows are in the same tables as the ones above.
 
 ## Download
 
-Cram 1.3.1, from the [releases page](https://github.com/lukr54/cram/releases/latest):
+Cram 1.3.2, from the [releases page](https://github.com/lukr54/cram/releases/latest):
 
 | | |
 |---|---|

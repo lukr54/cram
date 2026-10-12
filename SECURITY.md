@@ -15,11 +15,11 @@ features are.
 
 | version | supported |
 |---|---|
-| 1.1.x | yes |
-| 1.0.x | no — upgrade to 1.1.x |
+| 1.3.x | yes |
+| 1.0.x – 1.2.x | no — upgrade to 1.3.x |
 | < 1.0 | there is nothing earlier |
 
-**1.0.0 was the first release** (6 August 2026) and 1.1.0 is current (12 August 2026). Only the
+**1.0.0 was the first release** (6 August 2026) and 1.3.2 is current (12 October 2026). Only the
 newest minor line is supported: there is one maintainer and no backport branch, so a fix ships in
 the next release rather than being carried backwards. Between releases it is on `main` and available
 by building from source, as soon as it is ready and pushed.
@@ -68,6 +68,12 @@ Cram is maintained by Nexal IT (Ulysses Horkan EI). There is no 24/7 security te
 
 We ask for **coordinated disclosure**: please give us 90 days before publishing, or less if a fix
 ships sooner. There is **no bug bounty**, just credit and genuine thanks.
+
+### Fixed vulnerabilities
+
+| fixed in | affected | issue | reported by |
+|---|---|---|---|
+| 1.3.2 | 1.0.0 – 1.3.1 | Extraction wrote through a symbolic link already in the destination, so an entry named like the link overwrote the file it pointed to, outside the output directory. `cram x`, streamed extraction and `cram-extract` were all affected. See the [changelog](CHANGELOG.md#132---2026-10-12). | [@anish833](https://github.com/anish833) |
 
 ---
 
@@ -126,6 +132,12 @@ are rejected. A leading separator is *stripped* rather than rejected, so a roote
 device names are *mangled* rather than opened, because creating `out\NUL` would send the bytes to the
 null device while the extractor reported success. `cram-extract` shares no code with the engine by
 design, so it carries its own equivalent guard with its own tests.
+
+**An existing path is overwritten only if it is a regular file.** A symbolic link, FIFO or device
+already sitting in the destination under an entry's name is left alone and that entry fails. The
+path is opened without following a link at its last component and the check is made on the opened
+handle, so nothing can be swapped in between the check and the write. Links to directories higher
+up the path are followed, because Cram never creates links from an archive. Added in 1.3.2.
 
 **A short decode is a failure, not a success.** A crafted archive can declare a large entry and then
 supply a handful of bytes that decode cleanly to EOF. The extractor compares what actually decoded

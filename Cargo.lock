@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "cram-cli"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "cram-core",
  "cram-mount",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "cram-core"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "cram-extract"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "cram-mount"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "cram-core",
  "getrandom 0.2.17",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "cram-recovery"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "blake3",
  "reed-solomon-erasure",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "cram-shell"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "windows",
  "windows-core",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "cram-sign"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "blake3",
  "ed25519-dalek",

@@ -9,6 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-10-12
+
 ### Security
 
 - **Extraction no longer writes through a symbolic link already in the destination.** If
@@ -870,4 +872,5 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 [1.2.0]: https://github.com/lukr54/cram/releases/tag/v1.2.0
 [1.3.0]: https://github.com/lukr54/cram/releases/tag/v1.3.0
 [1.3.1]: https://github.com/lukr54/cram/releases/tag/v1.3.1
-[Unreleased]: https://github.com/lukr54/cram/compare/v1.3.1...HEAD
+[1.3.2]: https://github.com/lukr54/cram/releases/tag/v1.3.2
+[Unreleased]: https://github.com/lukr54/cram/compare/v1.3.2...HEAD
