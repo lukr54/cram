@@ -99,8 +99,10 @@ pub trait RandomAccessReader: Send + Sync {
     /// structurally impossible, since no arrangement of chunks can force a re-decode of a unit that
     /// is visited once.
     ///
-    /// 7z solid blocks have the same shape and should adopt this; they are believed to suffer the
-    /// same way and it has not been measured.
+    /// 7z solid blocks have the same shape and now use it, both the block and, where the archive
+    /// carries LZMA2 dictionary resets, each independently decodable segment inside one. Measured:
+    /// clustering alone was not enough there either, and cost 110 CPU-seconds against 11 — see
+    /// [`coalesce_locality`](Self::coalesce_locality).
     fn locality_key(&self, _index: usize) -> Option<u64> {
         None
     }
@@ -119,6 +121,39 @@ pub trait RandomAccessReader: Send + Sync {
     /// when entries decode independently, which is why it is off by default.
     fn coalesce_locality(&self) -> bool {
         false
+    }
+
+    /// Whether this backend can serve a whole decode unit in ONE pass, streaming each entry's bytes
+    /// as they emerge, so nothing is held. See [`copy_unit`](Self::copy_unit).
+    fn streams_units(&self) -> bool {
+        false
+    }
+
+    /// Serve `indices` in one pass over their decode unit, handing each entry's index and a reader
+    /// over its uncompressed bytes to `visit`, in archive order. `visit` returns `false` to stop the
+    /// pass (cancellation). Only called when [`streams_units`](Self::streams_units) is `true`.
+    ///
+    /// This exists because [`copy_entry`](Self::copy_entry) is the wrong shape for a solid format.
+    /// It addresses one entry, so serving a block's entries through it means decoding the block and
+    /// *keeping* it — 7z extraction of the benchmark corpus went from 190 MB of peak RSS to 1.8 GB
+    /// that way, against 7-Zip's 176 MB, to be 10% faster than it. The bytes are already flowing
+    /// past in the right order; the only reason to hold them was that the interface had no way to
+    /// hand them over as they went by.
+    ///
+    /// `visit` is not required to read the body it is given. The implementor must drain whatever is
+    /// left before moving on, since a solid stream has to be advanced past an entry to reach the
+    /// next one — that is what makes "skip this entry" cost no memory rather than no time.
+    ///
+    /// The engine still owns every write-side decision. `visit` is where skip policy, file creation,
+    /// progress and cleanup happen, exactly as they do on the per-entry path.
+    fn copy_unit(
+        &self,
+        _indices: &[usize],
+        _visit: &mut dyn FnMut(usize, &mut dyn Read) -> bool,
+    ) -> Result<()> {
+        Err(crate::error::ArchiveError::Backend(
+            "this backend does not stream decode units".into(),
+        ))
     }
 
     /// How many units of work can be decoded independently, when the backend knows a number the

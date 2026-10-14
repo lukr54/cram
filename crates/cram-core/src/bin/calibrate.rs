@@ -93,10 +93,17 @@ fn main() {
         .unwrap_or(250.0);
 
     // ---- Layer 4: calibration (cached unless --recalibrate) ----
-    let cached = if recal { None } else { hw::load_profile() };
+    // The wall is looked up for the volume this is being run on, since that is the one a probe here
+    // would measure. Another volume's number is not this one's.
+    let here = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let cached = if recal {
+        None
+    } else {
+        hw::load_profile(Some(&here))
+    };
     let (rates, mut wall, source) = match cached {
         Some((r, w)) if r.deflate_dec > 0.0 => {
-            let wall = if w > 0.0 { w } else { default_wall };
+            let wall = w.unwrap_or(default_wall);
             (r, wall, "cached profile")
         }
         _ => {
@@ -119,7 +126,7 @@ fn main() {
     // ---- optional heavy write-wall probe ----
     let mut measured_wall = wall > 0.0 && source == "cached profile";
     if write_probe {
-        let dir = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let dir = here.clone();
         println!(
             "\nMeasuring sustained write wall (writing up to {} GiB to {}, early-stops at the SLC cliff, then deletes)...",
             probe_gib,
@@ -181,10 +188,24 @@ fn main() {
     );
 
     // ---- persist ----
-    match hw::save_profile(&rates, if measured_wall { Some(wall) } else { None }) {
+    // Recorded against the volume it was measured on, so running this from a scratch disk does not
+    // rewrite what is known about the system one.
+    let key = if measured_wall {
+        hw::volume_key(&here).map(|k| (k, wall))
+    } else {
+        None
+    };
+    match hw::save_profile(&rates, key) {
         Ok(()) => {
             if let Some(p) = hw::profile_path() {
                 println!("\nSaved profile → {}", p.display());
+                if measured_wall {
+                    println!(
+                        "  write wall {:.0} MiB/s recorded for the volume holding {}",
+                        wall,
+                        here.display()
+                    );
+                }
             }
         }
         Err(e) => println!("\n(could not save profile: {e})"),

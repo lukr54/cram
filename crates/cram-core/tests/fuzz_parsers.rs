@@ -64,6 +64,28 @@ fn exercise(fmt: Format, path: &Path) {
         return;
     };
     let _ = reader.entries().map(<[_]>::len);
+
+    // The random-access side reads structure the sequential side never looks at -- for 7z, the LZMA2
+    // chunk framing inside a block, walked to decide where a decoder may start. That walk is driven
+    // entirely by attacker-controlled bytes, so it belongs in here rather than being covered by
+    // `next_entry` alone, which does not reach it at all.
+    if let Some(ra) = reader.as_random_access() {
+        let n = ra.entries().len().min(4);
+        let all: Vec<usize> = (0..n).collect();
+        let mut served = 0usize;
+        let _ = ra.copy_unit(&all, &mut |_i, body| {
+            let mut sink = std::io::sink();
+            let _ = std::io::copy(&mut body.take(1 << 20), &mut sink);
+            served += 1;
+            served < 8
+        });
+        for i in 0..n {
+            let mut sink = std::io::sink();
+            let _ = ra.copy_entry(i, &mut sink);
+            let _ = ra.read_range(i, 0, 4096);
+        }
+    }
+
     for _ in 0..8 {
         match reader.next_entry() {
             Ok(Some(mut es)) => {

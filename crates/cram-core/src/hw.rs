@@ -1222,10 +1222,32 @@ pub fn derive_plan(
                 },
                 (Bottleneck::WriteBound, _) => {
                     // Single drive: parallel per-entry writers. A lone sequential writer measured
-                    // slower than parallel on the tested NVMe SSD (one write stream underutilizes the
-                    // drive), so the pipeline is NOT built. ~physical*3/4 keeps some headroom for the
-                    // competing reads on the shared drive; governor tunes.
-                    let workers = ((hw.physical * 3) / 4).clamp(4, 8);
+                    // slower than parallel on the tested NVMe SSD (one write stream underutilizes
+                    // the drive), so the pipeline is NOT built.
+                    //
+                    // Enough workers to keep the drive fed, and no more. Being write-bound is a
+                    // statement about the *ratio* of the two rates, so the worker count has to come
+                    // from the same two numbers rather than from a fraction of the core count:
+                    // saturating a wall of `wall` MiB/s at `decode_rate` MiB/s per worker takes
+                    // `wall / decode_rate` of them, whatever the machine happens to have.
+                    //
+                    // The fixed `(physical * 3 / 4).clamp(4, 8)` this replaces was right only for a
+                    // codec fast enough that eight workers outrun any disk. On a slow one it was
+                    // self-contradicting: extracting a 7-Zip-written archive, `classify` projected
+                    // twenty-one units of LZMA decode against the wall to call it write-bound and
+                    // then ran eight, reaching 620 MiB/s against the 2689 MiB/s wall it had just
+                    // declared itself bound by. The same two numbers now give nineteen.
+                    //
+                    // The old value becomes the FLOOR rather than the answer, so no archive that
+                    // extracts well today gets fewer workers than it got before: this can only add
+                    // them, and only where the codec is slow enough to need them. Byte throughput
+                    // is not the only thing workers buy — 42,151 files is 42,151 creates, and that
+                    // parallelism does not show up in either rate.
+                    //
+                    // Still bounded by the units that actually exist and the cores to run them on.
+                    let floor = ((hw.physical * 3) / 4).clamp(4, 8);
+                    let needed = (wall / rates.decode_rate(codec)).ceil().max(1.0) as usize;
+                    let workers = needed.clamp(floor, blocks.max(1).min(hw.physical).max(floor));
                     Plan {
                         bottleneck,
                         shape: Shape::PerEntry,
@@ -1479,7 +1501,10 @@ pub fn profile_path() -> Option<std::path::PathBuf> {
 }
 
 /// Bump when the profile's meaning changes, so an old file is re-measured instead of misread.
-pub const PROFILE_SCHEMA: u32 = 2;
+/// 3: the write wall moved from one machine-wide `write_wall_mibs` to a `wall.<volume>` entry per
+/// destination. A v2 file carries a single wall that may have been measured on any volume, which is
+/// exactly the reading that has to stop, so it is retired rather than migrated.
+pub const PROFILE_SCHEMA: u32 = 3;
 
 /// Identity of the machine a profile was measured on: core counts plus the work drive's media and
 /// bus. Without this stamp a profile copied between machines, or a *roaming* profile following the
@@ -1509,14 +1534,66 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Persist calibrated rates. `wall` must be a **measured** sustained ceiling from
-/// [`measure_write_wall`], pass `None` if it was never measured. Writing a bus-table guess here
-/// would launder an estimate into a number everything downstream treats as measured.
-pub fn save_profile(rates: &Rates, wall: Option<f64>) -> io::Result<()> {
+/// A stable name for the volume a path lives on, so a measured write wall is remembered against the
+/// thing it describes.
+///
+/// The codec rates in a profile belong to the CPU and are the same wherever the bytes land. The
+/// write wall is not: it belongs to the destination. Recording it per machine meant the first
+/// extraction to run set the number for every later one — measure once into `/dev/shm` and every
+/// extraction to a spinning disk afterwards plans against a RAM speed, which was live behaviour
+/// here (a tmpfs 2689.6 MiB/s used to plan an ext4 write).
+///
+/// `None` means "don't cache a wall for this destination", which is safe: it re-probes.
+pub fn volume_key(dir: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // st_dev separates every mount, so tmpfs, each disk and each partition get their own entry.
+        std::fs::metadata(dir)
+            .ok()
+            .map(|m| format!("dev{}", m.dev()))
+    }
+    #[cfg(windows)]
+    {
+        // The volume root: `C:` and `D:` are different devices, two folders on `C:` are not.
+        let p = std::fs::canonicalize(dir).ok()?;
+        let s = p.to_string_lossy().to_string();
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+        let root = s.split(['\\', '/']).next()?.to_ascii_uppercase();
+        (!root.is_empty()).then(|| format!("vol{root}"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Persist calibrated rates, and a measured write wall against the volume it was measured on.
+///
+/// `wall` must be a **measured** sustained ceiling from [`measure_write_wall`]; pass `None` if it
+/// was never measured. Writing a bus-table guess here would launder an estimate into a number
+/// everything downstream treats as measured.
+///
+/// Walls already recorded for *other* volumes are carried over, so measuring the scratch disk does
+/// not forget what was measured about the system one.
+pub fn save_profile(rates: &Rates, wall: Option<(String, f64)>) -> io::Result<()> {
     if let Some(p) = profile_path() {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut walls = std::fs::read_to_string(&p)
+            .ok()
+            .filter(|t| profile_applies(t))
+            .map(|t| parse_profile(&t).1)
+            .unwrap_or_default();
+        // Only a real measurement is recorded at all; absence means "not measured", never 0.
+        if let Some((key, w)) = wall.filter(|(_, w)| *w > 0.0) {
+            walls.retain(|(k, _)| *k != key);
+            walls.push((key, w));
+        }
+        // Sorted by volume so the file is stable between saves and diffable by a human.
+        walls.sort_by(|a, b| a.0.cmp(&b.0));
         let mut body = format!(
             "# Cram calibrated hardware profile\nschema = {}\nsaved_unix = {}\nmachine = \"{}\"\ndeflate_enc_mibs = {:.1}\ndeflate_dec_mibs = {:.1}\nlzma_dec_mibs = {:.1}\n",
             PROFILE_SCHEMA,
@@ -1526,22 +1603,19 @@ pub fn save_profile(rates: &Rates, wall: Option<f64>) -> io::Result<()> {
             rates.deflate_dec,
             rates.lzma_dec
         );
-        // Only a real measurement is recorded at all; absence means "not measured", never 0.
-        if let Some(w) = wall.filter(|w| *w > 0.0) {
-            body.push_str(&format!(
-                "write_wall_mibs = {w:.1}\nwrite_wall_measured = 1\n"
-            ));
+        for (k, w) in &walls {
+            body.push_str(&format!("wall.{k} = {w:.1}\n"));
         }
         std::fs::write(p, body)?;
     }
     Ok(())
 }
 
-/// Parse a profile file body into (rates, wall). Blank and `#` comment lines are skipped,
-/// crucially WITHOUT early-returning, so one comment line can't discard the whole profile.
-fn parse_profile(text: &str) -> (Rates, f64) {
+/// Parse a profile file body into (rates, per-volume walls). Blank and `#` comment lines are
+/// skipped, crucially WITHOUT early-returning, so one comment line can't discard the whole profile.
+fn parse_profile(text: &str) -> (Rates, Vec<(String, f64)>) {
     let mut r = Rates::default();
-    let mut wall = 0.0;
+    let mut walls = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || !line.contains('=') {
@@ -1555,24 +1629,38 @@ fn parse_profile(text: &str) -> (Rates, f64) {
                 "deflate_enc_mibs" => r.deflate_enc = val,
                 "deflate_dec_mibs" => r.deflate_dec = val,
                 "lzma_dec_mibs" => r.lzma_dec = val,
-                "write_wall_mibs" => wall = val,
-                _ => {}
+                _ => {
+                    if let Some(vol) = k.strip_prefix("wall.") {
+                        walls.push((vol.to_string(), val));
+                    }
+                }
             }
         }
     }
-    (r, wall)
+    (r, walls)
 }
 
-/// Load cached rates (+ measured wall, 0.0 when never measured) so we can skip re-calibration.
-/// Returns `None`, forcing a fresh calibration; when the profile was written by an older schema
-/// or measured on different hardware.
-pub fn load_profile() -> Option<(Rates, f64)> {
+/// Load cached rates, plus the measured wall for `dest`'s volume if one was ever taken **there**.
+///
+/// The wall is `None` whenever this particular destination has not been measured, even on a machine
+/// whose codec rates are known — which is the point. The alternative is planning a slow disk against
+/// a fast one's number, and after the write-bound worker count started being derived from the wall
+/// rather than from a fraction of the cores, that mistake sets the thread count too.
+///
+/// Returns `None` entirely when the profile was written by an older schema or on other hardware,
+/// forcing a fresh calibration.
+pub fn load_profile(dest: Option<&Path>) -> Option<(Rates, Option<f64>)> {
     let p = profile_path()?;
     let text = std::fs::read_to_string(p).ok()?;
     if !profile_applies(&text) {
         return None;
     }
-    Some(parse_profile(&text))
+    let (rates, walls) = parse_profile(&text);
+    let key = dest.and_then(volume_key);
+    let wall = key
+        .and_then(|k| walls.iter().find(|(v, _)| *v == k).map(|(_, w)| *w))
+        .filter(|w| *w > 0.0);
+    Some((rates, wall))
 }
 
 /// Is this profile for this schema and this machine? A pre-schema file (v1) has neither key and is
@@ -1648,11 +1736,41 @@ mod tests {
 
     #[test]
     fn profile_parse_survives_comment_and_blank_lines() {
-        let text = "# Cram calibrated hardware profile\n\ndeflate_enc_mibs = 17.0\ndeflate_dec_mibs = 574.0\nlzma_dec_mibs = 103.0\nwrite_wall_mibs = 191.0\n";
-        let (r, wall) = parse_profile(text);
-        assert_eq!(wall, 191.0);
+        let text = "# Cram calibrated hardware profile\n\ndeflate_enc_mibs = 17.0\ndeflate_dec_mibs = 574.0\nlzma_dec_mibs = 103.0\nwall.dev66306 = 191.0\n";
+        let (r, walls) = parse_profile(text);
+        assert_eq!(walls, vec![("dev66306".to_string(), 191.0)]);
         assert_eq!(r.deflate_dec, 574.0);
         assert_eq!(r.lzma_dec, 103.0);
+    }
+
+    /// A write wall belongs to the volume it was measured on. Keeping one per machine meant the
+    /// first extraction set the figure for every later one, whatever it was writing to — a tmpfs
+    /// probe of 2689.6 MiB/s was live here, planning writes to an ext4 disk. It matters more since
+    /// the write-bound worker count started being derived from the wall.
+    #[test]
+    fn a_wall_measured_on_one_volume_is_not_offered_for_another() {
+        let text = "schema = 3\nmachine = \"x\"\ndeflate_dec_mibs = 574.0\nwall.devFAST = 2689.6\nwall.devSLOW = 84.0\n";
+        let (_, walls) = parse_profile(text);
+        let of = |k: &str| walls.iter().find(|(v, _)| v == k).map(|(_, w)| *w);
+        assert_eq!(of("devFAST"), Some(2689.6));
+        assert_eq!(of("devSLOW"), Some(84.0));
+        // The one that matters: an unmeasured volume gets nothing, NOT another volume's number.
+        assert_eq!(of("devUNSEEN"), None);
+    }
+
+    /// Two directories on one volume share its measurement; two volumes do not. Whatever the key
+    /// is made of, that is the property it has to have.
+    #[test]
+    fn volume_key_is_per_volume_not_per_directory() {
+        let tmp = std::env::temp_dir();
+        let a = tmp.join(format!("cram-vk-a-{}", std::process::id()));
+        let b = tmp.join(format!("cram-vk-b-{}", std::process::id()));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        assert_eq!(volume_key(&a), volume_key(&b));
+        assert!(volume_key(&a).is_some());
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
@@ -1704,6 +1822,63 @@ mod tests {
         // Verdict: parallel per-entry, NOT a single-writer pipeline.
         assert_eq!(p.shape, Shape::PerEntry);
         assert!(p.workers >= 4 && p.workers <= 8);
+    }
+
+    /// A write-bound plan must field enough workers to actually reach the wall it says it is bound
+    /// by. Extracting a 7-Zip-written archive, the old fixed cap projected twenty-one units of LZMA
+    /// decode to classify it as write-bound and then ran eight of them, which reached under a
+    /// quarter of that wall.
+    #[test]
+    fn a_write_bound_plan_fields_enough_workers_to_saturate_the_wall() {
+        let hw = HwProfile {
+            logical: 24,
+            physical: 24,
+            smt: false,
+            ram_total: 24 << 30,
+            ..HwProfile::detect()
+        };
+        let rates = Rates {
+            deflate_enc: 5.0,
+            deflate_dec: 133.0,
+            lzma_dec: 143.7,
+        };
+        // The measured corpus case: 21 LZMA2 segments, tmpfs wall of 2689 MiB/s.
+        let p = derive_plan(
+            Op::Extract,
+            Codec::Lzma,
+            21,
+            &hw,
+            Topology::SameDrive,
+            &rates,
+            2689.0,
+        );
+        assert_eq!(p.bottleneck, Bottleneck::WriteBound);
+        // 2689 / 143.7 = 18.7, so nineteen -- not the eight a fraction of the cores would give.
+        assert_eq!(p.workers, 19);
+
+        // Never more workers than there are units to run on them.
+        let few = derive_plan(
+            Op::Extract,
+            Codec::Lzma,
+            3,
+            &hw,
+            Topology::SameDrive,
+            &rates,
+            2689.0,
+        );
+        assert!(few.workers <= 8, "3 units must not ask for 19 workers");
+
+        // A codec fast enough to outrun the drive keeps the old count: this only ever adds workers.
+        let fast = derive_plan(
+            Op::Extract,
+            Codec::Zstd,
+            2000,
+            &hw,
+            Topology::SameDrive,
+            &rates,
+            194.0,
+        );
+        assert_eq!(fast.workers, 8);
     }
 
     #[test]

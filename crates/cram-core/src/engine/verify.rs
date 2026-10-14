@@ -344,8 +344,69 @@ fn verify_random_access(
         .build()
         .map_err(|e| ArchiveError::Backend(e.to_string()))?;
 
+    // One decode of an entry, checksummed. Shared by both paths below so they cannot disagree about
+    // what counts as a verified entry.
+    let check = |i: usize, outcome: std::thread::Result<(Result<u64>, u64, u32)>| {
+        let entry = &entries[i];
+        let mut a = acc.lock().unwrap();
+        match outcome {
+            // Random-access entries carry authoritative metadata (`meta_final` is implicitly true).
+            Ok((Ok(_), n, crc)) => record(&mut a, i, entry, n, crc, true, sink),
+            // A cancelled pass fails every in-flight decode; those are not archive damage.
+            Ok((Err(_), ..)) if sink.is_cancelled() => {}
+            Ok((Err(e), ..)) => {
+                a.failures
+                    .push((i, entry.name().to_string(), format!("decode failed: {e}")))
+            }
+            Err(p) => a
+                .failures
+                .push((i, entry.name().to_string(), panic_message(p.as_ref()))),
+        }
+    };
+
     pool.install(|| {
         groups.par_iter().for_each(|group| {
+            // A solid backend decodes the whole unit once and hands over each entry as it passes,
+            // so verification costs the checksum buffer rather than a decoded block per worker.
+            if ra.streams_units() {
+                let served = Mutex::new(Vec::with_capacity(group.len()));
+                let pass = catch_unwind(AssertUnwindSafe(|| {
+                    ra.copy_unit(group, &mut |i, body| {
+                        sink.wait_if_paused();
+                        if sink.is_cancelled() {
+                            return false;
+                        }
+                        served.lock().unwrap().push(i);
+                        sink.on_entry_start(&entries[i]);
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            let mut cs = CrcSink::new(sink);
+                            let r = std::io::copy(body, &mut cs).map_err(ArchiveError::from);
+                            (r, cs.n, cs.crc.finalize())
+                        }));
+                        check(i, outcome);
+                        true
+                    })
+                }));
+                let why = match pass {
+                    Ok(Ok(())) => return,
+                    _ if sink.is_cancelled() => return,
+                    Ok(Err(e)) => e.to_string(),
+                    Err(p) => panic_message(p.as_ref()),
+                };
+                // An entry the pass never reached is unverified, which is not the same as sound.
+                let served = served.into_inner().unwrap();
+                let mut a = acc.lock().unwrap();
+                for &i in group {
+                    if !served.contains(&i) {
+                        a.failures.push((
+                            i,
+                            entries[i].name().to_string(),
+                            format!("decode unit failed before this entry: {why}"),
+                        ));
+                    }
+                }
+                return;
+            }
             for &i in group {
                 sink.wait_if_paused();
                 if sink.is_cancelled() {
@@ -362,23 +423,7 @@ fn verify_random_access(
                     let r = ra.copy_entry(i, &mut cs);
                     (r, cs.n, cs.crc.finalize())
                 }));
-                let mut a = acc.lock().unwrap();
-                match outcome {
-                    // Random-access entries carry authoritative metadata (`meta_final` is
-                    // implicitly true).
-                    Ok((Ok(_), n, crc)) => record(&mut a, i, entry, n, crc, true, sink),
-                    // A cancelled pass fails every in-flight decode; those are not archive damage.
-                    Ok((Err(_), ..)) if sink.is_cancelled() => {}
-                    Ok((Err(e), ..)) => a.failures.push((
-                        i,
-                        entry.name().to_string(),
-                        format!("decode failed: {e}"),
-                    )),
-                    Err(p) => {
-                        a.failures
-                            .push((i, entry.name().to_string(), panic_message(p.as_ref())))
-                    }
-                }
+                check(i, outcome);
             }
         });
     });

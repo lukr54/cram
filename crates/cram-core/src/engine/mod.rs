@@ -97,23 +97,30 @@ fn rates_and_wall(hw: &HwProfile, dest: &Path) -> (Rates, f64) {
         .as_ref()
         .map(|d| d.default_wall_mibs())
         .unwrap_or(250.0);
-    if let Some((r, w)) = hw::load_profile() {
+    // Two separate questions, and they expire separately. The codec rates belong to the CPU and are
+    // reusable everywhere; the wall belongs to THIS destination and a figure measured on another
+    // volume says nothing about it.
+    let cached = hw::load_profile(Some(dest));
+    if let Some((r, Some(w))) = &cached {
         if r.deflate_dec > 0.0 {
-            return (r, if w > 0.0 { w } else { default_wall });
+            return (*r, *w);
         }
     }
-    // No usable profile (first run, new schema, or different hardware). Calibrate ONCE and persist
-    // it: the full micro-bench costs ~8s on a modern desktop, so without a stored result *every
-    // single extract* would pay for it again, synchronously, and then throw the measurement away.
-    // A smaller sample than the standalone `calibrate` binary uses: this runs inline in front of a
-    // real extract, so it trades a little precision for latency. Repeated-median sampling keeps it
-    // stable at this size, and it is paid once per machine rather than per extract.
-    let rates = hw::calibrate(24);
-    // And actually measure the write ceiling of the drive we're about to write to, rather than
-    // planning against a bus-table guess forever. Bounded and quick; skipped when the destination
-    // is short on space, in which case we fall back to the guess and record nothing.
+    // Calibrate ONCE and persist it: the full micro-bench costs ~8s on a modern desktop, so without
+    // a stored result *every single extract* would pay for it again, synchronously, and then throw
+    // the measurement away. A smaller sample than the standalone `calibrate` binary uses: this runs
+    // inline in front of a real extract, so it trades a little precision for latency. Repeated-median
+    // sampling keeps it stable at this size, and it is paid once per machine rather than per extract.
+    let rates = match &cached {
+        Some((r, _)) if r.deflate_dec > 0.0 => *r,
+        _ => hw::calibrate(24),
+    };
+    // Measure the write ceiling of the drive we are about to write to, rather than planning against
+    // a bus-table guess forever. Bounded and quick; skipped when the destination is short on space,
+    // in which case we fall back to the guess and record nothing.
     let measured = probe_wall_if_safe(dest);
-    let _ = hw::save_profile(&rates, measured);
+    let key = probe_dir(dest).and_then(hw::volume_key).zip(measured);
+    let _ = hw::save_profile(&rates, key);
     (rates, measured.unwrap_or(default_wall))
 }
 
@@ -133,14 +140,20 @@ pub fn warm_profile(dest: &Path) {
 
 /// One bounded, real write probe on `dest`'s drive. Returns `None` (and measures nothing) unless
 /// there is comfortable headroom, a calibration must never be the thing that fills someone's disk.
+/// The directory a write probe would run in, and whose volume a measurement belongs to. `dest` may
+/// not exist yet, in which case its parent is where the bytes will land.
+fn probe_dir(dest: &Path) -> Option<&Path> {
+    if dest.is_dir() {
+        Some(dest)
+    } else {
+        dest.parent()
+    }
+}
+
 fn probe_wall_if_safe(dest: &Path) -> Option<f64> {
     const PROBE_MIB: usize = 512; // 4 x 128 MiB windows -> a median has something to work with
     const REQUIRED_FREE_MIB: u64 = 4096;
-    let dir = if dest.is_dir() {
-        dest
-    } else {
-        dest.parent().unwrap_or(Path::new("."))
-    };
+    let dir = probe_dir(dest).unwrap_or(Path::new("."));
     if hw::free_space_mib(dir)? < REQUIRED_FREE_MIB {
         return None;
     }
@@ -176,16 +189,39 @@ pub fn extract(
         // is not the one Cram happens to have been run from.
         let hw = HwProfile::detect_for(dest);
         let (rates, wall) = rates_and_wall(&hw, dest);
-        hw::derive_plan(
+        let units = units.unwrap_or_else(|| block_count(fmt, entries));
+        let plan = hw::derive_plan(
             Op::Extract,
             plan_codec(fmt, entries),
             // The backend's own count where it has one (`.cram` packs); the entry list otherwise.
-            units.unwrap_or_else(|| block_count(fmt, entries)),
+            units,
             &hw,
             Topology::SameDrive,
             &rates,
             wall,
-        )
+        );
+        // Why this extraction ran the way it did, on request. Every input to the decision, because
+        // the useless answer is the one that says what was chosen without saying what decided it.
+        // Working out why 7z extraction used two cores on twelve and twelve on twenty-four took an
+        // afternoon of bisecting with `taskset`; it is one line with this.
+        if std::env::var_os("CRAM_PROFILE").is_some() {
+            eprintln!(
+                "cram: extract plan {:?} {:?} workers={} writers={} units={} \
+                 logical={} physical={} decode={:.1} MiB/s wall={:.1} MiB/s random_access={} ({})",
+                plan.bottleneck,
+                plan.shape,
+                plan.workers,
+                plan.writers,
+                units,
+                hw.logical,
+                hw.physical,
+                rates.decode_rate(plan_codec(fmt, entries)),
+                wall,
+                reader.as_random_access().is_some(),
+                plan.note,
+            );
+        }
+        plan
     };
 
     // Cancelling should leave the destination as it was found, so the engines record what they
