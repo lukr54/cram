@@ -43,3 +43,24 @@ targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-apple-darwin",
 ]
+
+# libmimalloc-sys ships two MIT texts: its own LICENSE.txt (the Rust binding, Octavian Oncescu) and
+# the vendored C library's c_src/mimalloc/v{2,3}/LICENSE (Microsoft, Daan Leijen). Left to its file
+# scan, cargo-about keeps one file per licence expression, and which one it kept differed between
+# Linux and Windows at the same Cargo.lock, so the CI diff failed on whichever side lost. The binary
+# links both the binding and the C library, so both texts belong in the appendix. A clarification
+# pins the list. The checksums are SHA-256 of each file; when a new libmimalloc-sys version changes
+# either file, cargo-about warns that the clarification does not validate and falls back to the scan,
+# and these checksums need updating from the new crate's files.
+[libmimalloc-sys.clarify]
+license = "MIT"
+
+[[libmimalloc-sys.clarify.files]]
+path = "LICENSE.txt"
+checksum = "a08554fab028af3af047e8588d32d019662c1b1bf07959a195a2f75fe340726b"
+
+[[libmimalloc-sys.clarify.files]]
+path = "c_src/mimalloc/v2/LICENSE"
+checksum = "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9"
+# c_src/mimalloc/v3/LICENSE is byte-identical to v2's (same checksum) and is left out: listing it
+# makes cargo-about print the crate twice under the same text.

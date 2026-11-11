@@ -9,7 +9,7 @@ crate's own `LICENSE` file. This file is distributed alongside the executables; 
 
 Summary by licence:
 
-- **MIT License**, 251 crate(s)
+- **MIT License**, 252 crate(s)
 - **Unicode License v3**, 19 crate(s)
 - **Apache License 2.0**, 12 crate(s)
 - **BSD 3-Clause "New" or "Revised" License**, 8 crate(s)
@@ -5295,6 +5295,7 @@ DEALINGS IN THE SOFTWARE.
 ## MIT License
 
 Applies to:
+- `libmimalloc-sys` 0.1.49
 - `mimalloc` 0.1.52
 
 ```text
