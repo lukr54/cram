@@ -64,3 +64,27 @@ path = "c_src/mimalloc/v2/LICENSE"
 checksum = "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9"
 # c_src/mimalloc/v3/LICENSE is byte-identical to v2's (same checksum) and is left out: listing it
 # makes cargo-about print the crate twice under the same text.
+
+# miniz_oxide ships its MIT text twice: LICENSE and LICENSE-MIT.md, which differ by one blank line.
+# cargo-about keeps one of them and the choice is not stable: the CI run on main picked LICENSE on
+# 2026-10-12 and the runs of 2026-11-11 picked LICENSE-MIT.md at the same miniz_oxide 0.8.9, so the
+# appendix check failed with no dependency change behind it. The clarification pins LICENSE-MIT.md and
+# keeps the Zlib and Apache texts the crate is also offered under. Checksums are SHA-256 of each file,
+# to be updated from the new crate's files when a miniz_oxide release changes one of them.
+[miniz_oxide.clarify]
+license = "MIT OR Zlib OR Apache-2.0"
+
+[[miniz_oxide.clarify.files]]
+path = "LICENSE-MIT.md"
+license = "MIT"
+checksum = "799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d"
+
+[[miniz_oxide.clarify.files]]
+path = "LICENSE-ZLIB.md"
+license = "Zlib"
+checksum = "0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39"
+
+[[miniz_oxide.clarify.files]]
+path = "LICENSE-APACHE.md"
+license = "Apache-2.0"
+checksum = "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
