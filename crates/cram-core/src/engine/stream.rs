@@ -229,7 +229,11 @@ fn extract_zip_stream(
         };
         saw_entry = true;
 
-        let raw = zf.name().to_string();
+        // zip 9 decodes the name on demand and can fail; a name it cannot decode is a structural
+        // problem like the ones above, so the post-download extractor decides.
+        let Ok(raw) = zf.name().map(|n| n.into_owned()) else {
+            return Err(ArchiveError::StreamUnsupported);
+        };
         let is_dir = zf.is_dir();
         let Some(safe) = EntryPath::from_raw(&raw) else {
             // zip-slip name → skip (Drop drains the entry so the parser stays aligned), counted so

@@ -9,10 +9,10 @@ crate's own `LICENSE` file. This file is distributed alongside the executables; 
 
 Summary by licence:
 
-- **MIT License**, 251 crate(s)
+- **MIT License**, 252 crate(s)
 - **Unicode License v3**, 19 crate(s)
-- **Apache License 2.0**, 12 crate(s)
-- **BSD 3-Clause "New" or "Revised" License**, 8 crate(s)
+- **Apache License 2.0**, 13 crate(s)
+- **BSD 3-Clause "New" or "Revised" License**, 11 crate(s)
 - **BSD 2-Clause "Simplified" License**, 3 crate(s)
 - **ISC License**, 3 crate(s)
 - **Creative Commons Zero v1.0 Universal**, 1 crate(s)
@@ -1088,6 +1088,7 @@ limitations under the License.
 Applies to:
 - `blake3` 1.8.5
 - `constant_time_eq` 0.4.2
+- `constant_time_eq` 0.6.1
 - `lepton_jpeg` 0.5.8
 - `ryu` 1.0.23
 - `sync_wrapper` 1.0.2
@@ -1237,6 +1238,47 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
 ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+---
+
+## BSD 3-Clause "New" or "Revised" License
+
+Applies to:
+- `zstd-safe` 8.2.0
+- `zstd-sys` 2.1.2+zstd.1.5.7
+- `zstd` 0.14.3
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2026, Alexandre Bury
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
@@ -2636,7 +2678,7 @@ DEALINGS IN THE SOFTWARE.
 
 Applies to:
 - `hyper-rustls` 0.27.9
-- `rustls` 0.23.45
+- `rustls` 0.23.46
 
 ```text
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
@@ -5295,6 +5337,7 @@ DEALINGS IN THE SOFTWARE.
 ## MIT License
 
 Applies to:
+- `libmimalloc-sys` 0.1.49
 - `mimalloc` 0.1.52
 
 ```text
@@ -5702,6 +5745,26 @@ SOFTWARE.
 ## MIT License
 
 Applies to:
+- `cfg_aliases` 0.2.2
+
+```text
+MIT License
+
+Copyright (c) 2020 Katharos Technology
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+---
+
+## MIT License
+
+Applies to:
 - `safe_arch` 0.9.3
 
 ```text
@@ -5742,6 +5805,7 @@ Applies to:
 - `windows-link` 0.2.1
 - `windows-result` 0.2.0
 - `windows-strings` 0.1.0
+- `windows-sys` 0.52.0
 - `windows-sys` 0.61.2
 - `windows-targets` 0.52.6
 - `windows` 0.58.0
@@ -5882,7 +5946,6 @@ Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
 Copyright (c) 2017 Frommi
 Copyright (c) 2017-2024 oyvindln
 
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -5999,7 +6062,7 @@ Applies to:
 - `syn` 2.0.119
 - `thiserror-impl` 2.0.18
 - `thiserror` 2.0.18
-- `typed-path` 0.12.3
+- `typed-path` 0.12.4
 - `unicode-ident` 1.0.24
 - `unrar` 0.5.8
 - `zmij` 1.0.23
@@ -6067,7 +6130,7 @@ SOFTWARE.
 ## MIT License
 
 Applies to:
-- `zip` 8.6.0
+- `zip` 9.0.5
 
 ```text
 The MIT License (MIT)
@@ -6172,6 +6235,38 @@ Applies to:
 The MIT License (MIT)
 
 Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+```
+
+---
+
+## MIT License
+
+Applies to:
+- `nix` 0.31.3
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Carl Lerche + nix-rust Authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -6518,27 +6613,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-
-```
-
----
-
-## MIT License
-
-Applies to:
-- `zstd-safe` 7.2.4
-- `zstd-sys` 2.0.16+zstd.1.5.7
-- `zstd` 0.13.3
-
-```text
-The MIT License (MIT)
-Copyright (c) 2016 Alexandre Bury
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 

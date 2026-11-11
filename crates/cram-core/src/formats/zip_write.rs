@@ -82,7 +82,7 @@ fn file_options(
     pw: Option<&Secret>,
     large: bool,
     modified: Option<SystemTime>,
-) -> FileOptions<'_, ()> {
+) -> FileOptions<'_, '_, ()> {
     let mut opts = SimpleFileOptions::default().compression_method(method);
     // STORE takes no level; only compressing methods do.
     if method != CompressionMethod::Stored {

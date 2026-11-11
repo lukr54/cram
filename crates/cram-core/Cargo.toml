@@ -38,7 +38,7 @@ time = "0.3"                                                            # ZIP DO
 # `deflate-zopfli` is what `--tiny` reaches for. It adds ONLY the pure-Rust `zopfli` crate -- it does
 # not touch flate2 or its backend -- so the zlib-rs rule above is unaffected. The zip crate switches
 # on the level: 0-9 go to flate2, 10-264 to zopfli with `level - 9` iterations.
-zip = { version = "8", default-features = false, features = [
+zip = { version = "9.0.5", default-features = false, features = [
     "deflate-flate2",
     "deflate-zopfli",
     "aes-crypto",
@@ -92,7 +92,7 @@ getrandom = "0.2"    # OS CSPRNG for salts + nonces (BCryptGenRandom on Windows)
 # `zstdmt` builds libzstd with its own worker threads, which is what lets a `.tar.zst` use more than
 # one core. Unlike chunking it costs no ratio: the workers share one context and one window, so the
 # output is the same stream a single-threaded run would produce, only sooner.
-zstd = { version = "0.13", optional = true, features = ["zstdmt"] }
+zstd = { version = "0.14", optional = true, features = ["zstdmt"] }
 # Image decoding for `cram dedup --similar` (perceptual hashing). Pure Rust and mingw-clean; the codec
 # list is explicit so the default build doesn't drag in the whole format zoo. HEIC/HEIF and camera RAW
 # are absent because decoding them needs a C library, those files are still covered by exact-duplicate
@@ -143,7 +143,7 @@ default = []
 download = ["dep:rdm-core", "dep:tokio", "dep:reqwest", "dep:sha2", "dep:futures-util"]
 # Opt-in C backends. Gated so the default build is 100% pure-Rust / always-builds.
 #
-# `zip/zstd` rides along because it needs the same crate at the same version (`zstd ^0.13.3`), so on
+# `zip/zstd` rides along because it needs the same crate at the same version (`zstd ^0.14` since zip 9), so on
 # a build that already has `zstd-c` it costs nothing and buys reading ZIP method 93. Repackers have
 # largely moved to zstd-in-zip, and until 1.3.1 those archives failed per entry with "compression
 # method not supported: 93" while the rest of the archive extracted around them. It stays behind
