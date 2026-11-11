@@ -82,7 +82,7 @@ fn scan(path: &Path) -> Result<(Vec<Entry>, Arc<ZipArchiveMetadata>)> {
     let mut out = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let zf = archive.by_index_raw(i).map_err(map_zip_err)?;
-        let Some(safe) = EntryPath::from_raw(zf.name()) else {
+        let Some(safe) = EntryPath::from_raw(&zf.name().map_err(map_zip_err)?) else {
             continue; // zip-slip: refuse to list/extract traversal entries
         };
         let kind = if zf.is_dir() {
