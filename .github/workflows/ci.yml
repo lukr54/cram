@@ -49,6 +49,11 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # The default build has no zstd writer, so the tests that check what the writer puts in a zstd
+      # pack (its content checksum, and which codec --tiny picks) only compile with zstd-c on.
+      - name: Tests with the C zstd writer
+        run: cargo test -p cram-core --features zstd-c
+
       # The shipped configuration, which is not the default one: the CLI is released with the C zstd
       # backend and the download feature on, and those code paths are otherwise never compiled here.
       - name: Build the release configuration

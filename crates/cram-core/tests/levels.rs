@@ -249,3 +249,113 @@ fn cold_round_trips_through_its_filters() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Varied text and a word-aligned table, small enough to stay one pack at every level, so the only
+/// thing that separates two archives of it is how that one pack was compressed.
+fn mixed_tree(root: &Path) -> PathBuf {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let mut prose = String::new();
+    for i in 0..4_000u32 {
+        prose.push_str(&format!(
+            "entry {i}: the quick brown fox number {} jumps over {} lazy dogs near gate {}\n",
+            i.wrapping_mul(7_919) % 1_000,
+            i % 37,
+            i.wrapping_mul(31) % 211
+        ));
+    }
+    fs::write(src.join("prose.txt"), prose).unwrap();
+    let mut table = Vec::new();
+    for i in 0..20_000u32 {
+        table.extend_from_slice(&(i.wrapping_mul(2_654_435_761) >> 12).to_le_bytes());
+    }
+    fs::write(src.join("table.bin"), &table).unwrap();
+    src
+}
+
+/// **`--tiny` on a `.cram` is `--small`, byte for byte.**
+///
+/// `.cram` has no slower encoder for `--tiny` to reach for, so the level is documented to behave as
+/// `--small` there. It did not: the pack policy gave the filter search to `Level::Cold` alone, and
+/// `Level::Tiny` fell through to the single-attempt path. On a `zstd-c` build, which is what the
+/// releases are, that wrote `--tiny` packs as zstd with no XZ candidate at all, and the archive came
+/// out larger than `--small`'s.
+///
+/// The control is `Explicit(9)`: the single-attempt path at the same preset, which is the path
+/// `--tiny` used to take. It has to differ from `--small` on this input, or the equality below could
+/// hold with the bug still in place. Runs on every feature set; on `zstd-c` the control is zstd.
+#[test]
+fn tiny_cram_is_byte_identical_to_cold() {
+    let dir = scratch("tiny");
+    let src = mixed_tree(&dir);
+    let build = |level: Level, name: &str| {
+        let arc = dir.join(name);
+        create(
+            &arc,
+            &src,
+            CreateOptions {
+                level,
+                ..Default::default()
+            },
+        );
+        fs::read(&arc).unwrap()
+    };
+    let cold = build(Level::Cold, "cold.cram");
+    let tiny = build(Level::Tiny, "tiny.cram");
+    let single = build(Level::Explicit(9), "single.cram");
+
+    assert_ne!(
+        cold, single,
+        "control: the single-attempt path must give a different archive from --small on this input"
+    );
+    assert!(
+        tiny == cold,
+        "--tiny wrote a different .cram from --small ({} vs {} bytes); --tiny matching the \
+         single-attempt control: {}",
+        tiny.len(),
+        cold.len(),
+        tiny == single
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **On a `zstd-c` build, `--tiny` must not write its packs as single-attempt zstd.**
+///
+/// That is the shape the bug took on the released binaries. A pack's plaintext begins with its
+/// codec's own magic, so the witness is which magic the archive carries: the XZ stream header for
+/// `--tiny`, and the zstd frame header for the single-attempt control, which shows the check can see
+/// a zstd pack when there is one.
+#[cfg(feature = "zstd-c")]
+#[test]
+fn tiny_cram_packs_are_not_single_attempt_zstd() {
+    const XZ_MAGIC: &[u8] = &[0xFD, b'7', b'z', b'X', b'Z', 0x00];
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+    let has = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+
+    let dir = scratch("tiny-zstd");
+    let src = mixed_tree(&dir);
+    let tiny_arc = dir.join("tiny.cram");
+    let single_arc = dir.join("single.cram");
+    for (arc, level) in [(&tiny_arc, Level::Tiny), (&single_arc, Level::Explicit(9))] {
+        create(
+            arc,
+            &src,
+            CreateOptions {
+                level,
+                ..Default::default()
+            },
+        );
+    }
+    let tiny = fs::read(&tiny_arc).unwrap();
+    let single = fs::read(&single_arc).unwrap();
+
+    assert!(
+        has(&single, ZSTD_MAGIC),
+        "control: the single-attempt path on a zstd-c build writes a zstd pack"
+    );
+    assert!(
+        has(&tiny, XZ_MAGIC) && !has(&tiny, ZSTD_MAGIC),
+        "--tiny wrote a zstd pack: it skipped the --small candidate screen"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
