@@ -24,11 +24,13 @@
 //! - **tar**: no per-entry checksum, so a clean full decode plus a declared-size match is the check
 //!   (catches truncation / a broken codec stream).
 //! - **`.cram`**: a clean decode of every pack. Encrypted packs are authenticated by their AES-GCM
-//!   tag and compressed packs by their codec framing; an **unencrypted, stored** pack (what
-//!   incompressible media compresses to) carries no per-chunk checksum in the frozen v1 format, so
-//!   `cram test` confirms it decodes structurally but cannot detect an in-place bit flip in it. For
-//!   guaranteed content integrity on such archives, pair with `cram sign` (ed25519) or `cram rec`
-//!   (parity), which cover the whole file.
+//!   tag, XZ packs by the stream's check (a CRC-64 when Cram wrote the pack), and zstd packs by the
+//!   frame's 32-bit content checksum when the frame carries one (the writer sets it in releases
+//!   after 1.3.2). An **unencrypted, stored**
+//!   pack (what incompressible media compresses to), and an unencrypted zstd pack written by 1.3.2 or
+//!   earlier, carry no checksum, so `cram test` confirms they decode structurally but cannot detect
+//!   an in-place bit flip in them. For content integrity on such archives, pair with `cram sign`
+//!   (ed25519) or `cram rec` (parity), which cover the whole file.
 //!
 //! This is the backup-verification workflow ("is my archive still good?") every archiver offers.
 

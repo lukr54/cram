@@ -9,7 +9,7 @@
 //! ZIP cannot hide the file listing, so requesting [`HeaderMode::NamesToo`](crate::secret::HeaderMode)
 //! for ZIP is **rejected** at create time rather than silently leaving every filename exposed.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -19,9 +19,10 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use zip::result::ZipError;
-use zip::write::{FileOptions, SimpleFileOptions};
+use zip::write::{FullFileOptions, PreparedZipFile, SimpleFileOptions, ZipFileBuilder};
 use zip::{AesMode, CompressionMethod, ZipWriter as ZipCrateWriter};
 
+use super::zip_time;
 use crate::error::{ArchiveError, Result};
 use crate::format::Codec;
 use crate::model::Entry;
@@ -54,8 +55,10 @@ const PARALLEL_INFLIGHT_MAX: u64 = 128 << 20;
 const PARALLEL_DEPTH: usize = 2048;
 
 /// Set to any value to compress ZIP entries on the calling thread, as this backend did before the
-/// parallel path existed. The two produce byte-identical archives, so this is a diagnostic: if a
-/// ZIP ever looks wrong, it says in one run whether the fan-out is implicated.
+/// parallel path existed. For an unencrypted archive the two produce the same bytes, so this is a
+/// diagnostic: if a ZIP ever looks wrong, it says in one run whether the fan-out is implicated. One
+/// case is known to differ and is harmless: at `--tiny`, a file over 1,000,000 bytes (see
+/// [`write_body`]). An encrypted archive never matches another, since each entry's salt is random.
 const ENV_SEQUENTIAL: &str = "CRAM_ZIP_SEQUENTIAL";
 
 /// Overrides [`PARALLEL_ENTRY_MAX`], in bytes. Exists so the oversized-entry fallback can be tested
@@ -73,16 +76,16 @@ fn map_zip_write(e: ZipError) -> ArchiveError {
     }
 }
 
-/// Build the per-file options: compression method + level, plus AES-256 when a password is set.
-/// Free function (not a `&self` method) so it borrows only the password field, leaving the writer
-/// handle free to borrow mutably for `start_file`.
+/// Build the per-file options: compression method + level, the modification time, plus AES-256 when
+/// a password is set. Free function (not a `&self` method) so it borrows only the password field,
+/// leaving the writer handle free to borrow mutably for `start_file`.
 fn file_options(
     method: CompressionMethod,
     level: Option<i64>,
     pw: Option<&Secret>,
     large: bool,
     modified: Option<SystemTime>,
-) -> FileOptions<'_, '_, ()> {
+) -> Result<FullFileOptions<'_, '_>> {
     let mut opts = SimpleFileOptions::default().compression_method(method);
     // STORE takes no level; only compressing methods do.
     if method != CompressionMethod::Stored {
@@ -105,40 +108,48 @@ fn file_options(
     if large {
         opts = opts.large_file(true);
     }
-    if let Some(dt) = zip_datetime(modified) {
+    if let Some(dt) = zip_time::dos_for_write(modified) {
         opts = opts.last_modified_time(dt);
     }
-    match pw {
+    let opts = match pw {
         Some(s) => opts.with_aes_encryption(AesMode::Aes256, s.expose()),
         None => opts,
-    }
+    };
+    with_ext_timestamp(opts.into_full_options(), modified)
 }
 
-/// The entry's mtime as a ZIP `DateTime`, or `None` if absent or outside ZIP's DOS-time range (which
-/// starts at 1980, an older or missing timestamp is simply not stored, leaving the crate default).
-/// Sourced from the input file's mtime (UTC), so an identical input tree still yields an identical zip.
+/// Attach the Info-ZIP extended timestamp (`0x5455`, UTC seconds) to both the local and the central
+/// header, when the time fits it. The DOS fields beside it hold local time; see [`zip_time`].
 ///
-/// The input may be a mtime a *reader* surfaced from an untrusted archive (via `convert`), so it must
-/// be bounded before `time::OffsetDateTime::from(SystemTime)`, that conversion **panics** for a time
-/// beyond `time`'s ±9999-year range. A far-future or pre-epoch timestamp is dropped, not stored.
-fn zip_datetime(modified: Option<SystemTime>) -> Option<zip::DateTime> {
-    let t = modified?;
-    // `duration_since` is `Err` for a pre-1970 time; DOS time can't hold those anyway.
-    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    const MAX_SANE_UNIX: u64 = 32_503_680_000; // ~year 3000, well inside `time`'s range, absurdly future
-    if secs > MAX_SANE_UNIX {
-        return None;
+/// Every writer path goes through here: the streamed one, both shapes of entry the parallel path
+/// builds (see [`DoneBody`]), and directories. The field reaches the central header on all of
+/// them but one: an encrypted entry written through the parallel path has it in its local header
+/// only, and `0x5855` in the central one, for the reason given on [`DoneBody::Archive`].
+///
+/// The mtime may have come from an untrusted archive through `convert`; [`zip_time`] bounds it
+/// before any calendar conversion, and a time it cannot hold is dropped, not stored.
+fn with_ext_timestamp<'k, 'n>(
+    mut opts: FullFileOptions<'k, 'n>,
+    modified: Option<SystemTime>,
+) -> Result<FullFileOptions<'k, 'n>> {
+    if let Some(payload) = zip_time::ext_timestamp_payload(modified) {
+        opts.add_extra_field(zip_time::EXT_TIMESTAMP_ID, payload, false)
+            .map_err(map_zip_write)?;
     }
-    let odt = time::OffsetDateTime::from(t);
-    zip::DateTime::from_date_and_time(
-        odt.year() as u16,
-        u8::from(odt.month()),
-        odt.day(),
-        odt.hour(),
-        odt.minute(),
-        odt.second(),
-    )
-    .ok()
+    Ok(opts)
+}
+
+/// Attach the older Info-ZIP Unix field (`0x5855`) to the central header only, for the one shape
+/// of entry whose central header cannot keep `0x5455`; see [`DoneBody::Archive`].
+fn with_central_unix_time<'k, 'n>(
+    mut opts: FullFileOptions<'k, 'n>,
+    modified: Option<SystemTime>,
+) -> Result<FullFileOptions<'k, 'n>> {
+    if let Some(payload) = zip_time::unix_time_payload(modified) {
+        opts.add_extra_field(zip_time::UNIX_TIME_ID, payload, true)
+            .map_err(map_zip_write)?;
+    }
+    Ok(opts)
 }
 
 /// The ZIP name for an entry: the normalized-safe relative path with forward slashes (ZIP uses `/`).
@@ -146,13 +157,44 @@ fn zip_name(entry: &Entry) -> String {
     entry.path.safe().to_string_lossy().replace('\\', "/")
 }
 
-/// One worker's finished entry: a complete single-entry ZIP held in memory. The bytes inside are
-/// already deflated, so the writer thread hands them to `raw_copy_file` rather than compressing
-/// again. Going through a real one-entry archive rather than raw buffers keeps every header field
-/// the `zip` crate's own business, which is the difference between a fast path and a second,
-/// subtly-different ZIP encoder to maintain.
+/// One worker's finished entry, already compressed, in one of two shapes. Either way the header
+/// fields stay the `zip` crate's own business, which is the difference between a fast path and a
+/// second, subtly-different ZIP encoder to maintain.
+enum DoneBody {
+    /// Compressed by a [`ZipFileBuilder`]. `add_prepared_file` writes both headers from the options
+    /// the worker chose and copies the compressed bytes verbatim, so the `0x5455` timestamp lands in
+    /// the local and the central header, and the headers are byte for byte what the streamed path
+    /// writes. (So are the compressed bytes, with the one exception [`write_body`] describes.)
+    /// `name` is the entry's name, kept beside the file because `zip` 9.0.5 does not expose it and
+    /// the writer has to claim it.
+    Prepared { name: String, file: PreparedZipFile },
+    /// A complete one-entry ZIP held in memory, for an encrypted entry: a `ZipFileBuilder` refuses
+    /// encryption, so the worker runs a whole `ZipWriter` and the writer thread splices the result
+    /// in with `merge_archive`.
+    ///
+    /// **This shape loses the `0x5455` timestamp from the central header.** `merge_archive` copies
+    /// the local header and data as written, so the field stays there, but it writes the central
+    /// header from the fields it parsed, and `zip` 9 parses `0x5455` into a typed field that it
+    /// then writes back as nothing. (`zip` 8 kept the extra-field bytes it read and wrote them
+    /// back.) `raw_copy_file` is no way round it: it rebuilds both headers the same way and drops
+    /// the field from the local one as well.
+    ///
+    /// So the worker gives the central header a second field, the older Info-ZIP Unix field
+    /// `0x5855`, holding the same UTC seconds. `zip` 9 does not interpret that id: it keeps the
+    /// bytes and writes them back, and the merged entry ends with `0x5455` in its local header and
+    /// `0x5855` in its central one. This crate's reader, 7-Zip and Info-ZIP read `0x5855` there.
+    /// Without it the entry would be dated by its DOS fields alone: two-second steps, an hour late
+    /// in the hour that repeats when summer time ends, the time of writing for a file dated before
+    /// 1980, and an hour off in 7-Zip across a summer-time change. Writing the id needs the crate
+    /// feature `unreserved`. `encrypted_entries_keep_their_time_on_both_writer_paths` pins the
+    /// three facts this rests on: `0x5455` gone from the central header, `0x5855` there, and the
+    /// exact time read back. The day the crate writes `0x5455` back, that test fails and `0x5855`
+    /// can go.
+    Archive(Vec<u8>),
+}
+
 struct DoneEntry {
-    zip_bytes: Vec<u8>,
+    body: DoneBody,
     in_bytes: u64,
     stored: bool,
 }
@@ -191,11 +233,12 @@ pub struct ZipArchiveWriter {
     /// Whether to fan compression out across the rayon pool.
     ///
     /// This was off for encrypted archives, on the grounds that an AES entry carries its own framing
-    /// and extra field and `raw_copy_file` preserving that was not something to assume without a
-    /// test. The test now exists (`aes_survives_the_parallel_path`) and it passes: the zip crate's
-    /// `ZipFile::options` deliberately carries the AES mode, vendor version and real compression
-    /// method across for exactly this case, so the raw copy reproduces the entry intact. Each entry
-    /// still gets its own salt, because each worker runs its own `start_file`.
+    /// and extra field and the copy into the main archive preserving that was not something to
+    /// assume without a test. The test exists (`aes_survives_the_parallel_path`) and passes; it was
+    /// written against `raw_copy_file` and still passes now that the copy is `merge_archive`, which
+    /// copies the local header and data verbatim and keeps the parsed AES fields for the central
+    /// header. Each entry still gets its own salt, because each worker runs its own `start_file`.
+    /// Only encrypted entries are copied that way now; see [`DoneBody`].
     parallel: bool,
     /// Mirrors the engine's `adaptive` flag. With `takes_paths` on, the engine stops probing
     /// store-vs-compress inline, so the decision has to be made here or every incompressible file
@@ -211,10 +254,19 @@ pub struct ZipArchiveWriter {
     entry_max: u64,
     /// Writer-thread time split, nanoseconds, printed under `CRAM_PROFILE`. `recv` is the writer
     /// waiting on a worker (so: not enough parallelism upstream); `parse` and `copy` are what the
-    /// writer itself costs per entry, and together they are the pipeline's hard ceiling.
+    /// writer itself costs per entry, and together they are the pipeline's hard ceiling. `parse` is
+    /// spent on encrypted entries only: the others arrive prepared, with nothing to parse.
     prof_recv: u128,
     prof_parse: u128,
     prof_copy: u128,
+    /// Every name written so far, files and directories (with their trailing `/`).
+    ///
+    /// The zip crate refuses a duplicate name in `start_file`, `add_directory` and
+    /// `add_prepared_file`, but `merge_archive`, which encrypted entries go through, does not check:
+    /// a second entry under a name already written would replace the first in the central directory
+    /// and leave its data unreachable. The check is made here for every path, so a duplicate is
+    /// reported the same way whichever one the entry took.
+    names: HashSet<Box<str>>,
 }
 
 impl ZipArchiveWriter {
@@ -250,8 +302,9 @@ impl ZipArchiveWriter {
         let level = deflate_level(opts.level);
 
         let file = File::create(path)?;
-        // 1 MiB, not the default 8 KiB. Every entry's compressed bytes are memcpy'd through here by
-        // `raw_copy_file`, so on a tree of tens of thousands of small files the default turns a
+        // 1 MiB, not the default 8 KiB. Every parallel entry's compressed bytes are memcpy'd through
+        // here by `add_prepared_file` or `merge_archive` (streamed entries are written through it
+        // too), so on a tree of tens of thousands of small files the default turns a
         // few-hundred-megabyte archive into tens of thousands of write syscalls.
         let zw = ZipCrateWriter::new(BufWriter::with_capacity(1 << 20, file));
         let parallel = std::env::var_os(ENV_SEQUENTIAL).is_none();
@@ -282,7 +335,20 @@ impl ZipArchiveWriter {
             prof_recv: 0,
             prof_parse: 0,
             prof_copy: 0,
+            names: HashSet::new(),
         })
+    }
+
+    /// Record `name` as written, or fail if it already was. Takes the set rather than `&mut self`
+    /// so it can run while the zip writer is borrowed.
+    fn claim_name(names: &mut HashSet<Box<str>>, name: &str) -> Result<()> {
+        if names.insert(name.into()) {
+            Ok(())
+        } else {
+            Err(ArchiveError::Backend(format!(
+                "zip write: Duplicate filename: {name}"
+            )))
+        }
     }
 
     /// Write the oldest queued entry, blocking until its worker has finished. Returns `Ok(false)`
@@ -298,9 +364,17 @@ impl ZipArchiveWriter {
         match item {
             Pending::Dir { name, modified } => {
                 let mut opts = SimpleFileOptions::default();
-                if let Some(dt) = zip_datetime(modified) {
+                if let Some(dt) = zip_time::dos_for_write(modified) {
                     opts = opts.last_modified_time(dt);
                 }
+                let opts = with_ext_timestamp(opts.into_full_options(), modified)?;
+                // `add_directory` stores the name with a trailing `/`; claim it in that form.
+                let stored = if name.ends_with('/') {
+                    name.clone()
+                } else {
+                    format!("{name}/")
+                };
+                Self::claim_name(&mut self.names, &stored)?;
                 zw.add_directory(name, opts).map_err(map_zip_write)?;
                 self.entries += 1;
             }
@@ -313,14 +387,36 @@ impl ZipArchiveWriter {
                     .recv()
                     .map_err(|_| ArchiveError::Backend("zip: compression worker died".into()))??;
                 self.prof_recv += t_recv.elapsed().as_nanos();
-                let t_parse = Instant::now();
-                let mut inner =
-                    zip::ZipArchive::new(Cursor::new(done.zip_bytes)).map_err(map_zip_write)?;
-                let file = inner.by_index_raw(0).map_err(map_zip_write)?;
-                self.prof_parse += t_parse.elapsed().as_nanos();
-                let t_copy = Instant::now();
-                zw.raw_copy_file(file).map_err(map_zip_write)?;
-                self.prof_copy += t_copy.elapsed().as_nanos();
+                match done.body {
+                    DoneBody::Prepared { name, file } => {
+                        Self::claim_name(&mut self.names, &name)?;
+                        let t_copy = Instant::now();
+                        zw.add_prepared_file(file).map_err(map_zip_write)?;
+                        self.prof_copy += t_copy.elapsed().as_nanos();
+                    }
+                    DoneBody::Archive(zip_bytes) => {
+                        let t_parse = Instant::now();
+                        let inner =
+                            zip::ZipArchive::new(Cursor::new(zip_bytes)).map_err(map_zip_write)?;
+                        // A worker builds exactly one entry; anything else is a bug, and merging it
+                        // would splice in whatever it holds.
+                        let name = match (inner.len(), inner.name_for_index(0)) {
+                            // zip 9 decodes the name on demand; a name our own worker wrote and the
+                            // crate cannot decode is a bug, reported like the entry-count one below.
+                            (1, Some(name)) => name.map_err(map_zip_write)?.into_owned(),
+                            (n, _) => {
+                                return Err(ArchiveError::Backend(format!(
+                                    "zip: a compression worker produced {n} entries, expected 1"
+                                )))
+                            }
+                        };
+                        self.prof_parse += t_parse.elapsed().as_nanos();
+                        Self::claim_name(&mut self.names, &name)?;
+                        let t_copy = Instant::now();
+                        zw.merge_archive(inner).map_err(map_zip_write)?;
+                        self.prof_copy += t_copy.elapsed().as_nanos();
+                    }
+                }
                 self.entries += 1;
                 self.in_bytes += done.in_bytes;
                 if done.stored {
@@ -349,7 +445,7 @@ impl ZipArchiveWriter {
     }
 
     /// Stream one entry straight into the archive on the calling thread. This is the original
-    /// sequential writer, unchanged: it still serves `conv`, encrypted archives and any entry too
+    /// sequential writer, unchanged: it still serves `conv`, `CRAM_ZIP_SEQUENTIAL` and any entry too
     /// large to buffer. Callers must have drained the queue first.
     fn add_file_direct(
         &mut self,
@@ -378,8 +474,9 @@ impl ZipArchiveWriter {
             self.aes_pw.as_deref(),
             large,
             entry.modified,
-        );
+        )?;
         let name = zip_name(entry);
+        Self::claim_name(&mut self.names, &name)?;
         let zw = self
             .zw
             .as_mut()
@@ -417,7 +514,7 @@ mod wprof {
     pub static FILES: AtomicU64 = AtomicU64::new(0);
 }
 
-/// Compress one file into a complete single-entry ZIP, off the writer thread.
+/// Compress one file off the writer thread, into whichever [`DoneBody`] its encryption allows.
 ///
 /// The store-vs-compress decision is made here from the bytes already in hand. It must match
 /// `probe::classify_file` exactly, the same way the engine's inline probe does, or archives written
@@ -468,16 +565,27 @@ fn compress_one(
     wprof::PROBE_NANOS.fetch_add(t_probe.elapsed().as_nanos() as u64, Relaxed);
 
     // No `large_file`: PARALLEL_ENTRY_MAX keeps every entry on this path far below 4 GiB, and the
-    // caller streams anything bigger.
+    // caller streams anything bigger. (`CRAM_ZIP_ENTRY_MAX` can raise that limit; it is a test
+    // knob, and nothing bounds it.)
     let t_zip = Instant::now();
-    let opts = file_options(entry_method, level, pw.as_deref(), false, modified);
-    let mut inner = ZipCrateWriter::new(Cursor::new(Vec::with_capacity(data.len() / 2 + 512)));
-    inner.start_file(name, opts).map_err(map_zip_write)?;
-    write_body(&mut inner, &data, entry_method, level, ZOPFLI_BLOCK)?;
-    let cursor = inner.finish().map_err(map_zip_write)?;
+    let opts = file_options(entry_method, level, pw.as_deref(), false, modified)?;
+    let body = if pw.is_some() {
+        // Encrypted: a whole one-entry archive, because the builder below refuses encryption. Its
+        // central header also gets the time as `0x5855`, the field that survives the merge.
+        let opts = with_central_unix_time(opts, modified)?;
+        let mut inner = ZipCrateWriter::new(Cursor::new(Vec::with_capacity(data.len() / 2 + 512)));
+        inner.start_file(name, opts).map_err(map_zip_write)?;
+        write_body(&mut inner, &data, entry_method, level, ZOPFLI_BLOCK)?;
+        DoneBody::Archive(inner.finish().map_err(map_zip_write)?.into_inner())
+    } else {
+        let mut builder = ZipFileBuilder::new(&name, opts).map_err(map_zip_write)?;
+        write_body(&mut builder, &data, entry_method, level, ZOPFLI_BLOCK)?;
+        let file = builder.finish().map_err(map_zip_write)?;
+        DoneBody::Prepared { name, file }
+    };
     wprof::ZIP_NANOS.fetch_add(t_zip.elapsed().as_nanos() as u64, Relaxed);
     Ok(DoneEntry {
-        zip_bytes: cursor.into_inner(),
+        body,
         in_bytes: data.len() as u64,
         stored: adaptive_store,
     })
@@ -503,7 +611,10 @@ fn compress_one(
 /// Both settings under test were being bypassed, so neither was ever actually under test.
 ///
 /// The streaming path for entries over [`PARALLEL_ENTRY_MAX`] never had this problem: `io::copy`
-/// feeds it in 8 KiB pieces, so the buffer fills and flushes per megabyte the way it should.
+/// feeds it in 8 KiB pieces, so the buffer fills and flushes. It flushes every 999,424 bytes (122
+/// pieces), not every 1,000,000, so the two paths cut a file over 1,000,000 bytes into different
+/// master blocks, and at `--tiny` its compressed bytes differ: by 4 bytes on a 1,000,001-byte
+/// file, not at all at 1,000,000. Both are valid DEFLATE of the same data, and 1.3.2 did the same.
 /// `block` is the master-block size; production passes [`ZOPFLI_BLOCK`]. It is a parameter so the
 /// regression test can demonstrate the effect on a buffer small enough to compress in a second.
 fn write_body<W: io::Write>(
@@ -666,7 +777,7 @@ impl ArchiveWriter for ZipArchiveWriter {
                 per(self.prof_parse)
             );
             eprintln!(
-                "raw_copy_file   {:9.1} ms   {:6.1} us/entry",
+                "append entry    {:9.1} ms   {:6.1} us/entry",
                 ms(self.prof_copy),
                 per(self.prof_copy)
             );
@@ -688,7 +799,7 @@ impl ArchiveWriter for ZipArchiveWriter {
                 core(&wprof::PROBE_NANOS) * 1e3 / files as f64
             );
             eprintln!(
-                "build 1-entry   {:9.1} ms   {:6.1} us/file   ({} files)",
+                "compress entry  {:9.1} ms   {:6.1} us/file   ({} files)",
                 core(&wprof::ZIP_NANOS),
                 core(&wprof::ZIP_NANOS) * 1e3 / files as f64,
                 files
@@ -724,16 +835,400 @@ mod mtime_guard_tests {
 
     #[test]
     fn zip_datetime_bounds_and_survives_hostile_input() {
-        assert!(zip_datetime(None).is_none());
+        use super::zip_time::dos_for_write;
+        assert!(dos_for_write(None).is_none());
         // Pre-1980 (DOS epoch) has no representation -> dropped, not stored.
-        assert!(zip_datetime(Some(UNIX_EPOCH)).is_none());
-        // A far-future time (~year 5000) must be rejected BEFORE time::OffsetDateTime::from, which
+        assert!(dos_for_write(Some(UNIX_EPOCH)).is_none());
+        // A far-future time (~year 5000) must be rejected BEFORE any calendar conversion, which
         // panics beyond +/-9999 - the bound makes this return None, never crash.
         let huge = UNIX_EPOCH + Duration::from_secs(95_617_584_000);
-        assert!(zip_datetime(Some(huge)).is_none());
+        assert!(dos_for_write(Some(huge)).is_none());
         // A real 2020 timestamp converts.
         let real = UNIX_EPOCH + Duration::from_secs(1_577_934_246);
-        assert!(zip_datetime(Some(real)).is_some());
+        assert!(dos_for_write(Some(real)).is_some());
+    }
+
+    /// One entry's headers as they sit in the file: the name, the method and the DOS (time, date)
+    /// of the local and the central header, each header's extra-field bytes, and where the
+    /// entry's data starts.
+    struct RawHeaders {
+        name: String,
+        local_method: u16,
+        central_method: u16,
+        local_dos: (u16, u16),
+        central_dos: (u16, u16),
+        local_extra: Vec<u8>,
+        central_extra: Vec<u8>,
+        data_start: usize,
+    }
+
+    fn le16(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([b[at], b[at + 1]])
+    }
+
+    fn le32(b: &[u8], at: usize) -> usize {
+        u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
+    }
+
+    /// Walk the central directory of an archive this writer produced (no ZIP64, no comment).
+    fn raw_headers(zip: &[u8]) -> Vec<RawHeaders> {
+        let eocd = zip
+            .windows(4)
+            .rposition(|w| w == b"PK\x05\x06")
+            .expect("end of central directory");
+        let count = le16(zip, eocd + 10);
+        let mut p = le32(zip, eocd + 16);
+        let mut out = Vec::new();
+        for _ in 0..count {
+            assert_eq!(&zip[p..p + 4], b"PK\x01\x02", "central header at {p}");
+            let (n, m, k) = (
+                usize::from(le16(zip, p + 28)),
+                usize::from(le16(zip, p + 30)),
+                usize::from(le16(zip, p + 32)),
+            );
+            let q = le32(zip, p + 42);
+            assert_eq!(&zip[q..q + 4], b"PK\x03\x04", "local header at {q}");
+            let (ln, lm) = (
+                usize::from(le16(zip, q + 26)),
+                usize::from(le16(zip, q + 28)),
+            );
+            out.push(RawHeaders {
+                name: String::from_utf8(zip[p + 46..p + 46 + n].to_vec()).unwrap(),
+                local_method: le16(zip, q + 8),
+                central_method: le16(zip, p + 10),
+                local_dos: (le16(zip, q + 10), le16(zip, q + 12)),
+                central_dos: (le16(zip, p + 12), le16(zip, p + 14)),
+                local_extra: zip[q + 30 + ln..q + 30 + ln + lm].to_vec(),
+                central_extra: zip[p + 46 + n..p + 46 + n + m].to_vec(),
+                data_start: q + 30 + ln + lm,
+            });
+            p += 46 + n + m + k;
+        }
+        out
+    }
+
+    /// The payload of extra field `id`, if present.
+    fn extra_field(extra: &[u8], id: u16) -> Option<Vec<u8>> {
+        let mut i = 0;
+        while i + 4 <= extra.len() {
+            let len = usize::from(le16(extra, i + 2));
+            if le16(extra, i) == id {
+                return Some(extra[i + 4..i + 4 + len].to_vec());
+            }
+            i += 4 + len;
+        }
+        None
+    }
+
+    /// The DOS (time, date) for `unix` in this machine's zone. The offset comes from
+    /// `localtime::utc_offset_at`, the same function the writer uses, so this cannot catch a wrong
+    /// offset; the `localtime` tests check that function against values fixed in the test. The
+    /// conversion from offset to DOS fields is done here, apart from `zip_time`.
+    fn expected_dos(unix: u64) -> (u16, u16) {
+        let utc = i64::try_from(unix).unwrap();
+        let off = i64::from(crate::localtime::utc_offset_at(utc).unwrap_or(0));
+        let t = time::OffsetDateTime::from_unix_timestamp(utc + off).unwrap();
+        let time =
+            (u16::from(t.hour()) << 11) | (u16::from(t.minute()) << 5) | u16::from(t.second() / 2);
+        let date = ((u16::try_from(t.year()).unwrap() - 1980) << 9)
+            | (u16::from(u8::from(t.month())) << 5)
+            | u16::from(t.day());
+        (time, date)
+    }
+
+    /// The fix, end to end, on both writer paths: every entry carries `0x5455` with the UTC
+    /// seconds in its local and its central header, the DOS fields hold the local wall time, and
+    /// reading the archive back gives the exact time that went in.
+    ///
+    /// The parallel path is the one at risk, and it has lost the field twice. It used to build each
+    /// entry as a one-entry archive and copy it into the main one: `raw_copy_file` rewrote the
+    /// local header and dropped the extra field, and under `zip` 9 `merge_archive` drops it from
+    /// the central header (this test caught that one). An unencrypted entry now arrives as a
+    /// `PreparedZipFile`, whose headers are written from the options the worker chose. Encrypted
+    /// entries take another route: `encrypted_entries_keep_their_time_on_both_writer_paths`.
+    #[test]
+    fn mtime_survives_both_writer_paths() {
+        use crate::model::{EntryKind, EntryPath};
+        use crate::reader::RandomAccessReader;
+
+        const WINTER: u64 = 1_577_934_246; // 2020-01-02T03:04:06Z
+        const SUMMER: u64 = 1_593_604_800; // 2020-07-01T12:00:00Z
+        let dir = std::env::temp_dir().join(format!("cram-zipmtime-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = [("w.txt", WINTER), ("s.txt", SUMMER)];
+        for (name, _) in files {
+            std::fs::write(dir.join(name), format!("{name} body\n").repeat(40)).unwrap();
+        }
+        let entry = |i: usize, name: &str, kind: EntryKind, secs: u64, size: u64| Entry {
+            index: i,
+            path: EntryPath::from_raw(name).unwrap(),
+            kind,
+            size,
+            compressed_size: None,
+            modified: Some(UNIX_EPOCH + Duration::from_secs(secs)),
+            unix_mode: None,
+            crc32: None,
+            encrypted: false,
+        };
+
+        let mut archives = Vec::new();
+        for parallel in [true, false] {
+            let path = dir.join(if parallel { "par.zip" } else { "seq.zip" });
+            let mut w =
+                Box::new(ZipArchiveWriter::create(&path, &CreateOptions::default()).unwrap());
+            w.parallel = parallel;
+            w.add_dir(&entry(0, "d", EntryKind::Dir, SUMMER, 0))
+                .unwrap();
+            for (i, (name, secs)) in files.iter().enumerate() {
+                let src = dir.join(name);
+                let size = std::fs::metadata(&src).unwrap().len();
+                let e = entry(i + 1, name, EntryKind::File, *secs, size);
+                if parallel {
+                    w.add_path(&e, &src, WriteHint::default()).unwrap();
+                } else {
+                    let mut body = std::fs::File::open(&src).unwrap();
+                    w.add_file(&e, &mut body, WriteHint::default()).unwrap();
+                }
+            }
+            w.finish().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+
+            let want = [("d/", SUMMER), ("w.txt", WINTER), ("s.txt", SUMMER)];
+            let headers = raw_headers(&bytes);
+            assert_eq!(headers.len(), want.len());
+            for (h, (name, secs)) in headers.iter().zip(want) {
+                let tag = format!("parallel={parallel} {name}");
+                assert_eq!(h.name, name, "{tag}: order");
+                let mut ut = vec![0x01];
+                ut.extend_from_slice(&(secs as u32).to_le_bytes());
+                assert_eq!(
+                    extra_field(&h.local_extra, 0x5455),
+                    Some(ut.clone()),
+                    "{tag}: 0x5455 missing or wrong in the local header"
+                );
+                assert_eq!(
+                    extra_field(&h.central_extra, 0x5455),
+                    Some(ut),
+                    "{tag}: 0x5455 missing or wrong in the central header"
+                );
+                assert_eq!(h.local_dos, expected_dos(secs), "{tag}: local DOS fields");
+                assert_eq!(
+                    h.central_dos,
+                    expected_dos(secs),
+                    "{tag}: central DOS fields"
+                );
+            }
+
+            let r = super::super::zip::ZipReader::open(&path, Arc::new(crate::secret::NoPassword))
+                .unwrap();
+            for (e, (name, secs)) in RandomAccessReader::entries(&r).iter().zip(want) {
+                assert_eq!(
+                    e.modified,
+                    Some(UNIX_EPOCH + Duration::from_secs(secs)),
+                    "parallel={parallel} {name}: time read back"
+                );
+            }
+            archives.push(bytes);
+        }
+        assert_eq!(
+            archives[0], archives[1],
+            "the parallel and the streamed writer must produce the same bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `merge_archive` does not refuse a name already in the archive the way `raw_copy_file` did,
+    /// so the writer has to. Without the check the second entry silently replaces the first in the
+    /// central directory.
+    ///
+    /// Both kinds of archive, because they reach the main archive differently: an unencrypted entry
+    /// goes through `add_prepared_file`, which checks for itself, and an encrypted one through
+    /// `merge_archive`, where the writer's own check is the only one.
+    #[test]
+    fn duplicate_names_are_still_refused_on_the_parallel_path() {
+        use crate::model::{EntryKind, EntryPath};
+
+        let dir = std::env::temp_dir().join(format!("cram-zipdup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("same.txt");
+        std::fs::write(&src, b"one name, twice").unwrap();
+        let e = Entry {
+            index: 0,
+            path: EntryPath::from_raw("same.txt").unwrap(),
+            kind: EntryKind::File,
+            size: 15,
+            compressed_size: None,
+            modified: None,
+            unix_mode: None,
+            crc32: None,
+            encrypted: false,
+        };
+        for encrypted in [false, true] {
+            let opts = if encrypted {
+                aes_options()
+            } else {
+                CreateOptions::default()
+            };
+            let mut w = Box::new(ZipArchiveWriter::create(&dir.join("dup.zip"), &opts).unwrap());
+            assert!(w.parallel, "this test is about the parallel path");
+            w.add_path(&e, &src, WriteHint::default()).unwrap();
+            w.add_path(&e, &src, WriteHint::default()).unwrap();
+            let err = match w.finish() {
+                Ok(_) => panic!("encrypted={encrypted}: a duplicate name was written"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("Duplicate filename"),
+                "encrypted={encrypted}: unexpected error: {err}"
+            );
+            // The crate's own refusal, which an unencrypted entry would fall back on, prints the
+            // name as `EscapeAscii { .. }`. The writer's check comes first and names the file.
+            assert!(
+                err.contains("same.txt"),
+                "encrypted={encrypted}: the error does not name the file: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AES-256 create options with a fixed password, for the tests that need an encrypted archive.
+    fn aes_options() -> CreateOptions {
+        use crate::secret::{EncryptSpec, ZipCipher};
+        CreateOptions {
+            encrypt: Some(EncryptSpec {
+                password: Secret::new(AES_TEST_PASSWORD),
+                zip_cipher: ZipCipher::Aes256,
+                header: HeaderMode::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    const AES_TEST_PASSWORD: &str = "correct horse battery staple";
+
+    /// An encrypted entry keeps its exact time on both writer paths, by two different fields.
+    ///
+    /// On the parallel path it is spliced in with `merge_archive`, and `zip` 9 writes a merged
+    /// entry's central header without the `0x5455` field (see [`DoneBody::Archive`]), so the worker
+    /// adds `0x5855` to the central header. Three facts are pinned for that path: `0x5455` is in
+    /// the local header and gone from the central one, `0x5855` is in the central header only, and
+    /// the reader gives back the exact time. Two of the four files are the ones the DOS fields
+    /// alone get wrong: an odd second, and a 1975 date they cannot hold.
+    ///
+    /// The streamed path is checked beside it: with the same password it writes `0x5455` to both
+    /// headers and no `0x5855`.
+    ///
+    /// **If the assertion that the parallel path's central header has no `0x5455` fails, the crate
+    /// has started writing the field back.** That is good news: Cram's own archives no longer need
+    /// `0x5855` or the `unreserved` feature (the reader's branch can stay, for other tools'
+    /// archives), and this test can assert `0x5455` in both headers as
+    /// `mtime_survives_both_writer_paths` does.
+    #[test]
+    fn encrypted_entries_keep_their_time_on_both_writer_paths() {
+        use crate::model::{EntryKind, EntryPath};
+        use crate::reader::RandomAccessReader;
+
+        const WINTER: u64 = 1_577_934_246; // 2020-01-02T03:04:06Z
+        const SUMMER: u64 = 1_593_604_800; // 2020-07-01T12:00:00Z
+        const ODD: u64 = 1_748_779_201; // 2025-06-01T12:00:01Z
+        const EARLY: u64 = 157_766_400; // 1975-01-01T00:00:00Z
+        let dir = std::env::temp_dir().join(format!("cram-zipmtime-aes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // (name, time, whether the DOS fields can hold the date)
+        let files = [
+            ("w.txt", WINTER, true),
+            ("s.txt", SUMMER, true),
+            ("o.txt", ODD, true),
+            ("e.txt", EARLY, false),
+        ];
+        for (name, _, _) in files {
+            std::fs::write(dir.join(name), format!("{name} body\n").repeat(40)).unwrap();
+        }
+
+        for parallel in [true, false] {
+            let path = dir.join(if parallel { "par.zip" } else { "seq.zip" });
+            let mut w = Box::new(ZipArchiveWriter::create(&path, &aes_options()).unwrap());
+            w.parallel = parallel;
+            for (i, (name, secs, _)) in files.iter().enumerate() {
+                let src = dir.join(name);
+                let e = Entry {
+                    index: i,
+                    path: EntryPath::from_raw(name).unwrap(),
+                    kind: EntryKind::File,
+                    size: std::fs::metadata(&src).unwrap().len(),
+                    compressed_size: None,
+                    modified: Some(UNIX_EPOCH + Duration::from_secs(*secs)),
+                    unix_mode: None,
+                    crc32: None,
+                    encrypted: false,
+                };
+                if parallel {
+                    w.add_path(&e, &src, WriteHint::default()).unwrap();
+                } else {
+                    let mut body = std::fs::File::open(&src).unwrap();
+                    w.add_file(&e, &mut body, WriteHint::default()).unwrap();
+                }
+            }
+            w.finish().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+
+            let headers = raw_headers(&bytes);
+            assert_eq!(headers.len(), files.len());
+            for (h, (name, secs, dos_holds)) in headers.iter().zip(files) {
+                let tag = format!("parallel={parallel} {name}");
+                assert_eq!(h.name, name, "{tag}: order");
+                let mut ut = vec![0x01];
+                ut.extend_from_slice(&(secs as u32).to_le_bytes());
+                // The Unix field: the access time, then the modification time.
+                let mut ux = (secs as u32).to_le_bytes().to_vec();
+                ux.extend_from_slice(&(secs as u32).to_le_bytes());
+                assert_eq!(
+                    extra_field(&h.local_extra, 0x5455),
+                    Some(ut.clone()),
+                    "{tag}: 0x5455 missing or wrong in the local header"
+                );
+                assert_eq!(
+                    extra_field(&h.central_extra, 0x5455),
+                    if parallel { None } else { Some(ut) },
+                    "{tag}: 0x5455 in the central header (see this test's comment if it is \
+                     the parallel one that changed)"
+                );
+                assert_eq!(
+                    extra_field(&h.central_extra, 0x5855),
+                    if parallel { Some(ux) } else { None },
+                    "{tag}: 0x5855 in the central header"
+                );
+                assert_eq!(
+                    extra_field(&h.local_extra, 0x5855),
+                    None,
+                    "{tag}: 0x5855 belongs in the central header only"
+                );
+                // A date the DOS fields cannot hold has no expected fields to compare with.
+                if dos_holds {
+                    assert_eq!(h.local_dos, expected_dos(secs), "{tag}: local DOS fields");
+                    assert_eq!(
+                        h.central_dos,
+                        expected_dos(secs),
+                        "{tag}: central DOS fields"
+                    );
+                }
+            }
+
+            let r = super::super::zip::ZipReader::open(&path, Arc::new(crate::secret::NoPassword))
+                .unwrap();
+            for (e, (name, secs, _)) in RandomAccessReader::entries(&r).iter().zip(files) {
+                assert!(e.encrypted, "parallel={parallel} {name}: not encrypted");
+                assert_eq!(
+                    e.modified,
+                    Some(UNIX_EPOCH + Duration::from_secs(secs)),
+                    "parallel={parallel} {name}: time read back"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--tiny` has to clear the zip crate's encoder switch, which is a plain numeric threshold:
@@ -768,11 +1263,11 @@ mod mtime_guard_tests {
     /// Encrypted archives were forced onto the sequential writer because an AES entry carries its
     /// own framing — a 0x9901 extra field holding the vendor version, key strength and the *real*
     /// compression method, with method 99 in the header — and the parallel path does not compress
-    /// into the archive directly. It builds a complete one-entry zip in memory and hands it to
-    /// `raw_copy_file`, so the question was whether that reproduces the framing or quietly drops it.
+    /// into the archive directly. It builds a complete one-entry zip in memory and copies it into
+    /// the main archive (`raw_copy_file` when this test was written, `merge_archive` now), so the
+    /// question is whether that reproduces the framing or quietly drops it.
     ///
-    /// It reproduces it: `ZipFile::options` carries the AES metadata across specifically for
-    /// downstream writers. This test is what turns that from a reading of the crate into a fact, and
+    /// It reproduces it. This test is what turns that from a reading of the crate into a fact, and
     /// it must stay: the failure it guards against is an archive that *looks* fine and cannot be
     /// decrypted.
     ///
@@ -845,21 +1340,44 @@ mod mtime_guard_tests {
         }
         w.finish().unwrap();
 
+        // The headers as they sit in the file, read without the zip crate. An AES entry states
+        // method 99 in both headers and carries the 0x9901 field in both; the real method lives
+        // in that field. A read-back through the crate alone proves none of this: under `zip` 8,
+        // `merge_archive` wrote the inner method into the central header, the crate's own reader
+        // took it, and 7-Zip refused the archive.
+        let raw = std::fs::read(&archive).unwrap();
+        let headers = raw_headers(&raw);
+        assert_eq!(headers.len(), bodies.len(), "raw entry count");
+        let mut salts = std::collections::HashSet::new();
+        for h in &headers {
+            assert_eq!(h.local_method, 99, "{}: local header method", h.name);
+            assert_eq!(h.central_method, 99, "{}: central header method", h.name);
+            assert!(
+                extra_field(&h.local_extra, 0x9901).is_some(),
+                "{}: no AES field in the local header",
+                h.name
+            );
+            assert!(
+                extra_field(&h.central_extra, 0x9901).is_some(),
+                "{}: no AES field in the central header",
+                h.name
+            );
+            // AES-256: the entry's data starts with its 16-byte salt.
+            salts.insert(raw[h.data_start..h.data_start + 16].to_vec());
+        }
+        assert_eq!(salts.len(), bodies.len(), "every entry needs its own salt");
+
         // Read it back the way any reader would, with the password.
         let f = std::fs::File::open(&archive).unwrap();
         let mut za = zip::ZipArchive::new(f).unwrap();
         assert_eq!(za.len(), bodies.len(), "entry count");
-        let mut salts = std::collections::HashSet::new();
         for (i, want) in bodies.iter().enumerate() {
             let mut e = za.by_index_decrypt(i, pw.as_bytes()).unwrap();
             assert!(e.encrypted(), "entry {i} came out unencrypted");
             let mut got = Vec::new();
             std::io::Read::read_to_end(&mut e, &mut got).unwrap();
             assert_eq!(&got, want, "entry {i} did not round-trip");
-            // AES-256 salt is the first 16 bytes of the entry data; distinct per entry.
-            salts.insert(e.central_header_start());
         }
-        assert_eq!(salts.len(), bodies.len(), "entries must be distinct");
 
         // And the wrong password must fail rather than yielding garbage.
         let f2 = std::fs::File::open(&archive).unwrap();

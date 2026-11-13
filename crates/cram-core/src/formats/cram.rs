@@ -107,6 +107,57 @@ fn zstd_level(preset: u32) -> i32 {
     (preset as i32 * 2).clamp(1, 19)
 }
 
+/// zstd-compress one pack, as a single frame that carries its content checksum.
+///
+/// The checksum is the only thing in a `.cram` that can catch a flipped bit inside a zstd pack: the
+/// index holds no hash, and a corrupted frame often still decodes to exactly `raw_len` bytes. It is
+/// the low 32 bits of the XXH64 of the decoded content, stored in the last four bytes of the frame
+/// and announced by a flag in the frame header, so it costs four bytes per pack and no format
+/// change: an older reader decodes the frame as before and simply does not check it. Every zstd
+/// pack goes through here, so no site can forget it.
+#[cfg(feature = "zstd-c")]
+fn zstd_compress(raw: &[u8], level: u32) -> Result<Vec<u8>> {
+    let encode = |e: std::io::Error| ArchiveError::Backend(format!("zstd encode: {e}"));
+    let mut c = zstd::bulk::Compressor::new(zstd_level(level)).map_err(encode)?;
+    c.include_checksum(true).map_err(encode)?;
+    c.compress(raw).map_err(encode)
+}
+
+/// Decode one zstd pack to exactly the bytes its frame holds, verifying the frame's content checksum
+/// when it carries one.
+///
+/// Bounded to `raw_len + 1` bytes like XZ: a frame that decodes to more yields `raw_len + 1` and the
+/// caller's exact-length check refuses it. A frame without a checksum (every zstd pack written
+/// before the writer turned it on) decodes exactly as it always has.
+///
+/// Two checks beyond decoding, both on bytes already in memory:
+/// - the frame must account for every byte of the pack. A flipped checksum flag otherwise turns the
+///   stored checksum into four ignored trailing bytes, and verification off with it;
+/// - when the frame stored a checksum, the one computed over the decoded bytes must equal it. The
+///   decoder only finishes the computation once every byte has been drained, which `read_to_end`
+///   does unless the frame decoded to more than `raw_len`, a case the caller rejects anyway.
+fn zstd_decode_pack(comp: &[u8], raw_len: u32) -> Result<Vec<u8>> {
+    let mut raw = Vec::with_capacity(raw_len as usize);
+    let mut limited = ruzstd::decoding::StreamingDecoder::new(comp)
+        .map_err(|e| corrupt(&format!("zstd decode: {e}")))?
+        .take(raw_len as u64 + 1);
+    limited.read_to_end(&mut raw)?;
+    if raw.len() != raw_len as usize {
+        // Reported by the caller, which owns the message for every codec.
+        return Ok(raw);
+    }
+    let (rest, frame) = limited.into_inner().into_parts();
+    if !rest.is_empty() {
+        return Err(corrupt("zstd pack has bytes after its frame"));
+    }
+    if let Some(stored) = frame.get_checksum_from_data() {
+        if frame.get_calculated_checksum() != Some(stored) {
+            return Err(corrupt("zstd pack content checksum mismatch"));
+        }
+    }
+    Ok(raw)
+}
+
 /// Read a small signed integer from the environment, for the tuning knobs.
 fn env_i32(key: &str) -> Option<i32> {
     std::env::var_os(key)?.to_str()?.trim().parse::<i32>().ok()
@@ -1234,8 +1285,7 @@ fn pack_compress(raw: Vec<u8>, level: u32, policy: PackPolicy) -> Result<(u8, Ve
 fn pack_compress_single(raw: Vec<u8>, level: u32, use_zstd: bool) -> Result<(u8, Vec<u8>)> {
     #[cfg(feature = "zstd-c")]
     if use_zstd {
-        let comp = zstd::bulk::compress(&raw, zstd_level(level))
-            .map_err(|e| ArchiveError::Backend(format!("zstd encode: {e}")))?;
+        let comp = zstd_compress(&raw, level)?;
         return Ok(if comp.len() < raw.len() {
             (CODEC_ZSTD, comp)
         } else {
@@ -1286,8 +1336,7 @@ fn pack_compress_exhaustive(raw: Vec<u8>, level: u32) -> Result<(u8, Vec<u8>)> {
     #[cfg(feature = "zstd-c")]
     {
         let floor = best.as_ref().map_or(raw.len(), |(_, c)| c.len());
-        let zc = zstd::bulk::compress(&raw, zstd_level(level))
-            .map_err(|e| ArchiveError::Backend(format!("zstd encode: {e}")))?;
+        let zc = zstd_compress(&raw, level)?;
         if zc.len() < floor {
             best = Some((CODEC_ZSTD, zc));
         }
@@ -1499,8 +1548,7 @@ fn pack_compress_cold(raw: Vec<u8>, level: u32) -> Result<(u8, Vec<u8>)> {
     #[cfg(feature = "zstd-c")]
     {
         let floor = best.as_ref().map_or(raw.len(), |(_, c)| c.len());
-        let zc = zstd::bulk::compress(&raw, zstd_level(level))
-            .map_err(|e| ArchiveError::Backend(format!("zstd encode: {e}")))?;
+        let zc = zstd_compress(&raw, level)?;
         if zc.len() < floor {
             best = Some((CODEC_ZSTD, zc));
         }
@@ -1557,8 +1605,13 @@ impl CramArchiveWriter {
         // `CRAM_FORCE_ZSTD=1` overrides that, to test whether zstd at --ultra over a 32 MiB pack
         // lands near XZ's size for a fraction of the encode time -- a different point on the
         // frontier rather than a cheaper route to the same one.
+        //
+        // `Tiny` is `Cold` here and in the policy below. `.cram` has no slower encoder for it to
+        // reach for, and it used to fall through to the default arm instead: a `zstd-c` build wrote
+        // `--tiny` packs as single-attempt zstd and came out larger than `--small`.
+        let cold = matches!(opts.level, Level::Cold | Level::Tiny);
         let use_zstd = cfg!(feature = "zstd-c")
-            && (!matches!(opts.level, Level::Best | Level::Cold)
+            && (!(cold || matches!(opts.level, Level::Best))
                 || env_i32("CRAM_FORCE_ZSTD") == Some(1));
         // `--store` reaches here as `format::Codec::None`. For a container that wraps a stream that
         // means "no wrapper"; for `.cram`, which compresses per pack, nothing consulted it at all
@@ -1569,7 +1622,7 @@ impl CramArchiveWriter {
         // knob exists precisely to measure zstd alone against XZ alone.
         let policy = if store_packs {
             PackPolicy::Store
-        } else if matches!(opts.level, Level::Cold) && env_i32("CRAM_FORCE_ZSTD") != Some(1) {
+        } else if cold && env_i32("CRAM_FORCE_ZSTD") != Some(1) {
             PackPolicy::Cold
         } else if matches!(opts.level, Level::Best) && env_i32("CRAM_FORCE_ZSTD") != Some(1) {
             PackPolicy::Exhaustive
@@ -2722,15 +2775,9 @@ impl CramReader {
                 raw
             }
             // zstd packs decode with the always-present pure-Rust ruzstd (one frame per pack), bounded
-            // to raw_len(+1 sentinel) like XZ, so any build reads a zstd-c-written `.cram`.
-            CODEC_ZSTD => {
-                let mut raw = Vec::with_capacity(p.raw_len as usize);
-                ruzstd::decoding::StreamingDecoder::new(comp.as_slice())
-                    .map_err(|e| corrupt(&format!("zstd decode: {e}")))?
-                    .take(p.raw_len as u64 + 1)
-                    .read_to_end(&mut raw)?;
-                raw
-            }
+            // to raw_len(+1 sentinel) like XZ, so any build reads a zstd-c-written `.cram`. The
+            // frame's content checksum, when it has one, is verified there.
+            CODEC_ZSTD => zstd_decode_pack(&comp, p.raw_len)?,
             other => return Err(corrupt(&format!("unknown pack codec {other}"))),
         };
         // A pack must decompress to EXACTLY the raw_len its index claims: a shorter result means a
@@ -2832,17 +2879,42 @@ impl ArchiveReader for CramReader {
         let mut buf = Vec::new();
         if !entry.is_dir() {
             // The sequential path buffers the whole body in RAM to hand back a `Read`. `entry.size`
-            // is authoritative (validated at open to equal the chunk-length sum), so refuse an entry
-            // too large to hold in memory before reconstructing, it would otherwise OOM the process
-            // (a hostile chunk list can force huge output from a tiny archive). Big legitimate
-            // entries extract via the random-access `copy_entry` path, which streams to disk.
+            // is authoritative (validated at open to equal the chunk-length sum for an untransformed
+            // entry, and checked against the restored length for a transformed one), so refuse an
+            // entry too large to hold in memory before reconstructing, it would otherwise OOM the
+            // process (a hostile chunk list can force huge output from a tiny archive). Big
+            // legitimate entries extract via the random-access `copy_entry` path, which streams to
+            // disk.
             if entry.size > MAX_INMEM_ENTRY {
                 return Err(corrupt(
                     "entry too large to buffer in memory; extract via random access",
                 ));
             }
             let ids = self.entry_chunks[i].clone();
-            self.reconstruct(&ids, &mut buf)?;
+            if self.transform_of(i) == XFORM_LEPTON {
+                // A recompressed photo is stored as a Lepton stream and must come back as the
+                // original JPEG, exactly as `copy_entry` and `read_range` hand it back. Without this
+                // the sequential path returned the stored stream under the `.jpg` name, and `cram
+                // conv` wrote it into zips and 7z archives as if it were the photo.
+                //
+                // The stored stream is buffered whole as well, and for a transformed entry its
+                // length is not `entry.size`: open only bounds the declared size by a multiple of
+                // it, so a hostile chunk list could make it arbitrarily long. It gets the same
+                // ceiling, read from the index before anything is reconstructed.
+                let stored = ids
+                    .iter()
+                    .map(|&c| self.chunks.get(c as usize).map_or(0, |c| c.length as u64))
+                    .fold(0u64, u64::saturating_add);
+                if stored > MAX_INMEM_ENTRY {
+                    return Err(corrupt(
+                        "entry too large to buffer in memory; extract via random access",
+                    ));
+                }
+                // `restore_entry` checks the restored length against `entry.size`.
+                buf = self.restore_entry(i, &ids)?;
+            } else {
+                self.reconstruct(&ids, &mut buf)?;
+            }
         }
         Ok(Some(EntryStream {
             entry,
@@ -3121,12 +3193,24 @@ mod tests {
         chunks: &[ChunkLoc],
         entries: &[EntryMeta],
     ) -> Vec<u8> {
+        assemble_version(region, packs, chunks, entries, VERSION)
+    }
+
+    /// As [`assemble`], declaring `version` in the header and serializing the index to match, so a
+    /// test can build a v2 archive whose entries carry a transform byte.
+    fn assemble_version(
+        region: &[u8],
+        packs: &[PackLoc],
+        chunks: &[ChunkLoc],
+        entries: &[EntryMeta],
+        version: u8,
+    ) -> Vec<u8> {
         let mut f = Vec::new();
         f.extend_from_slice(CRAM_MAGIC);
-        f.extend_from_slice(&[VERSION, 0]);
+        f.extend_from_slice(&[version, 0]);
         f.extend_from_slice(region);
         let index_offset = f.len() as u64;
-        let index = serialize_index(packs, chunks, entries, VERSION);
+        let index = serialize_index(packs, chunks, entries, version);
         f.extend_from_slice(&index);
         put_u64(&mut f, index_offset);
         put_u64(&mut f, index.len() as u64);
@@ -3423,6 +3507,124 @@ mod tests {
         reader.copy_entry(idx, &mut got).unwrap();
         assert_eq!(got, SAMPLE_JPEG);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `next_entry` is the path `cram conv` reads a `.cram` through, and it must hand back the same
+    /// bytes as `copy_entry` for every entry. It used to return a recompressed photo's stored Lepton
+    /// stream, so a converted zip carried a `.jpg` that no viewer could open.
+    #[test]
+    fn next_entry_matches_copy_entry_on_a_v2_archive() {
+        let dir = std::env::temp_dir().join(format!("cram-jseq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/sub")).unwrap();
+        std::fs::write(dir.join("src/photo.jpg"), SAMPLE_JPEG).unwrap();
+        std::fs::write(dir.join("src/sub/notes.txt"), b"plain text".repeat(50)).unwrap();
+        std::fs::write(dir.join("src/empty.txt"), b"").unwrap();
+
+        let archive = dir.join("out.cram");
+        crate::engine::create::create(
+            &archive,
+            Format::cram(crate::format::Codec::None),
+            &[dir.join("src")],
+            CreateOptions {
+                recompress_images: true,
+                ..Default::default()
+            },
+            &crate::progress::NullSink,
+        )
+        .unwrap();
+        // Without a transformed entry the two paths agree trivially and this proves nothing.
+        let head = std::fs::read(&archive).unwrap();
+        assert_eq!(
+            head[6], VERSION_XFORM,
+            "the photo must have been recompressed"
+        );
+
+        let mut reader = CramReader::open(&archive, np()).unwrap();
+        let count = RandomAccessReader::entries(&reader).len();
+        let mut expected = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut b = Vec::new();
+            reader.copy_entry(i, &mut b).unwrap();
+            expected.push(b);
+        }
+
+        let mut seen = 0usize;
+        let mut photo = false;
+        while let Some(mut es) = reader.next_entry().unwrap() {
+            let mut got = Vec::new();
+            es.body.read_to_end(&mut got).unwrap();
+            assert_eq!(
+                got,
+                expected[es.entry.index],
+                "{}: next_entry and copy_entry disagree",
+                es.entry.name()
+            );
+            if es.entry.name().ends_with("photo.jpg") {
+                assert_eq!(
+                    got, SAMPLE_JPEG,
+                    "the photo must come back as the original JPEG"
+                );
+                photo = true;
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, count, "next_entry must visit every entry");
+        assert!(photo, "the photo was listed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transformed entry's stored stream is buffered whole by `next_entry`, and its length is not
+    /// the declared size: open bounds the size by a multiple of the stored length, never the other
+    /// way, so a chunk list that repeats one chunk can make it as long as it likes. It has to be
+    /// refused from the index, before anything is reconstructed.
+    ///
+    /// The one pack is not a valid XZ stream, so reconstructing any of the entry fails with a decode
+    /// error. Only a refusal made before reconstruction can produce the expected message.
+    #[test]
+    fn next_entry_refuses_an_oversized_stored_stream() {
+        const CHUNK: u32 = 1 << 20;
+        let region = vec![0xA5u8; 16];
+        let packs = vec![PackLoc {
+            file_offset: HEADER_LEN,
+            comp_len: region.len() as u64,
+            raw_len: CHUNK,
+            codec: CODEC_XZ,
+        }];
+        let chunks = vec![ChunkLoc {
+            pack_id: 0,
+            offset: 0,
+            length: CHUNK,
+        }];
+        // One more repeat than fits under the ceiling. The declared size is small and plausible.
+        let repeats = (MAX_INMEM_ENTRY / CHUNK as u64 + 1) as usize;
+        let entries = vec![EntryMeta {
+            name: "photo.jpg".into(),
+            is_dir: false,
+            size: 1000,
+            mode: 0,
+            chunk_ids: vec![0; repeats],
+            transform: XFORM_LEPTON,
+        }];
+        let path = tmp(&assemble_version(
+            &region,
+            &packs,
+            &chunks,
+            &entries,
+            VERSION_XFORM,
+        ));
+        let mut reader = CramReader::open(&path, np()).unwrap();
+        let outcome = match reader.next_entry() {
+            Err(ArchiveError::Corrupt(m)) => m,
+            Err(e) => format!("another error: {e}"),
+            Ok(_) => "Ok".to_string(),
+        };
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            outcome.contains("too large to buffer"),
+            "an over-long stored stream must be refused before reconstruction, got: {outcome}"
+        );
     }
 
     #[test]

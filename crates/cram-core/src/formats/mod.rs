@@ -24,6 +24,7 @@ pub mod sevenz_write;
 pub mod tar;
 pub mod tar_write;
 pub mod zip;
+pub(crate) mod zip_time;
 pub mod zip_write;
 
 /// Open an archive for reading. `pw` supplies passwords lazily for encrypted entries/headers.

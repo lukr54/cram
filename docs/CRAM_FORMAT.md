@@ -346,6 +346,17 @@ at `--fast` and `--auto`. At `--small` it compresses every pack with **both** XZ
 whichever is smaller, so a released `--small` archive carries a mix of XZ, ZSTD and STORE, never XZ
 alone. STORE is picked for any pack neither codec shrinks.
 
+**zstd content checksum (informative).** A zstd frame may carry a content checksum (RFC 8878
+§3.1.1): a flag in the frame header descriptor, and the low 32 bits of the XXH64 (seed 0) of the
+decoded content in the last four bytes of the frame. This specification neither requires nor forbids
+it. The reference writer sets it in releases after 1.3.2; zstd packs written by 1.3.2 and earlier
+carry none. The reference readers (cram-core and `cram-extract`) verify it whenever a frame carries
+one and treat a mismatch as corruption. They also treat bytes after the end of the frame as
+corruption, since a ZSTD pack is a single frame; without that, a flipped checksum flag would leave
+the stored checksum unread. A frame without a checksum is read as before: a flipped bit in it is
+caught only if it breaks the frame or changes the decoded length (§9 check 8). The checksum adds
+four bytes to each zstd pack and does not change the format version.
+
 ---
 
 ## 12. Reproducibility

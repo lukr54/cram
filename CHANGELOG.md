@@ -9,6 +9,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cram conv` writes recompressed photos back as the original JPEG.** A `.cram` made with
+  `--small`, `--tiny` or `--recompress` stores each JPEG it could shrink as a Lepton stream, and
+  conversion reads a `.cram` entry by entry through a path that never reversed that step. Converting
+  such an archive to `.zip` or `.7z` exited 0 and wrote each of those photos as its Lepton stream
+  under the original `.jpg` name, a file no viewer opens; `cram t` on the result reported OK, because
+  the CRC was taken over the wrong bytes. Converting it to `.tar` failed with "file shrank while
+  being archived". The source `.cram` was never affected: `cram x`, `cram t`, `cram mount` and
+  `cram-extract` all restore the photos. The same reader code is in every release from 1.0.0 to
+  1.3.2; 1.3.2 is the one that was run.
+
+- **`--tiny` on a `.cram` now writes the same archive as `--small`.** `.cram` has no slower encoder
+  for `--tiny` to reach for, and the level is documented to behave as `--small` there, but only
+  `--small` got the per-pack filter search. `--tiny` took the single-attempt path instead: XZ at
+  preset 9 with no filter search on a pure-Rust build, and zstd with no XZ candidate on the released
+  binaries, which came out larger than `--small` (182,949 bytes against 179,109 on one 0.7 MiB text
+  sample, 1.3.2). The two levels now produce byte-identical `.cram` files. Every release from 1.2.0,
+  which added `--tiny`, to 1.3.2 has this; archives already written read as before.
+
+- **`cram t` and extraction now catch a flipped bit in a `.cram` zstd pack.** zstd packs were
+  written without the frame's content checksum, and the `.cram` index stores no hash of a pack, so a
+  flip inside one often still decoded to the declared length: `cram t` reported OK and `cram x`
+  wrote wrong bytes. XZ packs were not affected, since Cram writes each one with a CRC-64. The writer
+  now sets the zstd content checksum, four bytes per pack with no change to the format version, and
+  both cram-core and `cram-extract` verify it whenever a frame carries one. Both also refuse bytes
+  after the end of a pack's frame, so a flipped checksum flag cannot turn the check off. On a test
+  archive with one 619-byte zstd pack, flipping one bit in each byte returned wrong content without
+  an error 314 times with the check taken out and 0 times with it; 7 of the flips decode to unchanged
+  content and are not reported. Every release from 1.0.0 to 1.3.2 writes zstd packs without the
+  checksum. Those archives read as before and stay unprotected until they are created again. 1.3.2's
+  `cram t` passes an archive written with the checksum.
+
+- **ZIP modification times are now written and read as local time.** The DOS date-time in a ZIP
+  header has no time zone, and 7-Zip reads it as local time. Cram wrote UTC there and read it back
+  as UTC. Its own round trip came out right, but 7-Zip showed every Cram-made entry shifted by the
+  zone offset (one hour early at UTC+1), and extracting a ZIP whose only time is the DOS field set
+  each file's time off by the same amount. The writer now puts local time in the DOS fields and adds
+  the extended timestamp (extra field `0x5455`, UTC seconds) to every entry dated from 1970 to
+  2038-01-19, 9 bytes in the local header and 9 in the central one. One kind of entry carries it
+  differently: an encrypted file of 64 MiB or less added from disk (`cram a -p`; `cram conv` is not
+  affected). Those are compressed on the parallel path and copied in as one-entry archives, and the
+  zip crate (9.0.5) writes the central header of an entry copied that way without `0x5455`. Such an
+  entry keeps `0x5455` in its local header and gets the older Info-ZIP Unix field, `0x5855`, in its
+  central one: the same UTC seconds in 12 bytes, which the crate copies as it finds them and which
+  Cram, 7-Zip and Info-ZIP read. The reader takes `0x5455` first, then the NTFS field `0x000A`,
+  then `0x5855`, then the DOS fields as local time. Where the platform gives no local offset, the
+  DOS fields are written and read as UTC, as before. Every release from 1.0.0 to 1.3.2 wrote and
+  read UTC. Two regressions follow. A ZIP written by one of those releases has no `0x5455`, so Cram
+  now reads its times shifted by the local offset, as other tools already showed them. A ZIP
+  written by this version and extracted by one of those releases also comes out shifted, the other
+  way: they read only the DOS fields, as UTC, so a file last changed at 14:00 local time at UTC+1
+  is restored as 15:00.
+
 ## [1.3.2] - 2026-10-12
 
 ### Security

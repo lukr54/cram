@@ -167,11 +167,16 @@ that authentication code instead, which fails if any byte of the entry changed. 
 is optional, so an entry carrying none falls back to the *decode* check. *decode*: Cram recomputes no
 checksum of its own, so the check is "every entry decodes cleanly and its decoded length matches its
 declared size", plus whatever the underlying decoder rejects. For `.cram`, encrypted packs are
-additionally authenticated by their AES-GCM tag and compressed packs by their codec framing, an
-unencrypted *stored* pack has neither. So `cram t` catches truncation, structural damage and broken
-codec streams on every format, but a **silent in-file bit flip** is guaranteed to be caught only for
-ZIP, for 7z entries that carry a stored CRC, and for compressed or encrypted `.cram`. See
-[Limitations](#limitations).
+additionally authenticated by their AES-GCM tag, XZ packs are checked against their stream's check,
+which is a CRC-64 in every XZ pack Cram writes, and zstd packs written by a release after 1.3.2
+are checked against the zstd frame's 32-bit content checksum. zstd packs written by 1.3.2 or earlier carry no checksum, and an
+unencrypted *stored* pack has none of these. So `cram t` catches truncation, structural damage and
+broken codec streams on every format, but a **silent in-file bit flip** is caught only where a
+checksum or tag covers the content: ZIP, 7z entries that carry a stored CRC, encrypted `.cram`, and
+`.cram` packs compressed with XZ, or with zstd by a release after 1.3.2. A checksum misses a change
+that happens to leave its value unchanged; for zstd's 32-bit checksum that is about 1 in 4.3 billion
+per damaged pack. In an unencrypted zstd pack written by 1.3.2 or earlier, a flip can decode to wrong
+bytes of the right length and pass `cram t`. See [Limitations](#limitations).
 
 ‡ **Mount requires the optional Windows feature `Client-ProjFS`**, which is off by default. Enable it
 from an elevated PowerShell:
@@ -660,12 +665,15 @@ section is a performance claim; for those see [`BENCHMARKS.md`](BENCHMARKS.md).
 ## Limitations
 
 - **`cram test` cannot detect every bit flip.** On an *unencrypted, stored* `.cram` (incompressible
-  media with no password), and on `tar` / `.tar.zst`, there is no per-file content checksum, so a
-  flipped bit inside a file's content can decode to wrong bytes undetected. Truncation and
-  structural damage *are* caught. ISO and RAR are in the same position: Cram computes no checksum of
-  its own for either, so the verdict is a clean decode plus a declared-size match, plus whatever the
-  underlying decoder rejects. For guaranteed content integrity, use ZIP, 7z, or compressed/encrypted
-  `.cram`, or pair any archive with `cram sign` or `cram rec`; both cover the whole file.
+  media with no password), on the zstd packs of an unencrypted `.cram` written by 1.3.2 or earlier,
+  and on `tar` / `.tar.zst`, there is no content checksum, so a flipped bit inside a file's content
+  can decode to wrong bytes undetected. Truncation and structural damage *are* caught. ISO and RAR
+  are in the same position: Cram computes no checksum of its own for either, so the verdict is a
+  clean decode plus a declared-size match, plus whatever the underlying decoder rejects. A `.cram`
+  written by 1.3.2 or earlier gains the zstd checksum only when it is created again with a later
+  release. For content integrity, use ZIP, 7z, encrypted `.cram`, or a compressed `.cram` written by
+  a release after 1.3.2, or pair any archive with `cram sign` or `cram rec`; both cover the whole
+  file.
 - **Mount needs an optional Windows feature.** `Client-ProjFS` is off by default and must be enabled
   from an elevated PowerShell (see ‡ above); a restart may be required. Every other command works
   without it.

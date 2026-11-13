@@ -1,9 +1,10 @@
 //! The parallel ZIP create path must be invisible in the output.
 //!
-//! Entries are compressed across the rayon pool and written by `raw_copy_file` in submission order,
-//! so nothing about the archive should depend on how the work was divided. These tests pin that
-//! down three ways: repeated builds match, a forced-sequential build matches, and a build that
-//! pushes every entry down the oversized-entry fallback matches too.
+//! Entries are compressed across the rayon pool and appended in submission order, so nothing about
+//! the archive should depend on how the work was divided. These tests pin that down three ways:
+//! repeated builds match, a forced-sequential build matches, and a build that pushes every entry
+//! down the oversized-entry fallback matches too. Encrypted archives are outside them: an AES salt
+//! is random, so two builds never match.
 //!
 //! The fallback case is here because it regressed once during development. Turning `takes_paths`
 //! on stopped the engine probing store-vs-compress inline; the parallel path picked the probe up
@@ -18,10 +19,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use cram_core::engine;
 use cram_core::format::Format;
 use cram_core::progress::NullSink;
+use cram_core::secret::NoPassword;
 use cram_core::writer::CreateOptions;
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -44,6 +47,16 @@ fn build_tree(root: &Path) -> PathBuf {
     fs::create_dir_all(proj.join("blobs")).unwrap();
 
     fs::write(proj.join("README.md"), b"# zip parallel\n".repeat(200)).unwrap();
+    // An empty file and a non-ASCII name. The parallel path hands the zip crate a prepared file
+    // where the sequential writer streams into it, two routes through the crate that have to write
+    // the same headers. These are the entries where they could part ways with no data to show it:
+    // an empty DEFLATE stream, and the flag that marks a UTF-8 name.
+    fs::write(proj.join("empty.txt"), b"").unwrap();
+    fs::write(
+        proj.join("src/caf\u{e9}-\u{65e5}\u{672c}.txt"),
+        b"non-ASCII name\n".repeat(50),
+    )
+    .unwrap();
     for i in 0..12u32 {
         let text = format!("line {i} of a very compressible file\n").repeat(300);
         fs::write(proj.join(format!("src/f{i}.txt")), text).unwrap();
@@ -99,6 +112,35 @@ fn parallel_zip_matches_sequential_and_itself() {
     assert!(
         bytes_a.len() > 1000,
         "fixture produced a suspiciously tiny archive"
+    );
+
+    // The two entries with no data to tell them apart have to be in the archive, under their own
+    // names. Three byte-equal archives would not notice if every route dropped or mangled them
+    // alike.
+    let out = dir.join("extracted");
+    let rep = engine::extract(
+        &a,
+        &out,
+        Arc::new(NoPassword),
+        Default::default(),
+        &NullSink,
+    )
+    .expect("extract");
+    assert!(
+        rep.failed.is_empty(),
+        "unexpected failures: {:?}",
+        rep.failed
+    );
+    assert_eq!(
+        fs::read(out.join("proj/empty.txt")).expect("empty.txt was extracted"),
+        b"",
+        "empty.txt"
+    );
+    assert_eq!(
+        fs::read(out.join("proj/src/caf\u{e9}-\u{65e5}\u{672c}.txt"))
+            .expect("the file with a non-ASCII name was extracted"),
+        b"non-ASCII name\n".repeat(50),
+        "the file with a non-ASCII name"
     );
 
     // Forced sequential: the pre-parallel writer, which must agree byte for byte.

@@ -244,11 +244,13 @@ What "verified" means is per format, and the difference matters:
   and **cannot** detect a bit flip inside a file. For content integrity on an ISO, pair with
   `cram sign` or `cram rec`.
 - **`.cram`**, every pack must decode cleanly. Encrypted packs are authenticated by their AES-GCM
-  tag and compressed packs by their codec framing, but an **unencrypted, stored** pack (what
-  incompressible media compresses to) carries no per-chunk checksum in the frozen format, so
-  `cram test` confirms it decodes structurally and cannot detect an in-place bit flip inside it. For
-  guaranteed content integrity on such archives, pair with `cram sign` or `cram rec`, which cover the
-  whole file's bytes.
+  tag, XZ packs by the stream's check (a CRC-64 when Cram wrote the pack), and zstd packs by the
+  frame's 32-bit content checksum when the frame carries one, which it does when a release after
+  1.3.2 wrote it. An **unencrypted,
+  stored** pack (what incompressible media compresses to), and an unencrypted zstd pack written by
+  1.3.2 or earlier, carry no checksum, so `cram test` confirms they decode structurally and cannot
+  detect an in-place bit flip inside them. For content integrity on such archives, pair with
+  `cram sign` or `cram rec`, which cover the whole file's bytes.
 
 ---
 

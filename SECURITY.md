@@ -192,15 +192,18 @@ than any other tool, treat an archive from a stranger as hostile whatever you op
 
 ## Integrity limits worth knowing
 
-`cram test` cannot detect every bit flip. A **silent bit flip inside a file's content** is guaranteed
-to be caught only for ZIP, for 7z entries that carry a stored CRC, and for compressed or encrypted
-`.cram`. (ZIP stores a CRC-32 for every entry except an AES entry written in AE-2 form, which stores
-none because the AES authentication already proves the content is intact; such an entry is verified by
-that authentication instead.)
+`cram test` cannot detect every bit flip. A **silent bit flip inside a file's content** is caught
+only where a checksum or authentication tag covers it: ZIP, 7z entries that carry a stored CRC,
+encrypted `.cram`, and `.cram` packs compressed with XZ by Cram (which writes a CRC-64 into each),
+or with zstd by a release after 1.3.2 (the frame's 32-bit content checksum). (ZIP stores a CRC-32 for every entry except an AES
+entry written in AE-2 form, which stores none because the AES authentication already proves the
+content is intact; such an entry is verified by that authentication instead.) A checksum misses a
+change that leaves its value unchanged; for zstd's 32-bit checksum that is about 1 in 4.3 billion
+per damaged pack.
 
-Everywhere else Cram has no per-entry content checksum to compare against: an **unencrypted, stored
-`.cram`**, **`tar` / `.tar.zst`**, **ISO 9660**, **RAR**, and a **7z entry that carries no stored
-CRC**. A pass there means every entry decoded cleanly and its decoded length matched the declared
+Everywhere else Cram has no content checksum to compare against: an **unencrypted, stored
+`.cram`**, the **zstd packs of an unencrypted `.cram` written by 1.3.2 or earlier**, **`tar` /
+`.tar.zst`**, **ISO 9660**, **RAR**, and a **7z entry that carries no stored CRC**. A pass there means every entry decoded cleanly and its decoded length matched the declared
 size, plus whatever the underlying decoder rejects; it does not prove the bytes are the original ones.
 Truncation and structural damage *are* caught.
 
