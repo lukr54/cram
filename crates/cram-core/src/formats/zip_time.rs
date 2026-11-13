@@ -1,4 +1,4 @@
-//! An entry's modification time, and the two places a ZIP keeps it.
+//! An entry's modification time, and the places a ZIP keeps it.
 //!
 //! **The DOS date-time** in every ZIP header has no zone and a 2-second step. Archivers write and
 //! read it as **local** wall time (`tests/zip_time_7z.rs` checks this against 7-Zip), so Cram does
@@ -7,12 +7,15 @@
 //!
 //! **The Info-ZIP extended timestamp**, extra field `0x5455`, carries the modification time as UTC
 //! seconds since 1970. Cram writes it on every entry whose time fits, in the local and the central
-//! header, so a reader that understands it gets the exact second with no zone guesswork. One kind
-//! of entry has it in the local header only: an encrypted file written through the parallel path
-//! (see `DoneBody::Archive` in `zip_write.rs`).
+//! header, so a reader that understands it gets the exact second with no zone guesswork.
+//!
+//! **The older Info-ZIP Unix field**, `0x5855`, carries the access and the modification time the
+//! same way. Cram writes it in one place only: the central header of an encrypted file written
+//! through the parallel path, which cannot keep `0x5455` there (see `DoneBody::Archive` in
+//! `zip_write.rs`). That entry's local header has `0x5455` as usual.
 //!
 //! Reading prefers `0x5455`, then the NTFS field `0x000A` (100 ns ticks since 1601, written by
-//! 7-Zip and WinZip), and only then the DOS fields, read as local time.
+//! 7-Zip and WinZip), then `0x5855`, and only then the DOS fields, read as local time.
 //!
 //! When the platform cannot give a local offset ([`crate::localtime`] returns `None`), the DOS
 //! fields are written and read as UTC, which is what Cram did before; `0x5455` is written either
@@ -24,6 +27,11 @@ use crate::localtime;
 
 /// Header ID of the Info-ZIP extended timestamp ("UT").
 pub(crate) const EXT_TIMESTAMP_ID: u16 = 0x5455;
+
+/// Header ID of the older Info-ZIP Unix field ("UX"): the access time, then the modification time,
+/// each as UTC seconds in a little-endian `u32`. Info-ZIP replaced it with `0x5455`; 7-Zip and
+/// Info-ZIP still read it.
+pub(crate) const UNIX_TIME_ID: u16 = 0x5855;
 
 /// Flags byte of an extended timestamp that carries the modification time only.
 const EXT_FLAG_MTIME: u8 = 0x01;
@@ -90,22 +98,42 @@ pub(crate) fn ext_timestamp_payload(modified: Option<SystemTime>) -> Option<[u8;
     Some(out)
 }
 
+/// The `0x5855` payload for `modified`, in the form a central header holds: the access time, for
+/// which the modification time stands in, then the modification time. `None` exactly when
+/// [`ext_timestamp_payload`] is: both fields hold the same four-byte value, with the same range.
+pub(crate) fn unix_time_payload(modified: Option<SystemTime>) -> Option<[u8; 8]> {
+    let ut = ext_timestamp_payload(modified)?;
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&ut[1..]);
+    out[4..].copy_from_slice(&ut[1..]);
+    Some(out)
+}
+
+/// The modification time a `0x5855` field holds. Its local and its central form both put it in
+/// bytes 4 to 8; `None` when the field is too short to have them.
+pub(crate) fn unix_time_mtime(data: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(4..8)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
 /// An entry's modification time from what its central header holds: the `0x5455` mtime if present
 /// and at most [`EXT_MAX`], else the NTFS mtime if it lands between 1970 and [`MAX_SANE_UNIX`],
-/// else the DOS fields as local time. `None` when none of them gives a valid time; extraction then
-/// leaves the file's own time alone.
+/// else the `0x5855` mtime under the same limit as `0x5455`, else the DOS fields as local time.
+/// `None` when none of them gives a valid time; extraction then leaves the file's own time alone.
 pub(crate) fn mtime_for_read(
     dos: Option<zip::DateTime>,
     ext: Option<u32>,
     ntfs: Option<u64>,
+    unix: Option<u32>,
 ) -> Option<SystemTime> {
-    mtime_for_read_with(dos, ext, ntfs, localtime::utc_offset_at)
+    mtime_for_read_with(dos, ext, ntfs, unix, localtime::utc_offset_at)
 }
 
 fn mtime_for_read_with(
     dos: Option<zip::DateTime>,
     ext: Option<u32>,
     ntfs: Option<u64>,
+    unix: Option<u32>,
     offset_at: impl Fn(i64) -> Option<i32>,
 ) -> Option<SystemTime> {
     if let Some(secs) = ext.filter(|s| *s <= EXT_MAX) {
@@ -113,6 +141,10 @@ fn mtime_for_read_with(
     }
     if let Some(t) = ntfs.and_then(ntfs_to_system) {
         return Some(t);
+    }
+    // The same four-byte value as `0x5455`, with the same doubt about its top bit.
+    if let Some(secs) = unix.filter(|s| *s <= EXT_MAX) {
+        return UNIX_EPOCH.checked_add(Duration::from_secs(u64::from(secs)));
     }
     dos_as_local(dos?, &offset_at)
 }
@@ -232,17 +264,17 @@ mod tests {
         let dt = zip::DateTime::from_date_and_time(2020, 1, 2, 4, 4, 6).unwrap();
         let east = |_: i64| Some(3600);
         assert_eq!(
-            mtime_for_read_with(Some(dt), None, None, east),
+            mtime_for_read_with(Some(dt), None, None, None, east),
             Some(at(WINTER))
         );
         let west = |_: i64| Some(-5 * 3600);
         assert_eq!(
-            mtime_for_read_with(Some(dt), None, None, west),
+            mtime_for_read_with(Some(dt), None, None, None, west),
             Some(at(WINTER + 6 * 3600))
         );
         // No offset: the fields are UTC.
         assert_eq!(
-            mtime_for_read_with(Some(dt), None, None, |_| None),
+            mtime_for_read_with(Some(dt), None, None, None, |_| None),
             Some(at(WINTER + 3600))
         );
     }
@@ -257,19 +289,22 @@ mod tests {
         let eu = |t: i64| Some(if t < SWITCH { 3600 } else { 7200 });
         let dt = zip::DateTime::from_date_and_time(2020, 3, 29, 1, 30, 0).unwrap();
         assert_eq!(
-            mtime_for_read_with(Some(dt), None, None, eu),
+            mtime_for_read_with(Some(dt), None, None, None, eu),
             Some(at(SWITCH as u64 - 1800))
         );
         // 03:30 exists only after the switch: 01:30Z.
         let dt = zip::DateTime::from_date_and_time(2020, 3, 29, 3, 30, 0).unwrap();
         assert_eq!(
-            mtime_for_read_with(Some(dt), None, None, eu),
+            mtime_for_read_with(Some(dt), None, None, None, eu),
             Some(at(SWITCH as u64 + 1800))
         );
         // Round trip across the same zone, a day either side of the switch.
         for t in [SWITCH as u64 - 86_400, SWITCH as u64 + 86_400] {
             let dos = dos_for_write_with(Some(at(t)), eu).unwrap();
-            assert_eq!(mtime_for_read_with(Some(dos), None, None, eu), Some(at(t)));
+            assert_eq!(
+                mtime_for_read_with(Some(dos), None, None, None, eu),
+                Some(at(t))
+            );
         }
     }
 
@@ -279,16 +314,16 @@ mod tests {
         let east = |_: i64| Some(3600);
         let ntfs_summer = (SUMMER + NTFS_TO_UNIX_SECS) * NTFS_TICKS_PER_SEC;
         assert_eq!(
-            mtime_for_read_with(dos, Some(WINTER as u32), Some(ntfs_summer), east),
+            mtime_for_read_with(dos, Some(WINTER as u32), Some(ntfs_summer), None, east),
             Some(at(WINTER))
         );
         assert_eq!(
-            mtime_for_read_with(dos, None, Some(ntfs_summer), east),
+            mtime_for_read_with(dos, None, Some(ntfs_summer), None, east),
             Some(at(SUMMER))
         );
         // NTFS keeps its sub-second part.
         assert_eq!(
-            mtime_for_read_with(dos, None, Some(ntfs_summer + 1_234_567), east),
+            mtime_for_read_with(dos, None, Some(ntfs_summer + 1_234_567), None, east),
             Some(at(SUMMER) + Duration::from_nanos(123_456_700))
         );
     }
@@ -302,7 +337,7 @@ mod tests {
         // An extended timestamp with the top bit set is ambiguous between tools.
         for ext in [u32::MAX, EXT_MAX + 1] {
             assert_eq!(
-                mtime_for_read_with(Some(dt), Some(ext), None, east),
+                mtime_for_read_with(Some(dt), Some(ext), None, None, east),
                 from_dos
             );
         }
@@ -310,24 +345,90 @@ mod tests {
         let just_before_1970 = NTFS_TO_UNIX_SECS * NTFS_TICKS_PER_SEC - 1;
         for ntfs in [0, u64::MAX, just_before_1970] {
             assert_eq!(
-                mtime_for_read_with(Some(dt), None, Some(ntfs), east),
+                mtime_for_read_with(Some(dt), None, Some(ntfs), None, east),
                 from_dos
             );
         }
         // Nothing usable anywhere.
         assert_eq!(
-            mtime_for_read_with(None, Some(u32::MAX), Some(u64::MAX), east),
+            mtime_for_read_with(None, Some(u32::MAX), Some(u64::MAX), Some(u32::MAX), east),
             None
         );
         // The extremes of the trusted range itself.
         assert_eq!(
-            mtime_for_read_with(None, Some(0), None, east),
+            mtime_for_read_with(None, Some(0), None, None, east),
             Some(UNIX_EPOCH)
         );
         assert_eq!(
-            mtime_for_read_with(None, Some(EXT_MAX), None, east),
+            mtime_for_read_with(None, Some(EXT_MAX), None, None, east),
             Some(at(u64::from(EXT_MAX)))
         );
+    }
+
+    /// The older Unix field ranks after the two sources that carry more (`0x5455` is what current
+    /// tools write, NTFS has the fraction of a second) and before the DOS fields.
+    #[test]
+    fn unix_field_ranks_after_ntfs_and_before_dos() {
+        let dos = zip::DateTime::from_date_and_time(2001, 1, 1, 0, 0, 0).ok();
+        let east = |_: i64| Some(3600);
+        let ntfs_summer = (SUMMER + NTFS_TO_UNIX_SECS) * NTFS_TICKS_PER_SEC;
+        let unix = Some(WINTER as u32 + 60);
+        // Alone with the DOS fields, it answers.
+        assert_eq!(
+            mtime_for_read_with(dos, None, None, unix, east),
+            Some(at(WINTER + 60))
+        );
+        // Beside either of the other two, it does not.
+        assert_eq!(
+            mtime_for_read_with(dos, Some(WINTER as u32), None, unix, east),
+            Some(at(WINTER))
+        );
+        assert_eq!(
+            mtime_for_read_with(dos, None, Some(ntfs_summer), unix, east),
+            Some(at(SUMMER))
+        );
+        // A value with the top bit set is not trusted, as for `0x5455`: the DOS fields answer.
+        let from_dos = mtime_for_read_with(dos, None, None, None, east);
+        assert!(from_dos.is_some());
+        for bad in [u32::MAX, EXT_MAX + 1] {
+            assert_eq!(
+                mtime_for_read_with(dos, None, None, Some(bad), east),
+                from_dos
+            );
+        }
+        // An untrusted `0x5455` beside a sound `0x5855`: the sound one answers.
+        assert_eq!(
+            mtime_for_read_with(dos, Some(u32::MAX), None, unix, east),
+            Some(at(WINTER + 60))
+        );
+    }
+
+    #[test]
+    fn unix_field_payload_layout_and_range() {
+        // WINTER is 0x5E0D5DA6: the access time, then the modification time, little-endian.
+        assert_eq!(
+            unix_time_payload(Some(at(WINTER))),
+            Some([0xA6, 0x5D, 0x0D, 0x5E, 0xA6, 0x5D, 0x0D, 0x5E])
+        );
+        assert_eq!(unix_time_payload(None), None);
+        assert_eq!(
+            unix_time_payload(Some(UNIX_EPOCH - Duration::from_secs(1))),
+            None
+        );
+        assert!(unix_time_payload(Some(at(u64::from(EXT_MAX)))).is_some());
+        assert_eq!(unix_time_payload(Some(at(u64::from(EXT_MAX) + 1))), None);
+        // Reading takes bytes 4 to 8, whatever the first four and anything after them hold.
+        assert_eq!(
+            unix_time_mtime(&[1, 2, 3, 4, 0xA6, 0x5D, 0x0D, 0x5E]),
+            Some(WINTER as u32)
+        );
+        assert_eq!(
+            unix_time_mtime(&[1, 2, 3, 4, 0xA6, 0x5D, 0x0D, 0x5E, 9, 9, 9, 9]),
+            Some(WINTER as u32)
+        );
+        for short in [&[][..], &[1, 2, 3, 4][..], &[1, 2, 3, 4, 5, 6, 7][..]] {
+            assert_eq!(unix_time_mtime(short), None);
+        }
     }
 
     #[test]

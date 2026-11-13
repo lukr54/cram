@@ -195,7 +195,7 @@ mod tests {
                 "localtime::tests::fixed_zone_offsets",
                 "formats::zip::mtime_tests::",
                 "formats::zip_write::mtime_guard_tests::mtime_survives_both_writer_paths",
-                "formats::zip_write::mtime_guard_tests::encrypted_entries_keep_the_timestamp_in_the_local_header_only",
+                "formats::zip_write::mtime_guard_tests::encrypted_entries_keep_their_time_on_both_writer_paths",
                 "--include-ignored",
             ])
             .env("TZ", FIXED_TZ)
@@ -214,7 +214,7 @@ mod tests {
             "formats::zip::mtime_tests::dos_only_entry_reads_as_local_time",
             "formats::zip::mtime_tests::hostile_time_fields_do_not_panic",
             "formats::zip_write::mtime_guard_tests::mtime_survives_both_writer_paths",
-            "formats::zip_write::mtime_guard_tests::encrypted_entries_keep_the_timestamp_in_the_local_header_only",
+            "formats::zip_write::mtime_guard_tests::encrypted_entries_keep_their_time_on_both_writer_paths",
         ] {
             assert!(
                 stdout.contains(&format!("test {name} ... ok")),

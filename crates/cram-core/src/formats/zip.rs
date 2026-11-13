@@ -45,23 +45,27 @@ fn stored_crc(crc: u32, encrypted: bool, size: u64) -> Option<u32> {
 /// A ZIP entry's stored modification time as a [`SystemTime`], or `None` when absent/unrepresentable.
 ///
 /// Taken from the central header's Info-ZIP extended timestamp (`0x5455`, UTC seconds) when there
-/// is one, else its NTFS field (`0x000A`), else the DOS date-time read as **local** wall time, the
-/// way every other archiver reads it. The order and the bounds are in [`super::zip_time`]. The
-/// extra fields come already parsed by the zip crate, which rejects a malformed one when the
-/// archive is opened; only their values are checked here. `None` → extraction leaves the file's
-/// current time (never stamps a bogus one).
+/// is one, else its NTFS field (`0x000A`), else its older Info-ZIP Unix field (`0x5855`), else the
+/// DOS date-time read as **local** wall time, the way every other archiver reads it. The order and
+/// the bounds are in [`super::zip_time`]. The first two come already parsed by the zip crate, which
+/// rejects a malformed one when the archive is opened; only their values are checked here.
+/// `0x5855` comes as raw bytes and is passed over when too short. `None` → extraction leaves the
+/// file's current time (never stamps a bogus one).
 fn zip_mtime<R: Read>(zf: &zip::read::ZipFile<'_, R>) -> Option<SystemTime> {
     let mut ext = None;
     let mut ntfs = None;
+    let mut unix = None;
     for field in zf.extra_data_fields() {
-        if let ExtraField::ExtendedTimestamp(e) = field {
-            ext = ext.or(e.mod_time());
-        }
-        if let ExtraField::Ntfs(n) = field {
-            ntfs = ntfs.or(Some(n.mtime()));
+        match field {
+            ExtraField::ExtendedTimestamp(e) => ext = ext.or(e.mod_time()),
+            ExtraField::Ntfs(n) => ntfs = ntfs.or(Some(n.mtime())),
+            ExtraField::Custom(c) if c.header_id == super::zip_time::UNIX_TIME_ID => {
+                unix = unix.or(super::zip_time::unix_time_mtime(&c.data));
+            }
+            _ => {}
         }
     }
-    super::zip_time::mtime_for_read(zf.last_modified(), ext, ntfs)
+    super::zip_time::mtime_for_read(zf.last_modified(), ext, ntfs, unix)
 }
 
 /// Translate a `zip` crate error into a typed [`ArchiveError`].
@@ -452,6 +456,30 @@ mod mtime_tests {
         );
     }
 
+    /// The older Info-ZIP Unix field, which Cram writes on encrypted entries of the parallel path
+    /// and which tools wrote before `0x5455` existed: the access time, then the modification time.
+    /// The two differ here, so reading the wrong four bytes shows.
+    #[test]
+    fn unix_field_wins_over_dos() {
+        let mut ux = (ELSEWHERE as u32 - 3600).to_le_bytes().to_vec();
+        ux.extend_from_slice(&(ELSEWHERE as u32).to_le_bytes());
+        let got = read_mtime("ux", &one_entry_zip(&field(0x5855, &ux))).unwrap();
+        assert_eq!(got, Some(UNIX_EPOCH + Duration::from_secs(ELSEWHERE)));
+    }
+
+    /// Both Info-ZIP fields in one header: the current one answers.
+    #[test]
+    fn extended_timestamp_wins_over_the_unix_field() {
+        let mut ux = (ELSEWHERE as u32 - 3600).to_le_bytes().to_vec();
+        ux.extend_from_slice(&(ELSEWHERE as u32 - 7200).to_le_bytes());
+        let mut ut = vec![0x01];
+        ut.extend_from_slice(&(ELSEWHERE as u32).to_le_bytes());
+        let mut extra = field(0x5855, &ux);
+        extra.extend_from_slice(&field(0x5455, &ut));
+        let got = read_mtime("ux-ut", &one_entry_zip(&extra)).unwrap();
+        assert_eq!(got, Some(UNIX_EPOCH + Duration::from_secs(ELSEWHERE)));
+    }
+
     /// Hostile time fields must not panic. A value that parses but cannot be trusted falls back to
     /// the DOS fields; a field the zip crate cannot parse makes it refuse the archive at open, which
     /// is an error, not a crash.
@@ -475,6 +503,11 @@ mod mtime_tests {
             ("ut-all-max", field(0x5455, &all_ut)),
             ("nt-max", field(0x000A, &huge_nt)),
             ("nt-zero", field(0x000A, &zero_nt)),
+            // The Unix field arrives as raw bytes: a value with the top bit set is not trusted,
+            // and one too short to hold a modification time is passed over.
+            ("ux-max", field(0x5855, &[0xFF; 8])),
+            ("ux-short", field(0x5855, &[1, 2, 3, 4, 5])),
+            ("ux-empty", field(0x5855, &[])),
         ] {
             let got = read_mtime(tag, &one_entry_zip(&extra))
                 .unwrap_or_else(|e| panic!("{tag}: archive refused: {e}"));

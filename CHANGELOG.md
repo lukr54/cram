@@ -48,22 +48,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   zone offset (one hour early at UTC+1), and extracting a ZIP whose only time is the DOS field set
   each file's time off by the same amount. The writer now puts local time in the DOS fields and adds
   the extended timestamp (extra field `0x5455`, UTC seconds) to every entry dated from 1970 to
-  2038-01-19, 9 bytes in the local header and 9 in the central one. One kind of entry has it in the
-  local header only: an encrypted file of 64 MiB or less added from disk (`cram a -p`; `cram conv`
-  is not affected). Those are compressed on the parallel path and copied in as one-entry archives,
-  and the zip crate (9.0.5) writes the central header of an entry copied that way without the
-  field. Such an entry is dated by its DOS fields alone, like one from a tool that writes no
-  timestamp field. Cram reads it back as local time in two-second steps, an hour late if the time
-  falls in the hour that repeats when summer time ends, and as the time the archive was written if
-  the file is dated before 1980. 7-Zip extracts it an hour off when the file's date and the day of
-  extraction are on different sides of a summer-time change. The reader takes `0x5455` first, then
-  the NTFS field `0x000A`, then the DOS fields as local time. Where the platform gives no local
-  offset, the DOS fields are written and read as UTC, as before. Every release from 1.0.0 to 1.3.2
-  wrote and read UTC. Two regressions follow. A ZIP written by one of those releases has no
-  `0x5455`, so Cram now reads its times shifted by the local offset, as other tools already showed
-  them. A ZIP written by this version and extracted by one of those releases also comes out
-  shifted, the other way: they read only the DOS fields, as UTC, so a file last changed at 14:00
-  local time at UTC+1 is restored as 15:00.
+  2038-01-19, 9 bytes in the local header and 9 in the central one. One kind of entry carries it
+  differently: an encrypted file of 64 MiB or less added from disk (`cram a -p`; `cram conv` is not
+  affected). Those are compressed on the parallel path and copied in as one-entry archives, and the
+  zip crate (9.0.5) writes the central header of an entry copied that way without `0x5455`. Such an
+  entry keeps `0x5455` in its local header and gets the older Info-ZIP Unix field, `0x5855`, in its
+  central one: the same UTC seconds in 12 bytes, which the crate copies as it finds them and which
+  Cram, 7-Zip and Info-ZIP read. The reader takes `0x5455` first, then the NTFS field `0x000A`,
+  then `0x5855`, then the DOS fields as local time. Where the platform gives no local offset, the
+  DOS fields are written and read as UTC, as before. Every release from 1.0.0 to 1.3.2 wrote and
+  read UTC. Two regressions follow. A ZIP written by one of those releases has no `0x5455`, so Cram
+  now reads its times shifted by the local offset, as other tools already showed them. A ZIP
+  written by this version and extracted by one of those releases also comes out shifted, the other
+  way: they read only the DOS fields, as UTC, so a file last changed at 14:00 local time at UTC+1
+  is restored as 15:00.
 
 ## [1.3.2] - 2026-10-12
 

@@ -124,7 +124,7 @@ fn file_options(
 /// Every writer path goes through here: the streamed one, both shapes of entry the parallel path
 /// builds (see [`DoneBody`]), and directories. The field reaches the central header on all of
 /// them but one: an encrypted entry written through the parallel path has it in its local header
-/// only, for the reason given on [`DoneBody::Archive`].
+/// only, and `0x5855` in the central one, for the reason given on [`DoneBody::Archive`].
 ///
 /// The mtime may have come from an untrusted archive through `convert`; [`zip_time`] bounds it
 /// before any calendar conversion, and a time it cannot hold is dropped, not stored.
@@ -134,6 +134,19 @@ fn with_ext_timestamp<'k, 'n>(
 ) -> Result<FullFileOptions<'k, 'n>> {
     if let Some(payload) = zip_time::ext_timestamp_payload(modified) {
         opts.add_extra_field(zip_time::EXT_TIMESTAMP_ID, payload, false)
+            .map_err(map_zip_write)?;
+    }
+    Ok(opts)
+}
+
+/// Attach the older Info-ZIP Unix field (`0x5855`) to the central header only, for the one shape
+/// of entry whose central header cannot keep `0x5455`; see [`DoneBody::Archive`].
+fn with_central_unix_time<'k, 'n>(
+    mut opts: FullFileOptions<'k, 'n>,
+    modified: Option<SystemTime>,
+) -> Result<FullFileOptions<'k, 'n>> {
+    if let Some(payload) = zip_time::unix_time_payload(modified) {
+        opts.add_extra_field(zip_time::UNIX_TIME_ID, payload, true)
             .map_err(map_zip_write)?;
     }
     Ok(opts)
@@ -166,14 +179,17 @@ enum DoneBody {
     /// back.) `raw_copy_file` is no way round it: it rebuilds both headers the same way and drops
     /// the field from the local one as well.
     ///
-    /// An encrypted entry on this path is therefore dated by its DOS fields, like an entry from a
-    /// tool that writes no timestamp field, with what that brings. Read back by this crate: local
-    /// time in two-second steps; an hour late for a time in the hour that repeats when summer time
-    /// ends; and for a file dated before 1980, which the DOS fields cannot hold, the time the
-    /// archive was written. Extracted by 7-Zip: an hour off when the file's date and the day of
-    /// extraction fall on different sides of a summer-time change. The streamed path has none of
-    /// this. `encrypted_entries_keep_the_timestamp_in_the_local_header_only` pins the missing field
-    /// and fails the day the crate writes it back, at which point these two paragraphs go.
+    /// So the worker gives the central header a second field, the older Info-ZIP Unix field
+    /// `0x5855`, holding the same UTC seconds. `zip` 9 does not interpret that id: it keeps the
+    /// bytes and writes them back, and the merged entry ends with `0x5455` in its local header and
+    /// `0x5855` in its central one. This crate's reader, 7-Zip and Info-ZIP read `0x5855` there.
+    /// Without it the entry would be dated by its DOS fields alone: two-second steps, an hour late
+    /// in the hour that repeats when summer time ends, the time of writing for a file dated before
+    /// 1980, and an hour off in 7-Zip across a summer-time change. Writing the id needs the crate
+    /// feature `unreserved`. `encrypted_entries_keep_their_time_on_both_writer_paths` pins the
+    /// three facts this rests on: `0x5455` gone from the central header, `0x5855` there, and the
+    /// exact time read back. The day the crate writes `0x5455` back, that test fails and `0x5855`
+    /// can go.
     Archive(Vec<u8>),
 }
 
@@ -554,7 +570,9 @@ fn compress_one(
     let t_zip = Instant::now();
     let opts = file_options(entry_method, level, pw.as_deref(), false, modified)?;
     let body = if pw.is_some() {
-        // Encrypted: a whole one-entry archive, because the builder below refuses encryption.
+        // Encrypted: a whole one-entry archive, because the builder below refuses encryption. Its
+        // central header also gets the time as `0x5855`, the field that survives the merge.
+        let opts = with_central_unix_time(opts, modified)?;
         let mut inner = ZipCrateWriter::new(Cursor::new(Vec::with_capacity(data.len() / 2 + 512)));
         inner.start_file(name, opts).map_err(map_zip_write)?;
         write_body(&mut inner, &data, entry_method, level, ZOPFLI_BLOCK)?;
@@ -927,7 +945,7 @@ mod mtime_guard_tests {
     /// local header and dropped the extra field, and under `zip` 9 `merge_archive` drops it from
     /// the central header (this test caught that one). An unencrypted entry now arrives as a
     /// `PreparedZipFile`, whose headers are written from the options the worker chose. Encrypted
-    /// entries are the exception: `encrypted_entries_keep_the_timestamp_in_the_local_header_only`.
+    /// entries take another route: `encrypted_entries_keep_their_time_on_both_writer_paths`.
     #[test]
     fn mtime_survives_both_writer_paths() {
         use crate::model::{EntryKind, EntryPath};
@@ -1090,55 +1108,41 @@ mod mtime_guard_tests {
 
     const AES_TEST_PASSWORD: &str = "correct horse battery staple";
 
-    /// The one place the fix does not reach, pinned so that it cannot widen or quietly go away.
+    /// An encrypted entry keeps its exact time on both writer paths, by two different fields.
     ///
-    /// An encrypted entry written through the parallel path is spliced in with `merge_archive`,
-    /// and `zip` 9 writes a merged entry's central header without the `0x5455` field (see
-    /// [`DoneBody::Archive`]). What such an entry does carry: the field in its local header, and
-    /// the local wall time in the DOS fields of both headers. What it loses: this reader, which
-    /// reads central headers, dates it by the DOS fields. The four files are the cases that hold
-    /// in any zone: two whole even seconds away from a zone change come back exact, an odd second
-    /// comes back one second early, and a 1975 date, which the DOS fields cannot hold, comes back
-    /// as the time of writing. A time in the hour that repeats when summer time ends comes back an
-    /// hour late; that needs a zone with summer time and is not asserted here.
+    /// On the parallel path it is spliced in with `merge_archive`, and `zip` 9 writes a merged
+    /// entry's central header without the `0x5455` field (see [`DoneBody::Archive`]), so the worker
+    /// adds `0x5855` to the central header. Three facts are pinned for that path: `0x5455` is in
+    /// the local header and gone from the central one, `0x5855` is in the central header only, and
+    /// the reader gives back the exact time. Two of the four files are the ones the DOS fields
+    /// alone get wrong: an odd second, and a 1975 date they cannot hold.
     ///
-    /// The streamed path is checked beside it: with the same password it writes the field to both
-    /// headers and gives all four times back exact, which is what the parallel path would do if
-    /// the crate let it.
+    /// The streamed path is checked beside it: with the same password it writes `0x5455` to both
+    /// headers and no `0x5855`.
     ///
-    /// **If the assertion on the central header fails, the crate has started writing the field
-    /// back.** That is good news: drop the exception from `DoneBody::Archive`, the changelog and
-    /// this test, and assert the field in both headers here as `mtime_survives_both_writer_paths`
-    /// does.
+    /// **If the assertion that the parallel path's central header has no `0x5455` fails, the crate
+    /// has started writing the field back.** That is good news: Cram's own archives no longer need
+    /// `0x5855` or the `unreserved` feature (the reader's branch can stay, for other tools'
+    /// archives), and this test can assert `0x5455` in both headers as
+    /// `mtime_survives_both_writer_paths` does.
     #[test]
-    fn encrypted_entries_keep_the_timestamp_in_the_local_header_only() {
+    fn encrypted_entries_keep_their_time_on_both_writer_paths() {
         use crate::model::{EntryKind, EntryPath};
         use crate::reader::RandomAccessReader;
-
-        /// What the DOS fields give back for a time, which is all the parallel path has.
-        #[derive(Clone, Copy, PartialEq)]
-        enum Dos {
-            /// A whole even second the fields can hold.
-            Exact,
-            /// An odd second: the fields count in twos and the writer rounds down.
-            SecondEarly,
-            /// Before 1980: the writer sets no DOS time and the crate stamps the time of writing.
-            TimeOfWriting,
-        }
 
         const WINTER: u64 = 1_577_934_246; // 2020-01-02T03:04:06Z
         const SUMMER: u64 = 1_593_604_800; // 2020-07-01T12:00:00Z
         const ODD: u64 = 1_748_779_201; // 2025-06-01T12:00:01Z
         const EARLY: u64 = 157_766_400; // 1975-01-01T00:00:00Z
-        const AFTER_2020: u64 = 1_600_000_000;
         let dir = std::env::temp_dir().join(format!("cram-zipmtime-aes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // (name, time, whether the DOS fields can hold the date)
         let files = [
-            ("w.txt", WINTER, Dos::Exact),
-            ("s.txt", SUMMER, Dos::Exact),
-            ("o.txt", ODD, Dos::SecondEarly),
-            ("e.txt", EARLY, Dos::TimeOfWriting),
+            ("w.txt", WINTER, true),
+            ("s.txt", SUMMER, true),
+            ("o.txt", ODD, true),
+            ("e.txt", EARLY, false),
         ];
         for (name, _, _) in files {
             std::fs::write(dir.join(name), format!("{name} body\n").repeat(40)).unwrap();
@@ -1173,11 +1177,14 @@ mod mtime_guard_tests {
 
             let headers = raw_headers(&bytes);
             assert_eq!(headers.len(), files.len());
-            for (h, (name, secs, dos)) in headers.iter().zip(files) {
+            for (h, (name, secs, dos_holds)) in headers.iter().zip(files) {
                 let tag = format!("parallel={parallel} {name}");
                 assert_eq!(h.name, name, "{tag}: order");
                 let mut ut = vec![0x01];
                 ut.extend_from_slice(&(secs as u32).to_le_bytes());
+                // The Unix field: the access time, then the modification time.
+                let mut ux = (secs as u32).to_le_bytes().to_vec();
+                ux.extend_from_slice(&(secs as u32).to_le_bytes());
                 assert_eq!(
                     extra_field(&h.local_extra, 0x5455),
                     Some(ut.clone()),
@@ -1189,8 +1196,18 @@ mod mtime_guard_tests {
                     "{tag}: 0x5455 in the central header (see this test's comment if it is \
                      the parallel one that changed)"
                 );
-                // A time the DOS fields cannot hold has no expected fields to compare with.
-                if dos != Dos::TimeOfWriting {
+                assert_eq!(
+                    extra_field(&h.central_extra, 0x5855),
+                    if parallel { Some(ux) } else { None },
+                    "{tag}: 0x5855 in the central header"
+                );
+                assert_eq!(
+                    extra_field(&h.local_extra, 0x5855),
+                    None,
+                    "{tag}: 0x5855 belongs in the central header only"
+                );
+                // A date the DOS fields cannot hold has no expected fields to compare with.
+                if dos_holds {
                     assert_eq!(h.local_dos, expected_dos(secs), "{tag}: local DOS fields");
                     assert_eq!(
                         h.central_dos,
@@ -1202,24 +1219,13 @@ mod mtime_guard_tests {
 
             let r = super::super::zip::ZipReader::open(&path, Arc::new(crate::secret::NoPassword))
                 .unwrap();
-            for (e, (name, secs, dos)) in RandomAccessReader::entries(&r).iter().zip(files) {
-                let tag = format!("parallel={parallel} {name}: time read back");
+            for (e, (name, secs, _)) in RandomAccessReader::entries(&r).iter().zip(files) {
                 assert!(e.encrypted, "parallel={parallel} {name}: not encrypted");
-                let exact = Some(UNIX_EPOCH + Duration::from_secs(secs));
-                match (parallel, dos) {
-                    // The streamed path has the field in the central header: every time is exact.
-                    (false, _) | (true, Dos::Exact) => assert_eq!(e.modified, exact, "{tag}"),
-                    (true, Dos::SecondEarly) => assert_eq!(
-                        e.modified,
-                        Some(UNIX_EPOCH + Duration::from_secs(secs - 1)),
-                        "{tag}"
-                    ),
-                    (true, Dos::TimeOfWriting) => assert!(
-                        e.modified > Some(UNIX_EPOCH + Duration::from_secs(AFTER_2020)),
-                        "{tag}: expected the time of writing, got {:?}",
-                        e.modified
-                    ),
-                }
+                assert_eq!(
+                    e.modified,
+                    Some(UNIX_EPOCH + Duration::from_secs(secs)),
+                    "parallel={parallel} {name}: time read back"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
