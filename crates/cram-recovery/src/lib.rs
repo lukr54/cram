@@ -217,7 +217,7 @@ pub fn repair(corrupt: &[u8], sidecar: &[u8]) -> RecResult<Repair> {
     // stored hash; a mismatch (bit-rot) or a missing tail (truncation) marks the shard for recovery.
     let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(sc.n + sc.m);
     let mut damaged = 0usize;
-    for i in 0..sc.n {
+    for (i, want) in sc.shard_hashes.iter().take(sc.n).enumerate() {
         let start = i * ss;
         let mut shard = vec![0u8; ss];
         let mut present = false;
@@ -226,7 +226,7 @@ pub fn repair(corrupt: &[u8], sidecar: &[u8]) -> RecResult<Repair> {
             shard[..end - start].copy_from_slice(&corrupt[start..end]);
             present = true;
         }
-        if present && hash(&shard) == sc.shard_hashes[i] {
+        if present && hash(&shard) == *want {
             shards.push(Some(shard));
         } else {
             shards.push(None);
