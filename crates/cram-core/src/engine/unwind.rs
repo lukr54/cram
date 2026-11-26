@@ -25,9 +25,21 @@ pub struct CreatedLog {
     /// Parents already made, so the second file in a directory does not pay to make it again. See
     /// [`CreatedLog::ensure_dir`].
     ensured: Mutex<HashSet<PathBuf>>,
+    /// The archive's download quarantine, copied onto everything created here. See
+    /// [`super::quarantine`]. Unset everywhere but macOS, and there unless the archive has one.
+    mark: super::quarantine::Mark,
 }
 
 impl CreatedLog {
+    /// A log that also stamps `mark` onto every file it opens and every directory it makes. This is
+    /// where both engine paths create everything they write, which is why the mark lives here.
+    pub fn marking(mark: super::quarantine::Mark) -> Self {
+        CreatedLog {
+            mark,
+            ..Default::default()
+        }
+    }
+
     /// Make an entry's parent directory, at most once per directory per run.
     ///
     /// Both engine paths used to call `note_dir` + `fs::create_dir_all` for **every file**, and
@@ -45,7 +57,22 @@ impl CreatedLog {
             }
         }
         self.note_dir(p);
+        // Every level `create_dir_all` is about to make, deepest first, so each can be marked as
+        // `unzip` marks it. Found by walking up to the first level that exists, which is the
+        // destination at the latest, since both engines make it before anything else. Only paid
+        // when there is a mark to apply.
+        let mut new_levels = Vec::new();
+        if self.mark.is_set() {
+            let mut q = Some(p);
+            while let Some(d) = q.filter(|d| !d.exists()) {
+                new_levels.push(d.to_path_buf());
+                q = d.parent();
+            }
+        }
         std::fs::create_dir_all(p)?;
+        for d in &new_levels {
+            self.mark.apply_path(d);
+        }
         if let Ok(mut seen) = self.ensured.lock() {
             seen.insert(p.to_path_buf());
         }
@@ -68,23 +95,28 @@ impl CreatedLog {
     /// kernel tree. `create_new` gets the answer from the `openat` we were going to issue anyway,
     /// and as a bonus there is no longer a gap between the check and the create for anything else to
     /// slip into.
+    ///
+    /// Either way the file gets the archive's mark, if any: an overwritten file now holds the
+    /// archive's content just as much as a new one does.
     pub fn create_file(&self, p: &Path) -> std::io::Result<std::fs::File> {
-        match std::fs::File::create_new(p) {
+        let f = match std::fs::File::create_new(p) {
             Ok(f) => {
                 if let Ok(mut v) = self.files.lock() {
                     v.push(p.to_path_buf());
                 }
-                Ok(f)
+                f
             }
             // It was already there, so it is the user's and not ours to unwind — overwrite it
             // without recording it, which is exactly what `note_file` decided by omission. Only if
             // it is a regular file: `File::create` here followed a link planted at the path and
             // truncated whatever it named. See `overwrite`.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                super::overwrite::open_existing(p)
+                super::overwrite::open_existing(p)?
             }
-            Err(e) => Err(e),
-        }
+            Err(e) => return Err(e),
+        };
+        self.mark.apply_open(&f);
+        Ok(f)
     }
 
     /// Same, for a directory.
@@ -200,6 +232,47 @@ mod tests {
         assert!(!ours.exists(), "our file goes");
         assert!(shared.exists(), "their directory stays");
         assert!(shared.join("theirs.txt").exists(), "their file stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every level `ensure_dir` makes gets the mark, not only the deepest, and a level that was
+    /// already there does not. Entries whose parents are not listed in the archive take this path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_dir_marks_each_level_it_makes_and_no_other() {
+        use std::process::Command;
+        let q = "0083;6745f2a0;Safari;3F2504E0-4F89-11D3-9A0C-0305E82C3301";
+        let mark_of = |p: &Path| {
+            let o = Command::new("xattr")
+                .args(["-p", "com.apple.quarantine"])
+                .arg(p)
+                .output()
+                .unwrap();
+            o.status
+                .success()
+                .then(|| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        let dir = scratch("mark-levels");
+        let src = dir.join("archive");
+        std::fs::write(&src, b"x").unwrap();
+        let ok = Command::new("xattr")
+            .args(["-w", "com.apple.quarantine", q])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        std::fs::create_dir_all(dir.join("out/theirs")).unwrap();
+
+        let log = CreatedLog::marking(super::super::quarantine::Mark::of(&src));
+        log.ensure_dir(&dir.join("out/theirs/a/b/c")).unwrap();
+        let f = log.create_file(&dir.join("out/theirs/a/b/c/f")).unwrap();
+        drop(f);
+
+        assert_eq!(mark_of(&dir.join("out/theirs")), None, "already there");
+        for p in ["a", "a/b", "a/b/c", "a/b/c/f"] {
+            let p = dir.join("out/theirs").join(p);
+            assert_eq!(mark_of(&p).as_deref(), Some(q), "{}", p.display());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

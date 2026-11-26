@@ -44,6 +44,7 @@ pub mod dedup;
 pub mod estimate;
 pub(crate) mod overwrite;
 pub mod parallel;
+pub mod quarantine;
 pub mod reclaim;
 pub mod sequential;
 pub mod skip;
@@ -289,7 +290,8 @@ pub fn extract(
     // Cancelling should leave the destination as it was found, so the engines record what they
     // bring into existence and nothing else. See `unwind`: a file that was already there is never
     // ours to remove, even when this run overwrote it.
-    let created = unwind::CreatedLog::default();
+    // It also carries the archive's download quarantine onto everything extracted (macOS only).
+    let created = unwind::CreatedLog::marking(quarantine::Mark::of(path));
 
     // Random-access (ZIP, 7z, `.cram`, ISO 9660) → tuned parallel per-entry; everything else
     // (RAR, tar, raw single-stream) → sequential stream.

@@ -650,18 +650,21 @@ impl Archive {
     /// reference engine. Returning at the first bad entry left a truncated file sitting on disk at a
     /// fraction of its real length and never attempted the rest, which matters most here: this is
     /// the self-extractor, and its recipient has no second tool to check the result with.
-    fn extract_all(&mut self, dest: &Path) -> R<Extracted> {
+    ///
+    /// `mark` is the download quarantine of the archive (or of the self-extractor), copied onto every
+    /// file and every directory this run makes. See [`quarantine`].
+    fn extract_all(&mut self, dest: &Path, mark: &quarantine::Mark) -> R<Extracted> {
         fs::create_dir_all(dest).map_err(io_err)?;
         let mut out = Extracted::default();
         for i in 0..self.entries.len() {
             let path = dest.join(&self.entries[i].safe);
             if self.entries[i].is_dir {
-                fs::create_dir_all(&path).map_err(io_err)?;
+                mark.make_dirs(&path).map_err(io_err)?;
                 out.dirs += 1;
                 continue;
             }
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(io_err)?;
+                mark.make_dirs(parent).map_err(io_err)?;
             }
             let f = match create_dest(&path) {
                 Ok(f) => f,
@@ -670,6 +673,7 @@ impl Archive {
                     continue;
                 }
             };
+            mark.apply_open(&f);
             let mut w = io::BufWriter::new(f);
             let mut outcome = self.write_entry(i, &mut w);
             if outcome.is_ok() {
@@ -747,6 +751,121 @@ fn create_dest(p: &Path) -> io::Result<File> {
     })?;
     f.set_len(0)?;
     Ok(f)
+}
+
+/// macOS's download quarantine (`com.apple.quarantine`), passed from the archive to what comes out of
+/// it, as `unzip`, `ditto` and `bsdtar` do: the archive's value, byte for byte, on every file and on
+/// every directory this run makes. Without it Gatekeeper never sees a program that arrived inside a
+/// downloaded archive. The same rule as cram-core's `engine::quarantine`, written again here because
+/// this crate shares no code with it. A no-op on other platforms and for an unmarked archive.
+mod quarantine {
+    use std::path::Path;
+
+    #[derive(Default)]
+    pub struct Mark(Option<Vec<u8>>);
+
+    impl Mark {
+        pub fn of(path: &Path) -> Self {
+            Mark(imp::read(path))
+        }
+
+        pub fn apply_open(&self, f: &std::fs::File) {
+            if let Some(v) = &self.0 {
+                imp::write_open(f, v);
+            }
+        }
+
+        /// `create_dir_all`, marking each level it makes. Levels that already existed are not ours
+        /// and are left alone.
+        pub fn make_dirs(&self, p: &Path) -> std::io::Result<()> {
+            let Some(v) = &self.0 else {
+                return std::fs::create_dir_all(p);
+            };
+            let mut new_levels = Vec::new();
+            let mut q = Some(p);
+            while let Some(d) = q.filter(|d| !d.exists()) {
+                new_levels.push(d);
+                q = d.parent();
+            }
+            std::fs::create_dir_all(p)?;
+            for d in new_levels {
+                imp::write_path(d, v);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod imp {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        use std::path::Path;
+
+        const NAME: &[u8] = b"com.apple.quarantine\0";
+
+        pub fn read(path: &Path) -> Option<Vec<u8>> {
+            let p = CString::new(path.as_os_str().as_bytes()).ok()?;
+            let mut buf = vec![0u8; 4096];
+            // SAFETY: NUL-terminated strings; `buf` is valid for `buf.len()` bytes.
+            let n = unsafe {
+                libc::getxattr(
+                    p.as_ptr(),
+                    NAME.as_ptr().cast(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    0,
+                )
+            };
+            if n < 0 {
+                return None;
+            }
+            buf.truncate(n as usize);
+            Some(buf)
+        }
+
+        pub fn write_open(f: &std::fs::File, v: &[u8]) {
+            // SAFETY: the descriptor lives as long as `f`; `v` is valid for its length.
+            unsafe {
+                libc::fsetxattr(
+                    f.as_raw_fd(),
+                    NAME.as_ptr().cast(),
+                    v.as_ptr().cast(),
+                    v.len(),
+                    0,
+                    0,
+                );
+            }
+        }
+
+        pub fn write_path(path: &Path, v: &[u8]) {
+            let Ok(p) = CString::new(path.as_os_str().as_bytes()) else {
+                return;
+            };
+            // SAFETY: as above.
+            unsafe {
+                libc::setxattr(
+                    p.as_ptr(),
+                    NAME.as_ptr().cast(),
+                    v.as_ptr().cast(),
+                    v.len(),
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    mod imp {
+        use std::path::Path;
+        pub fn read(_: &Path) -> Option<Vec<u8>> {
+            None
+        }
+        pub fn write_open(_: &std::fs::File, _: &[u8]) {}
+        pub fn write_path(_: &Path, _: &[u8]) {}
+    }
 }
 
 /// `O_NOFOLLOW` fails the open on a link; `O_NONBLOCK` fails it on a FIFO with no reader instead of
@@ -945,6 +1064,15 @@ fn run_make_sfx(payload_path: &Path, out_path: &Path) -> ExitCode {
     if let Err(e) = fs::write(out_path, &out) {
         return fail(&format!("write {}: {e}", out_path.display()));
     }
+    // A self-extractor is a program: written with `fs::write` it came out 0644 on macOS and Linux
+    // and could not be run without a `chmod`. rwxr-xr-x, what a linker leaves under the usual umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(out_path, fs::Permissions::from_mode(0o755)) {
+            return fail(&format!("make {} executable: {e}", out_path.display()));
+        }
+    }
     println!(
         "wrote self-extractor {} ({} bytes = {offset}-byte stub + {}-byte payload)",
         out_path.display(),
@@ -965,7 +1093,12 @@ fn run_self_extract(payload: Vec<u8>, dest: &Path, password: Option<&str>) -> Ex
     if let Err(e) = fs::write(&tmp, &payload) {
         return fail(&format!("stage embedded payload: {e}"));
     }
-    let outcome = Archive::open(&tmp, password).and_then(|mut arc| arc.extract_all(dest));
+    // The staged copy is a fresh temp file with no mark; the one that came from the browser is this
+    // executable.
+    let mark = std::env::current_exe()
+        .map(|exe| quarantine::Mark::of(&exe))
+        .unwrap_or_default();
+    let outcome = Archive::open(&tmp, password).and_then(|mut arc| arc.extract_all(dest, &mark));
     let _ = fs::remove_file(&tmp);
     match outcome {
         Ok(out) => finish(&out, dest),
@@ -1064,7 +1197,7 @@ fn main() -> ExitCode {
     }
 
     let dest = dest.expect("dest is present in extract mode (arity checked above)");
-    match arc.extract_all(&dest) {
+    match arc.extract_all(&dest, &quarantine::Mark::of(&archive)) {
         Ok(out) => finish(&out, &dest),
         Err(e) => {
             eprintln!("error: {e}");

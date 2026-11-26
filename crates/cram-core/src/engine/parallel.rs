@@ -182,8 +182,9 @@ pub fn run(
     let mut dir_times: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
     for e in entries.iter().filter(|e| e.is_dir()) {
         let p = e.path.join_under(dest);
-        created.note_dir(&p);
-        let _ = fs::create_dir_all(&p);
+        // Through `ensure_dir`, like every other directory this run makes, so it is recorded and
+        // marked in one place.
+        let _ = created.ensure_dir(&p);
         if let Some(t) = e.modified {
             dir_times.push((p, t));
         }
