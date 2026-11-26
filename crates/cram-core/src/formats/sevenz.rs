@@ -221,10 +221,7 @@ fn extract_pass(
             }
             n = rd.read(&mut buf)?;
         }
-        if tx.send(SzMsg::FileEnd).is_err() {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(tx.send(SzMsg::FileEnd).is_ok())
     })?;
     // Walk finished cleanly with entries still buffered → the archive had no non-empty file to prove
     // a password (all dirs / empty files), so there was nothing to decrypt: emit them now.
