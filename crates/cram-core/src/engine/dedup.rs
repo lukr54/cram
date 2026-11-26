@@ -195,12 +195,16 @@ pub fn scan(
     // done. That silence is exactly what made a crash in here impossible to place.
     d.checkpoint_phase("walk (finding files)");
     let mut files: Vec<ScannedFile> = Vec::new();
+    // Shared across roots: two roots can name one directory by spellings `collapse_roots` cannot
+    // equate (a macOS firmlink is not resolved by `canonicalize`).
+    let mut walked = std::collections::HashSet::new();
     for root in collapse_roots(roots) {
         walk(
             root,
             opts.min_size,
             &mut files,
             &mut report.unreadable,
+            &mut walked,
             sink,
         )?;
     }
@@ -393,11 +397,11 @@ fn walk(
     min_size: u64,
     out: &mut Vec<ScannedFile>,
     unreadable: &mut u64,
+    walked: &mut std::collections::HashSet<FileId>,
     sink: &dyn ProgressSink,
 ) -> Result<()> {
     // Depth rides along only to arm the cycle guard below; the descent itself does not care.
     let mut stack: Vec<(PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
-    let mut seen_deep: std::collections::HashSet<FileId> = std::collections::HashSet::new();
     let mut dirs: u64 = 0;
     let mut last_report = std::time::Instant::now();
     while let Some((path, depth)) = stack.pop() {
@@ -424,12 +428,24 @@ fn walk(
             // into -- and since the walk stopped being able to overflow the stack, such a cycle
             // would run forever and grow the heap instead, which is quieter than what it replaced.
             //
-            // The identity lookup costs an open per directory, so it is armed by depth rather than
-            // paid on every scan: a normal tree never reaches it and is charged nothing.
-            if depth > CYCLE_GUARD_DEPTH {
-                match file_identity(&path) {
-                    Some(id) if !seen_deep.insert(id) => continue, // already walked; a cycle
-                    _ => {}
+            // On Windows the identity lookup costs an open per directory, so it is armed by depth
+            // rather than paid on every scan: a normal tree never reaches it and is charged nothing.
+            //
+            // On Unix the identity is free in the `symlink_metadata` above, so EVERY directory is
+            // checked. That is what stops a whole-disk scan on macOS walking the Data volume twice:
+            // `/Users`, `/Applications`, `/Library`... are firmlinks into `/System/Volumes/Data`, so
+            // a walk from `/` met each of those directories under both paths and reported every file
+            // in them as a duplicate of itself. A Linux bind mount is the same shape.
+            let id = file_id(&meta).or_else(|| {
+                if depth > CYCLE_GUARD_DEPTH {
+                    file_identity(&path)
+                } else {
+                    None
+                }
+            });
+            if let Some(id) = id {
+                if !walked.insert(id) {
+                    continue; // already walked under another path, or a cycle
                 }
             }
             let entries = match std::fs::read_dir(&path) {
@@ -1261,6 +1277,53 @@ mod tests {
         assert_eq!(g[0].reclaimable, 0, "one physical file frees nothing");
         assert_eq!(rep.reclaimable(), 0);
         assert_eq!(rep.redundant_files(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory the walk has already been through is not walked again, whatever path reaches it.
+    /// Unix only, where the walk knows every directory's identity; Windows resolves it only past
+    /// `CYCLE_GUARD_DEPTH`.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_already_walked_is_not_walked_again() {
+        let dir = scratch("walkedonce");
+        write(&dir.join("a.bin"), &[1u8; 64]);
+        write(&dir.join("sub/b.bin"), &[2u8; 64]);
+        let sink = Progress::new(0, 0);
+        let mut walked = std::collections::HashSet::new();
+        let (mut first, mut second, mut unreadable) = (Vec::new(), Vec::new(), 0u64);
+        walk(&dir, 1, &mut first, &mut unreadable, &mut walked, &sink).unwrap();
+        walk(&dir, 1, &mut second, &mut unreadable, &mut walked, &sink).unwrap();
+        assert_eq!(first.len(), 2, "the first walk finds both files");
+        assert_eq!(
+            second.len(),
+            0,
+            "the second walk of the same directory adds nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The macOS case itself: `/System/Volumes/Data/<path>` is the same directory as `<path>`, and
+    /// `canonicalize` does not say so. Before the fix every file here came back as a duplicate of
+    /// itself, in a group with nothing to reclaim.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_firmlinked_second_path_to_a_directory_is_walked_once() {
+        let dir = scratch("firmlink").canonicalize().unwrap();
+        write(&dir.join("only.bin"), &[3u8; 4096]);
+        let via_data = Path::new("/System/Volumes/Data").join(dir.strip_prefix("/").unwrap());
+        assert!(
+            via_data.join("only.bin").exists(),
+            "the Data-volume path reaches the same file"
+        );
+        let sink = Progress::new(0, 0);
+        let rep = scan(&[dir.clone(), via_data], &DedupOptions::default(), &sink).unwrap();
+        assert_eq!(rep.files_scanned, 1, "one file, found under one path");
+        assert_eq!(
+            rep.exact_groups().count(),
+            0,
+            "a file is not a duplicate of itself"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
