@@ -29,6 +29,10 @@ zeroize = "1"                                                           # wipe p
 filetime = "0.2"                                                        # restore entry mtimes on extract (pure Rust; correct dir handling on Windows)
 crc32fast = "1"                                                         # CRC32 for `cram test` integrity verification (pure Rust)
 time = "0.3"                                                            # ZIP DOS-datetime <-> SystemTime (already compiled via zip's `time` feature)
+# NFD for the extract scheduler's name fold, so names APFS treats as one file never race. Already in
+# the graph via url -> idna -> idna_adapter, with the same features; the defaults would add three
+# crates (utf16_iter, utf_types, write16) that nothing here uses.
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 # ZIP read (spine). Pure-Rust features only here, so the default build stays mingw-clean with no C
 # dependency; zstd (method 93) is added by the `zstd-c` feature below, which already links that crate.
 # NOTE: use `deflate-flate2` (flate2's default miniz_oxide backend), NOT the `deflate` meta-feature, 

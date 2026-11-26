@@ -126,6 +126,41 @@ fn dest_is_case_insensitive(dir: &Path) -> bool {
     insensitive
 }
 
+/// The scheduling key of one path component: names that may be one file on the destination must
+/// get the same key, or two workers write that file at once.
+///
+/// Lowercasing alone under-folds on APFS, which was measured on macOS 26.5 (2026-11-26): it treats
+/// a name and its NFD form as one file even on a case-sensitive volume, and its default
+/// case-insensitive volume folds `ß`/`SS`, `ﬁ`/`fi` and final `ς`/`σ` as well. Each of those pairs
+/// kept two keys, and a `.cram` extract of two 64 MiB entries came out corrupt in 11 to 15 runs of
+/// 20 with exit 0. So every non-ASCII name is decomposed (NFD) whatever the case rule, and a
+/// case-insensitive destination also gets a full fold: each char upper-cased, then each result
+/// lower-cased, then NFD again, since a case mapping can produce a precomposed char.
+///
+/// The full fold over-folds on purpose (`ı` and `i` share a key here, and are two files on APFS);
+/// that costs a group some parallelism and never a file. Pure-ASCII names take the old path, so
+/// the common case does no Unicode work.
+fn fold_name(s: &str, fold_case: bool) -> String {
+    if s.is_ascii() {
+        return if fold_case {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_owned()
+        };
+    }
+    let nfd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd();
+    let d = nfd.normalize(s);
+    if !fold_case {
+        return d.into_owned();
+    }
+    let folded: String = d
+        .chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect();
+    nfd.normalize(&folded).into_owned()
+}
+
 /// Extract every file entry of `ra` under `dest` across `workers` threads. Per-entry failures are
 /// collected into the [`Report`] (non-fatal); cancellation stops scheduling new work. When
 /// `skip_existing` is set, an entry whose destination already matches (size + CRC) is skipped
@@ -174,6 +209,7 @@ pub fn run(
     // deliberately AGGRESSIVE: over-folding costs one group a little parallelism, under-folding puts
     // two workers back on one file. Case folding is still probed on `dest` at runtime rather than
     // assumed from `cfg`, because case-insensitivity belongs to the filesystem and not to the OS.
+    // `fold_name` says what the fold covers and why lowercasing alone was not enough.
     let fold_case = dest_is_case_insensitive(dest);
     let dest_key = |e: &Entry| -> String {
         e.path
@@ -189,11 +225,7 @@ pub fn run(
                 let s = s.trim_end_matches([' ', '.']).to_string();
                 #[cfg(not(windows))]
                 let s = s.into_owned();
-                if fold_case {
-                    s.to_lowercase()
-                } else {
-                    s
-                }
+                fold_name(&s, fold_case)
             })
             .collect::<Vec<_>>()
             .join("/")
@@ -668,6 +700,59 @@ mod dest_race_tests {
             false,
         );
         assert_eq!(ordered, vec![vec![1], vec![3], vec![2], vec![0]]);
+    }
+
+    /// Every pair APFS resolved to one file on macOS 26.5 must share a key, or an extract races
+    /// them. The first three pairs are one file even on a case-sensitive APFS volume, so they must
+    /// share a key with case folding off too. The controls keep names the fold must not merge apart.
+    #[test]
+    fn apfs_equal_names_share_a_key() {
+        let nfc = "caf\u{e9}";
+        let nfd = "cafe\u{301}";
+        let hangul = "\u{d55c}";
+        let hangul_nfd = "\u{1112}\u{1161}\u{11ab}";
+        // One file on every APFS volume: normalisation only.
+        for (a, b) in [(nfc, nfd), (hangul, hangul_nfd)] {
+            assert_eq!(
+                fold_name(a, false),
+                fold_name(b, false),
+                "{a:?} / {b:?}, case kept"
+            );
+            assert_eq!(
+                fold_name(a, true),
+                fold_name(b, true),
+                "{a:?} / {b:?}, case folded"
+            );
+        }
+        // One file on case-insensitive APFS: case plus normalisation, and full case folding.
+        for (a, b) in [
+            ("CAFE\u{301}", nfc),
+            ("stra\u{df}e", "STRASSE"),
+            ("\u{fb01}le", "file"),
+            (
+                "\u{3bf}\u{3b4}\u{3bf}\u{3c2}",
+                "\u{3bf}\u{3b4}\u{3bf}\u{3c3}",
+            ),
+            ("\u{212a}", "k"),
+            ("\u{212b}", "\u{c5}"),
+            ("A.txt", "a.txt"),
+        ] {
+            assert_eq!(fold_name(a, true), fold_name(b, true), "{a:?} / {b:?}");
+        }
+        // Controls: distinct names keep distinct keys, and case is kept when the probe says so.
+        assert_ne!(fold_name("A.txt", false), fold_name("a.txt", false));
+        assert_ne!(fold_name("caf\u{e9}", true), fold_name("cafe", true));
+        assert_ne!(
+            fold_name("\u{ff21}", true),
+            fold_name("a", true),
+            "fullwidth A stays apart"
+        );
+        assert_eq!(
+            fold_name("Plain.TXT", true),
+            "plain.txt",
+            "the ASCII path is unchanged"
+        );
+        assert_eq!(fold_name("Plain.TXT", false), "Plain.TXT");
     }
 
     /// Case-variant names (`A.txt` / `a.txt`) resolve to ONE file on a case-insensitive filesystem,
