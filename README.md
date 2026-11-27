@@ -105,7 +105,7 @@ loses. Those rows are in the same tables as the ones above.
 
 ## Download
 
-Cram 1.3.2, from the [releases page](https://github.com/lukr54/cram/releases/latest):
+Cram 2.0.0, from the [releases page](https://github.com/lukr54/cram/releases/latest):
 
 | | |
 |---|---|
@@ -113,6 +113,7 @@ Cram 1.3.2, from the [releases page](https://github.com/lukr54/cram/releases/lat
 | Linux (x86-64) | [`cram-latest-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-x86_64-unknown-linux-gnu.tar.gz) |
 | macOS (Apple Silicon) | [`cram-latest-aarch64-apple-darwin.tar.gz`](https://github.com/lukr54/cram/releases/latest/download/cram-latest-aarch64-apple-darwin.tar.gz) |
 | Cram Studio, Windows GUI | [`cram-studio-latest-x64-setup.exe`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-x64-setup.exe) |
+| Cram Studio, macOS GUI (Apple Silicon, not yet notarized) | [`cram-studio-latest-aarch64.dmg`](https://github.com/lukr54/cram/releases/latest/download/cram-studio-latest-aarch64.dmg) |
 | Firefox hand-off add-on | [`cram-handoff-latest.xpi`](https://github.com/lukr54/cram/releases/latest/download/cram-handoff-latest.xpi) ([what it does](#downloading-and-handing-a-browser-download-to-cram), needs Studio) |
 
 Every release publishes a `SHA256SUMS` for each platform. **Nothing is code-signed yet**, so Windows

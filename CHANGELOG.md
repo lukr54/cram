@@ -9,7 +9,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-27
+
+A redesigned Cram Studio, the first Cram Studio for macOS, and engine fixes for ZIP times, `.cram`
+integrity and extraction on macOS. As with every release here, the Cram Studio installers ship as
+assets and are a separate proprietary product under their own EULA.
+
+**Cram Studio for macOS is not yet signed by Apple.** Signing and notarization with Apple are in
+progress, and the next incremental update will be signed. Until then, macOS blocks the app the first
+time it is opened. To open it: drag Cram from the DMG to Applications, open it once, then go to
+System Settings > Privacy & Security and press Open Anyway, which stays available for about an hour
+after the blocked attempt. macOS asks for your login password, once.
+
+The Firefox add-on is unchanged and stays at 1.1.0.
+
+### Cram Studio
+
+- **A new layout.** The archives you have open sit on a shelf beside the current one, with running
+  jobs underneath. Settings is one page (General, Licence, Diagnostics), and hardware has a page of
+  its own. New archive opens as a dialog. One search box finds archives and commands. A first run
+  starts on an empty shelf.
+- **macOS build** for Apple Silicon (`cram-studio-latest-aarch64.dmg`). It uses the Mac's words
+  (Trash, Dock, menu bar, ⌘K), keeps running in the menu bar when its window is closed and comes back
+  from the Dock, can open at login, and asks before quitting while a job is running. Mounting, the
+  Explorer menu and the Firefox hand-off are Windows-only and are not shown there.
+- **Converting to `.cram` now needs Pro, as creating one already did.** Opening, extracting, testing
+  and encrypting any archive, and converting a `.cram` to another format, stay free.
+- **Anonymous usage count.** Once a week Studio sends one empty request to `usage.nexalit.fr`, so
+  the number of installs in use can be counted. It carries no identifier and no data about you or
+  your files. Settings > Anonymous usage data turns it off.
+- Cram Studio is now licensed by Horkan Technologies; the EULA, the installer's publisher and the
+  copyright say so. Pro is €34.99.
+
 ### Fixed
+
+- **Extracting on macOS no longer corrupts files whose names APFS treats as one.** APFS treats a
+  name and its decomposed Unicode form as the same file, even on a case-sensitive volume, and its
+  default volume also folds ß/SS, the ﬁ ligature and final sigma. Cram's extractor grouped entries by
+  a lowercased name only, so each such pair went to two workers that wrote one file together, with
+  exit 0. Names are now decomposed before grouping, and a case-insensitive destination also gets a
+  full case fold. Every release from 1.0.0 to 1.3.2 has this on macOS.
+
+- **Files extracted from a downloaded archive stay quarantined on macOS.** A browser marks a
+  download with `com.apple.quarantine` so that Gatekeeper checks it before it first runs. `unzip`,
+  `ditto` and `bsdtar` copy the archive's mark onto everything they extract; Cram copied it onto
+  nothing, so an app or script that arrived inside a downloaded archive was never checked. Cram and
+  `cram-extract` now apply the archive's mark to every file and directory they create, and a
+  self-extractor applies its own.
+
+- **`cram make-sfx` writes the self-extractor executable** (mode 0755) on macOS and Linux. It was
+  0644, so it could not be run without a `chmod`.
+
+- **A whole-disk duplicate scan on macOS no longer reports every file as a duplicate of itself.**
+  `/Users`, `/Applications` and the other firmlinks lead into the Data volume, so a walk from `/`
+  went through each of those directories twice. A directory already walked is now skipped, whatever
+  path reaches it, which also covers a Linux bind mount.
 
 - **`cram conv` writes recompressed photos back as the original JPEG.** A `.cram` made with
   `--small`, `--tiny` or `--recompress` stores each JPEG it could shrink as a Lepton stream, and
@@ -927,4 +981,5 @@ Full policy, scope and reporting channel: [`SECURITY.md`](SECURITY.md).
 [1.3.0]: https://github.com/lukr54/cram/releases/tag/v1.3.0
 [1.3.1]: https://github.com/lukr54/cram/releases/tag/v1.3.1
 [1.3.2]: https://github.com/lukr54/cram/releases/tag/v1.3.2
-[Unreleased]: https://github.com/lukr54/cram/compare/v1.3.2...HEAD
+[2.0.0]: https://github.com/lukr54/cram/releases/tag/v2.0.0
+[Unreleased]: https://github.com/lukr54/cram/compare/v2.0.0...HEAD

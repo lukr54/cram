@@ -15,11 +15,11 @@ features are.
 
 | version | supported |
 |---|---|
-| 1.3.x | yes |
-| 1.0.x – 1.2.x | no — upgrade to 1.3.x |
+| 2.0.x | yes |
+| 1.0.x – 1.3.x | no — upgrade to 2.0.x |
 | < 1.0 | there is nothing earlier |
 
-**1.0.0 was the first release** (6 August 2026) and 1.3.2 is current (12 October 2026). Only the
+**1.0.0 was the first release** (6 August 2026) and 2.0.0 is current (27 November 2026). Only the
 newest minor line is supported: there is one maintainer and no backport branch, so a fix ships in
 the next release rather than being carried backwards. Between releases it is on `main` and available
 by building from source, as soon as it is ready and pushed.
