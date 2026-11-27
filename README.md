@@ -741,8 +741,9 @@ asset on this repository's Releases page,
 and that installer is **not** covered by those licences. A proprietary `.exe` on the Releases page
 of an MIT/Apache repository is deliberate, not an oversight.
 
-The download is free. A Pro upgrade unlocks deduplication reporting, signing, parity and mounting
-inside the GUI; all of those are in the free command line without restriction.
+The download is free. A Pro upgrade unlocks creating `.cram` archives, duplicate finding, signing,
+recovery records and repair, and mounting inside the GUI; all of those are in the free command line
+without restriction.
 
 ---
 
